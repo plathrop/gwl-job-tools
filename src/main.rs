@@ -1,45 +1,34 @@
-mod telemetry;
-
-use crate::telemetry::APP_NAME;
-use clap::{Parser, Subcommand};
-use miette::{IntoDiagnostic, Result};
+use clap::Parser;
+use gwl_job_tools::{
+    cli::{self, Cli, APP_NAME},
+    telemetry::init_telemetry,
+};
+use miette::Result;
 use tracing::{info, info_span};
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum Commands {
-    Apply,
-    Lead,
-    Status,
-}
-
-#[derive(Debug, Parser)]
-#[command(name = APP_NAME, version, about = "A job search tracker.")]
-pub struct Cli {
-    #[command(subcommand)]
-    pub command: Commands,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     miette::set_panic_hook();
-    let provider = telemetry::init_telemetry()?;
 
-    info!("{} starting...", telemetry::APP_NAME);
+    // Parse CLI before telemetry so that --help, --version, etc.
+    // don't initialize otel just to exit. Also, this allows us to
+    // disable telemetry via command line.
+    let cli = Cli::parse();
+    cli.color.write_global();
 
-    let main_span = info_span!("start");
-    let _guard = main_span.enter();
+    let telemetry = init_telemetry(cli.telemetry, APP_NAME)?;
 
-    let _cli = Cli::parse();
+    info!("{} starting...", APP_NAME);
 
-    // Commented out so the compiler doesn't complain about divergence
-    //
-    // match cli.command {
-    //     Commands::Lead => todo!(),
-    //     Commands::Apply => todo!(),
-    //     Commands::Status => todo!(),
-    // }
+    let result = {
+        let main_span = info_span!("cli", command = cli.command_name());
+        let _guard = main_span.enter();
 
-    provider.shutdown().into_diagnostic()?;
+        cli::execute(cli.command)
+    };
+
+    telemetry.shutdown();
+    result?;
 
     Ok(())
 }
