@@ -6,3 +6,9 @@
 {"type":"create","issueId":"GWLJ-32p6d0","timestamp":"2026-08-17T17:54:42.817Z","data":{"title":"Future Enhancements","type":"epic","priority":4,"description":"Future enhancements for the jobs tool."},"source":"gwl-job-tools"}
 {"type":"create","issueId":"GWLJ-bzqpt4","timestamp":"2026-08-17T17:55:25.653Z","data":{"title":"Generate shell completions.","type":"task","priority":4,"description":"Probably use clap_complete crate.","parent":"GWLJ-32p6d0"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-32p6d0","timestamp":"2026-08-17T17:55:25.656Z","data":{},"source":"gwl-job-tools"}
+{"type":"create","issueId":"GWLJ-uy22qw","timestamp":"2026-08-17T23:51:06.841Z","data":{"title":"Implement leads steel thread","type":"task","priority":1,"parent":"GWLJ-7kfu55"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-7kfu55","timestamp":"2026-08-17T23:51:06.844Z","data":{},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-y3o9rr","timestamp":"2026-08-17T23:51:21.872Z","data":{"blockedBy":["GWLJ-uy22qw"]},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-uy22qw","timestamp":"2026-08-17T23:51:30.562Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-uy22qw","timestamp":"2026-08-17T23:51:40.097Z","data":{"status":"blocked"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-uy22qw","timestamp":"2026-08-17T23:52:02.953Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
