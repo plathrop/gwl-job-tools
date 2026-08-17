@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Local tool/environment configuration
+mise.toml
+mise.local.toml
