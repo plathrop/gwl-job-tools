@@ -28,3 +28,6 @@ target
 # Local tool/environment configuration
 mise.toml
 mise.local.toml
+
+# Local temporary files
+/tmp
