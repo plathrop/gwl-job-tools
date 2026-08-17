@@ -7,6 +7,8 @@ edition = "2024"
 clap = { version = "4.6", features = ["derive", "env", "cargo", "unicode", "wrap_help"] }
 colorchoice-clap = "1.0.8"
 directories = "6.0"
+email_address = "0.2.9"
+futures = { version = "0.3.34", default-features = false, features = ["alloc", "std"] }
 miette = { version = "7.6", features = ["fancy", "derive"] }
 opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", features = ["http-proto", "reqwest-client"] }
@@ -14,12 +16,18 @@ opentelemetry-semantic-conventions = "0.26"
 opentelemetry-stdout = { version = "0.32", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "trace"] }
 owo-colors = { version = "4.3.0", features = ["supports-colors"] }
+phonelib = "2.0.0"
+rust_decimal = "1.42.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+time = { version = "0.3.55", features = ["serde", "serde-human-readable", "serde-well-known"] }
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+typed-money = { version = "0.2.0", features = ["serde_support"] }
+url = { version = "2.5.8", features = ["serde"] }
+uuid = { version = "1.24.1", features = ["v4", "v7", "serde", "fast-rng"] }
 
 [[bin]]
 name = "gwl-jobs"

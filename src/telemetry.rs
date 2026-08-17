@@ -92,3 +92,32 @@ fn build_otlp_provider(name: &str) -> Result<SdkTracerProvider> {
 
     Ok(provider)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── TelemetryGuard ─────────────────────────────────────────────
+
+    #[test]
+    fn no_provider_shutdown_does_not_panic() {
+        let guard = TelemetryGuard::NoProvider;
+        guard.shutdown();
+    }
+
+    // ── env_filter ─────────────────────────────────────────────────
+
+    #[test]
+    fn env_filter_returns_a_filter() {
+        // The function always returns an EnvFilter (falls back to "info" if
+        // RUST_LOG is unset). We just verify it doesn't panic.
+        let _filter = env_filter();
+    }
+
+    // ── TelemetryStatus (via clap) ────────────────────────────────
+
+    // TelemetryStatus is a clap ValueEnum. It is tested implicitly
+    // through the CLI parsing tests in cli.rs (parse_telemetry_*).
+    // Adding a separate serde test is not applicable since the type
+    // does not implement serde::Deserialize.
+}

@@ -12,6 +12,13 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    pub fn new(config_dir: PathBuf, data_dir: PathBuf) -> Self {
+        Self {
+            config_dir,
+            data_dir,
+        }
+    }
+
     pub fn discover() -> Result<Self> {
         let project_dirs = ProjectDirs::from("st.ember", "gwl", APP_NAME).ok_or_else(|| {
             miette::miette!("could not determine platform config/data directories")
@@ -29,5 +36,36 @@ impl AppPaths {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_dir_returns_configured_path() {
+        let paths = AppPaths::new(
+            PathBuf::from("/home/user/.config/gwl-jobs"),
+            PathBuf::from("/home/user/.local/share/gwl-jobs"),
+        );
+
+        assert_eq!(
+            paths.config_dir(),
+            Path::new("/home/user/.config/gwl-jobs")
+        );
+    }
+
+    #[test]
+    fn data_dir_returns_configured_path() {
+        let paths = AppPaths::new(
+            PathBuf::from("/home/user/.config/gwl-jobs"),
+            PathBuf::from("/home/user/.local/share/gwl-jobs"),
+        );
+
+        assert_eq!(
+            paths.data_dir(),
+            Path::new("/home/user/.local/share/gwl-jobs")
+        );
     }
 }
