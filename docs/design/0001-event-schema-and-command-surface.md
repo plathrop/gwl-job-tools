@@ -17,6 +17,13 @@ follow. It answers the four Increment 0 questions:
 It supersedes the placeholder `lead open|list|close` subcommands, which are
 removed when the first pipeline increment lands.
 
+**Deviations from the spec** (introduced in design review; the spec text is
+unchanged and this document supersedes it where they differ): the `no-action`
+mark is renamed `defer`; the queue command is `list` (not `queue`); event
+types drop the semantically null `lead_` prefix (the `lead/<id>` stream
+prefix already namespaces them); and question (c) is answered **fresh
+start** — the alpha CSV import is dropped (§6).
+
 ## 1. Model overview
 
 - **Aggregate:** `Lead`. One event stream per lead: `lead/<lead_id>`.
@@ -30,16 +37,33 @@ removed when the first pipeline increment lands.
   events. The `EventStore` trait is the only I/O seam:
   `append(stream, expected_seq, events)` and `load(stream)` / `replay()`.
 
+### Durability contract
+
+- **Single writer.** A command holds an exclusive lock (lockfile in the data
+  dir, `flock`) for the whole load → decide → append cycle; a second
+  concurrent process fails fast rather than racing `expected_seq`.
+- **A batch append is the commit unit.** All events in one `append()` call
+  are serialized and written with a single `write(2)` on an `O_APPEND` file
+  descriptor, followed by `fsync`. The two-event `reviewed` + `apply_queued`
+  batch (§5) therefore cannot be split by anything short of a crash
+  mid-write.
+- **Crash recovery.** On replay, a malformed trailing line (a torn write) is
+  discarded with a warning; any other malformed line is a hard error. A batch
+  torn between its events can leave a prefix visible — the §7
+  pending-recovery rule (an `apply-automatically` mark with no subsequent
+  `apply_queued` stays pending) is the semantic backstop.
+
 ### Event envelope
 
 Every line in the log is one envelope:
 
 ```json
 {
+  "envelope_version": 1,
   "id": "0192f8a1-…",
   "stream": "lead/0192f89f-…",
   "seq": 3,
-  "type": "lead_scored",
+  "type": "scored",
   "schema_version": 1,
   "occurred_at": "2026-08-25T19:00:00Z",
   "recorded_at": "2026-08-25T19:00:01Z",
@@ -49,21 +73,22 @@ Every line in the log is one envelope:
 }
 ```
 
-| Field            | Meaning                                                        |
-| ---------------- | -------------------------------------------------------------- |
-| `id`             | UUIDv7, unique per event.                                      |
-| `stream`         | `lead/<lead_id>`; the aggregate stream.                        |
-| `seq`            | Per-stream sequence, 1-based, gapless. Optimistic concurrency. |
-| `type`           | Event type (§3).                                               |
-| `schema_version` | Version of this event type's payload shape (§4).               |
-| `occurred_at`    | When the thing happened (user-supplied for imports/outcomes).  |
-| `recorded_at`    | When the event was appended.                                   |
-| `causation_id`   | ID of the event that directly caused this one, if any.         |
-| `correlation_id` | One UUID per command invocation; groups a command's events.    |
-| `payload`        | Event-type-specific body.                                      |
+| Field              | Meaning                                                              |
+| ------------------ | -------------------------------------------------------------------- |
+| `envelope_version` | Version of the envelope shape itself (§4).                           |
+| `id`               | UUIDv7, unique per event.                                            |
+| `stream`           | `lead/<lead_id>`; the aggregate stream.                              |
+| `seq`              | Per-stream sequence, 1-based, gapless. Optimistic concurrency.       |
+| `type`             | Event type (§3).                                                     |
+| `schema_version`   | Version of this event type's payload shape (§4).                     |
+| `occurred_at`      | When the thing happened (user-supplied for retro-recorded outcomes). |
+| `recorded_at`      | When the event was appended.                                         |
+| `causation_id`     | ID of the event that directly caused this one, if any.               |
+| `correlation_id`   | One UUID per command invocation; groups a command's events.          |
+| `payload`          | Event-type-specific body.                                            |
 
-`recorded_at` - `occurred_at` is meaningful for imports and retro-recorded
-outcomes; for pipeline events they are near-identical.
+`recorded_at` - `occurred_at` is meaningful for retro-recorded outcomes;
+for pipeline events they are near-identical.
 
 ## 2. Lead identity and re-ingest semantics (question a)
 
@@ -83,57 +108,77 @@ Computed from extracted fields, first applicable rule wins:
 1. **`req:<company-slug>:<req-id>`** — when both company and req id were
    extracted. Normalized: lowercase, trimmed, whitespace collapsed.
 2. **`url:<canonical-url>`** — canonicalized: scheme/host lowercased,
-   default port dropped, fragment dropped, all query params dropped
-   (drop-in adapter v0; per-adapter allowlists may retain params later),
-   trailing slashes collapsed.
+   default port dropped, fragment dropped, _known tracking parameters_
+   dropped (`utm_*`, `fbclid`, `gclid`, …), all other query params
+   **preserved**, trailing slashes collapsed. Boards that put the job id in
+   the query (`?jobId=123`) must not have distinct postings collapse into
+   one key; per-adapter rules may drop additional params only when the
+   board's URL contract is known. Known risk: a board variant that puts a
+   session/token (rather than the job id) in a non-tracking param defeats
+   dedupe for that board until its adapter lands.
 3. **`tc:<sha256>`** — SHA-256 over `normalize(title) + "\n" +
 normalize(company)`. Fallback for file drops with no URL or req id.
 
 All available identifier forms (req, url, title-company) are stored in the
 event payload and indexed by the projection, regardless of which form became
-the dedupe key. A re-ingest matches an existing lead if **any** indexed form
-hits, checked in precedence order — so a posting that gains a req id on
-repost still matches the earlier URL-keyed ingest via the URL index.
+the dedupe key. A re-ingest matches an existing lead on the **strongest form
+the incoming posting carries**: `req:` and `url:` hits always match (checked
+in precedence order — so a posting that gains a req id on repost still
+matches the earlier URL-keyed ingest via the URL index). The `tc:` fallback
+is consulted **only when the incoming posting has neither a req id nor a
+URL** — a posting carrying a strong identifier never merges onto another
+lead on title+company alone.
 
 ### Re-ingest semantics
 
 On ingest, compute identifiers and consult the lead index:
 
-- **No match** → mint `lead_id`, emit `lead_ingested`, run gates, then
+- **No match** → mint `lead_id`, emit `ingested`, run gates, then
   scoring.
 - **Match, latest mark is `ignore`** → the ignore mark is **durable**: emit
-  `lead_reingest_suppressed` (audit trail) and stop. No re-gating, no
+  `reingest_suppressed` (audit trail) and stop. No re-gating, no
   re-scoring, no queue re-entry. A re-ingested ignored lead never re-enters
-  the queue, on this run or any future run.
-- **Match, otherwise** → append `lead_updated` to the existing stream (new
+  the queue, on this run or any future run. Because marks are latest-wins,
+  re-marking an ignored lead lifts suppression: the next re-ingest follows
+  the ordinary `updated` path.
+- **Match, otherwise** → append `updated` to the existing stream (new
   extraction snapshot + list of changed fields), then **re-run gates and
-  scoring on the new content**: a gate failure emits `lead_rejected` (new
-  revision); a pass emits `lead_scored` (new revision). Rationale: gates are
+  scoring on the new content**: a gate failure emits `rejected` (new
+  revision); a pass emits `scored` (new revision). Rationale: gates are
   content-dependent — a repost that now lists compensation may pass a floor
-  it previously failed, and vice versa. The lead re-enters/updates the queue
-  at its new score; its deferral count is retained (it is history, and the
-  user can see it in the queue).
+  it previously failed, and vice versa. Whether the lead re-enters the
+  pending queue is governed by §7: only leads whose latest mark is absent or
+  `defer`, and which carry no outcome, re-enter. A lead already marked
+  `apply-automatically`/`apply-manual`, or one with an outcome, gets the
+  refreshed snapshot and new score revision but stays off the pending queue.
+  Its deferral count is retained (it is history, and the user can see it in
+  the queue).
 
-Known v0 limitation: two genuinely different postings with no URL and no req
-id can collide on the title+company hash. Acceptable at this volume; a later
-URL-form match self-heals by merging onto the existing stream.
+Known v0 limitation: two genuinely different postings that both lack a URL
+and a req id can still collide on the title+company hash, and a `tc:`-only
+drop can merge onto a lead that merely shares its title and company. These
+cases are ambiguous by inspection; acceptable at this volume. The converse
+does not self-heal: once a lead is keyed `tc:`-only, a later URL-bearing
+repost of the same posting mints a new lead (strong forms match first), so
+duplicates of that kind are tolerated until source adapters land.
 
 ## 3. Event schema (question b)
 
 `●` = emitted by the v0 pipeline. `○` = defined in the schema now, emitted
-only by `gwl-jobs outcome` (user-recorded) or `import-alpha` — the pipeline
-itself never produces them in v0.
+only by `gwl-jobs outcome` (user-recorded) — the pipeline itself never
+produces them in v0.
 
 ### Pipeline events
 
-**`lead_ingested`** ● — first sighting of a lead.
+**`ingested`** ● — first sighting of a lead.
 
 ```json
 {
   "dedupe_key": "req:nvidia:JR2018233",
   "identifiers": {
     "req": "req:nvidia:JR2018233",
-    "url": "url:https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/job/…"
+    "url": "url:https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/job/…",
+    "tc": "tc:9f2c…"
   },
   "source": "drop-in",
   "url": "https://nvidia.wd5.myworkdayjobs.com/…",
@@ -156,10 +201,9 @@ itself never produces them in v0.
 ```
 
 `extracted` fields are best-effort; any may be absent. `raw_text` is stored
-in the log (it is the source of truth; volume is trivial at this scale). For
-imports without posting text, `raw_text` is omitted.
+in the log (it is the source of truth; volume is trivial at this scale).
 
-**`lead_updated`** ● — re-ingest matched an existing, non-ignored lead.
+**`updated`** ● — re-ingest matched an existing, non-ignored lead.
 
 ```json
 {
@@ -171,13 +215,13 @@ imports without posting text, `raw_text` is omitted.
 }
 ```
 
-**`lead_reingest_suppressed`** ● — re-ingest matched a durably ignored lead.
+**`reingest_suppressed`** ● — re-ingest matched a durably ignored lead.
 
 ```json
 { "dedupe_key": "tc:9f2c…", "suppressed_by_mark": "ignore" }
 ```
 
-**`lead_rejected`** ● — a hard gate failed.
+**`rejected`** ● — a hard gate failed.
 
 ```json
 {
@@ -192,7 +236,7 @@ imports without posting text, `raw_text` is omitted.
 LLM scorer that fills it is vNext. `revision` counts gate/score evaluations
 of this lead (re-ingests re-evaluate).
 
-**`lead_scored`** ● — survived all gates.
+**`scored`** ● — survived all gates.
 
 ```json
 {
@@ -218,18 +262,18 @@ then omitted from `dimensions`, weights renormalize over the remainder, and
 [compensation: unknown, weight renormalized]`). `confidence` defaults to
 `1.0` and is only meaningful once LLM scorers arrive.
 
-**`lead_reviewed`** ● — the user marked a lead. Marks are latest-wins;
+**`reviewed`** ● — the user marked a lead. Marks are latest-wins;
 re-marking emits a new event.
 
 ```json
 { "mark": "apply-automatically", "note": null }
 ```
 
-`mark` ∈ `apply-automatically | apply-manual | no-action | ignore`.
-`no-action` increments the projected deferral count. `ignore` is durable
+`mark` ∈ `apply-automatically | apply-manual | defer | ignore`.
+`defer` increments the projected deferral count. `ignore` is durable
 (§2).
 
-**`lead_apply_queued`** ● — apply package prepared for an
+**`apply_queued`** ● — apply package prepared for an
 `apply-automatically` lead.
 
 ```json
@@ -247,23 +291,23 @@ re-marking emits a new event.
 
 ### Outcome events (○ — schema now, pipeline never emits)
 
-Recorded by the user via `gwl-jobs outcome` or produced by the alpha import.
-Each accepts optional `note`; `occurred_at` may be user-supplied for retro
-recording.
+Recorded by the user via `gwl-jobs outcome`. Each accepts optional `note`;
+`occurred_at` may be user-supplied for retro recording.
 
-| Type                        | Payload extras                    | Terminal? |
-| --------------------------- | --------------------------------- | --------- |
-| `lead_applied`              | `method: manual \| auto-assisted` | no        |
-| `lead_screened`             | `contact?`                        | no        |
-| `lead_interviewed`          | `stage?`                          | no        |
-| `lead_offered`              | —                                 | no        |
-| `lead_rejected_by_employer` | —                                 | yes       |
-| `lead_withdrawn`            | —                                 | yes       |
-| `lead_declined`             | — (user declined an offer)        | yes       |
-| `lead_archived`             | `reason`                          | yes       |
+| Type                   | Payload extras                    | Terminal? |
+| ---------------------- | --------------------------------- | --------- |
+| `applied`              | `method: manual \| auto-assisted` | no        |
+| `screened`             | `contact?`                        | no        |
+| `interviewed`          | `stage?`                          | no        |
+| `offered`              | —                                 | no        |
+| `accepted`             | `start_date?`                     | yes       |
+| `rejected_by_employer` | —                                 | yes       |
+| `withdrawn`            | —                                 | yes       |
+| `declined`             | — (user declined an offer)        | yes       |
+| `archived`             | `reason`                          | yes       |
 
 A lead with any outcome event leaves the review queue (§7). This set is
-deliberately closed-ended rather than a free-form `lead_outcome {kind}` so
+deliberately closed-ended rather than a free-form `outcome {kind}` so
 that projections and future analytics can match on concrete types.
 
 ## 4. Schema versioning and upcasting
@@ -277,8 +321,9 @@ Every event type starts at `schema_version: 1`.
   `upcast(type, from_version, payload_json) -> payload_json`, chained at
   replay (`v1 → v2 → v3`).
 - The log is **never rewritten**. Upcasting happens in memory on read.
-- The envelope itself carries an implicit version 1; envelope changes follow
-  the same rule.
+- The envelope carries an explicit `envelope_version`, versioned
+  independently of payload `schema_version`; envelope changes follow the
+  same additive/upcaster rules.
 
 This is the plan required before the first real event is written; the first
 pipeline increment ships the upcaster registry (empty) alongside the log
@@ -297,58 +342,53 @@ reader so the seam exists from day one.
    breakdown, and deferral count; then prompts:
 
    ```
-   [a] apply-automatically  [m] apply-manual  [n] no-action  [i] ignore  [s] skip  [q] quit
+   [a] apply-automatically  [m] apply-manual  [d] defer  [i] ignore  [s] skip  [q] quit
    ```
 
-   - `a` — emits `lead_reviewed{apply-automatically}`, then immediately
-     prepares the package (generic letter + cheat sheet + resume PDF), emits
-     `lead_apply_queued`, and opens the posting URL. The mark _is_ the
-     approval; there is no second confirmation. The browser click is the
-     user's.
-   - `m` — emits `lead_reviewed{apply-manual}`; prints JD + resume context +
+   - `a` — first prepares the package (generic letter + cheat sheet +
+     resume PDF); on success, appends `reviewed{apply-automatically}` and
+     `apply_queued` **in a single batch `append()`** (one `correlation_id`;
+     the `apply_queued`'s `causation_id` is the `reviewed` event's id), then
+     opens the posting URL. If package preparation fails, no events are
+     appended and the lead stays pending. The mark _is_ the approval; there
+     is no second confirmation. The browser click is the user's.
+   - `m` — emits `reviewed{apply-manual}`; prints JD + resume context +
      cheat sheet for the user to act on.
-   - `n` — emits `lead_reviewed{no-action}`; deferral count +1; reappears
-     next review.
-   - `i` — emits `lead_reviewed{ignore}`; durable (§2).
-   - `s` — no event; move on (differs from `n`: no deferral counted).
+   - `d` — emits `reviewed{defer}`; deferral count +1; reappears next
+     review.
+   - `i` — emits `reviewed{ignore}`; durable (§2).
+   - `s` — no event; move on. Skip is session-local with no durable
+     effect: a skipped lead is indistinguishable from an un-reviewed one
+     and reappears in the same position next review (unlike `d`, no
+     deferral counted).
    - `q` — stop.
 
 3. Because state is the event log, quitting mid-loop loses nothing; the loop
    is resumable by construction.
 
-Prompt input uses `dialoguer` (small, pure-Rust, single-key selection) —
-justified by the project's energy-economics goal: the review loop is the
-screen the user touches most, and arrow/one-key selection is materially
-cheaper than typed answers. A ratatui TUI is explicitly vNext-sized and out
-of scope.
+Prompt input reads raw keys via `console::Term::read_key` (the lower-level
+crate `dialoguer` itself builds on — small, pure-Rust). `dialoguer::Select`
+was considered and rejected: it navigates with arrows + Enter and cannot
+deliver the single-key `a`/`m`/`d`/`i`/`s`/`q` hotkeys above, which are the
+point — the review loop is the screen the user touches most, and one-key
+marks are materially cheaper than navigate-and-confirm (the project's
+energy-economics goal). A ratatui TUI is explicitly vNext-sized and out of
+scope.
 
 ## 6. The alpha's fate (question c)
 
-**Decision: one-time import, not a fresh start.**
+**Decision: fresh start. The alpha CSV is not imported.**
 
 `~/Documents/Job Hunt/events/events.csv` records 11 real outcomes (`Applied`
-×8, `Screened` ×3) with company, role, req id, URL, source, contact, and
-notes. A fresh start would lose the one thing this history is good for:
-**dedupe against the past.** Without it, a reposted NVIDIA JR2018233 would
-cheerfully re-enter the review queue for a job already applied to. The
-outcome events in §3 exist partly so this import is lossless.
-
-A later small increment adds `gwl-jobs import-alpha <csv>`:
-
-- Each row emits `lead_ingested` (`source: "alpha-csv"`, `occurred_at` from
-  the Date column, extracted fields from the columns, no `raw_text`) plus
-  exactly one outcome event: `Applied` → `lead_applied{method: manual}`,
-  `Screened` → `lead_screened{contact}`, carrying notes.
-- Gates and scoring are **not** run — the import is a historical record, not
-  a triage candidate, and there is no JD text to score.
-- Imported leads are terminally out of the review queue by the §7 rule (any
-  outcome event ⇒ off-queue).
-- The import is idempotent via dedupe keys: re-running it matches the
-  already-imported leads and appends nothing.
-
-The import is not on the v0 critical path; it lands after the pipeline as
-its own increment. If it were cut entirely, the fallback is a fresh start —
-accepted with eyes open that re-apply protection is lost.
+×8, `Screened` ×3) from the manual alpha. The countervailing value of
+importing was dedupe against the past — without it, a reposted req for an
+already-applied job (e.g. NVIDIA JR2018233) can re-enter the review queue as
+if new. **That risk is accepted, explicitly.** The remedy is manual and
+cheap: the §3 outcome set subsumes the alpha's Applied/Screened vocabulary,
+so any historical row can be retro-recorded with `gwl-jobs outcome` (`--at`
+carries the original date) if a familiar posting resurfaces. The alpha's
+`jds/` archive and the cover-letter corpus stay on disk as reference
+material; nothing in the tool reads them.
 
 ## 7. Projections and queue membership
 
@@ -358,30 +398,34 @@ In-memory, rebuilt by replaying the log at startup:
 - **LeadBook** — per lead: latest extraction snapshot, latest score
   (max revision), latest mark, deferral count, gate status, outcome state.
 
-**Review queue membership:** leads with a current `lead_scored`, no
-subsequent failing `lead_rejected`, no outcome event, not archived, and
-latest mark absent or `no-action`. Ranked by composite score descending.
+**Review queue membership:** leads with a current `scored`, no
+subsequent failing `rejected`, no outcome event, not archived, and
+latest mark absent or `defer`. Ranked by composite score descending.
 `apply-automatically`/`apply-manual` leads that have not yet recorded an
-outcome appear in `gwl-jobs queue --all` but not in the pending queue —
+outcome appear in `gwl-jobs list --all` but not in the pending queue —
 they have been acted on; `gwl-jobs outcome` is how they move forward.
+
+**Pending recovery:** a lead whose latest mark is `apply-automatically` but
+which has **no** subsequent `apply_queued` is treated as still-pending. That
+state is only reachable via a crash mid-batch (§1); this rule is the
+recovery path.
 
 ## 8. Command surface
 
 Supersedes and removes the placeholder `lead open|list|close`.
 
-| Command                                               | Purpose                                              | Events emitted                                                                                       |
-| ----------------------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `gwl-jobs ingest <url>`                               | Fetch, extract, dedupe, gate, score a posting.       | `lead_ingested` / `lead_updated` / `lead_reingest_suppressed`, then `lead_rejected` or `lead_scored` |
-| `gwl-jobs ingest --file <path>`                       | Same, from a local HTML/PDF/text drop.               | same                                                                                                 |
-| `gwl-jobs queue [--all]`                              | Print the ranked review queue.                       | —                                                                                                    |
-| `gwl-jobs review`                                     | Interactive prompt loop (§5).                        | `lead_reviewed`, `lead_apply_queued`                                                                 |
-| `gwl-jobs mark <lead> <mark> [--note]`                | Non-interactive mark (scriptable).                   | `lead_reviewed`                                                                                      |
-| `gwl-jobs package <lead>`                             | (Re)build the apply package; open the posting URL.   | `lead_apply_queued`                                                                                  |
-| `gwl-jobs show <lead>`                                | Full detail: snapshot, score history, marks, events. | —                                                                                                    |
-| `gwl-jobs outcome <lead> <type> [--note] [--at <ts>]` | Record an outcome (§3 table).                        | `lead_applied` / `lead_screened` / …                                                                 |
-| `gwl-jobs events [--lead <id>] [--type <t>]`          | Dump/filter the raw log (debugging, golden tests).   | —                                                                                                    |
-| `gwl-jobs import-alpha <csv>`                         | One-time alpha import (§6; later increment).         | `lead_ingested` + outcome events                                                                     |
-| `gwl-jobs completion`                                 | Shell completions (existing).                        | —                                                                                                    |
+| Command                                               | Purpose                                                                                                                                      | Events emitted                                                              |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `gwl-jobs ingest <url>`                               | Fetch, extract, dedupe, gate, score a posting.                                                                                               | `ingested` / `updated` / `reingest_suppressed`, then `rejected` or `scored` |
+| `gwl-jobs ingest --file <path>`                       | Same, from a local HTML/PDF/text drop.                                                                                                       | same                                                                        |
+| `gwl-jobs list [--all]`                               | Print the ranked review queue.                                                                                                               | —                                                                           |
+| `gwl-jobs review`                                     | Interactive prompt loop (§5).                                                                                                                | `reviewed`, `apply_queued`                                                  |
+| `gwl-jobs mark <lead> <mark> [--note]`                | Non-interactive mark (scriptable). `apply-automatically` runs the same prepare → batch-append → open flow as the review loop's `a` key (§5). | `reviewed` (+ `apply_queued`)                                               |
+| `gwl-jobs package <lead>`                             | (Re)build the apply package for a lead marked `apply-automatically`; re-print and re-open the URL. Bails on unmarked leads — mark first.     | `apply_queued`                                                              |
+| `gwl-jobs show <lead>`                                | Full detail: snapshot, score history, marks, events.                                                                                         | —                                                                           |
+| `gwl-jobs outcome <lead> <type> [--note] [--at <ts>]` | Record an outcome (§3 table).                                                                                                                | `applied` / `screened` / …                                                  |
+| `gwl-jobs events [--lead <id>] [--type <t>]`          | Dump/filter the raw log (debugging, golden tests).                                                                                           | —                                                                           |
+| `gwl-jobs completion`                                 | Shell completions (existing).                                                                                                                | —                                                                           |
 
 `<lead>` addressing: unambiguous UUID prefix of the `lead_id`. The review
 loop needs no addressing. Conventions carried forward: clap subcommands,
@@ -420,4 +464,5 @@ src/
 Per increment, per AGENTS.md: unit tests for gate/scoring/identity logic
 (canonicalization, precedence, re-ingest matching, weight renormalization,
 breakdown rendering) and golden round-trip tests for the JSONL log
-(write → replay → projection equality, upcaster no-op at current versions).
+(write → replay → projection equality, upcaster no-op at current versions,
+torn-tail replay tolerance).
