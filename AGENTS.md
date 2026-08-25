@@ -74,21 +74,13 @@ These come from the spec and apply to every change:
 - **lib/bin split**: `src/lib.rs` is the library; `src/main.rs` is a thin entry
   point (parse CLI, init telemetry, dispatch, shutdown). Put logic in the
   library, not in main.
-- **Event-sourcing seams** (define early, even if stubbed):
-  - `EventEnvelope` metadata: event id, stream/aggregate id, sequence/version,
-    recorded/occurred timestamps, causation/correlation ids, schema version.
-  - `EventStore` trait: `append(stream, expected_version, events)` +
-    `load(stream)` / `replay()`.
-  - Aggregate pattern: pure `decide(command, state) -> events` and
-    `evolve(state, event) -> state`.
-  - Projection/read-model layer for status/list views.
-  - Schema versioning/upcasting plan before the first real event is written.
-- These seams are directional guidance predating the increment plan. The design
-  doc produced by Increment 0 (`docs/design/`) is authoritative once merged —
-  update this section to match it at that point.
-- Current modules are flat (`cli`, `commands`, `config`, `model`, `telemetry`);
-  they will evolve toward `domain/`, `event_store/`, `projections/` as the
-  event model lands.
+- **Event-sourcing seams**: `docs/design/0001-event-schema-and-command-surface.md`
+  is authoritative. It defines the `EventEnvelope` metadata, the `EventStore`
+  trait, the aggregate `decide`/`evolve` pattern, projections, and the schema
+  versioning/upcasting plan.
+- Modules evolve from flat (`cli`, `commands`, `config`, `model`, `telemetry`)
+  toward `domain/`, `event_store/`, `projections/`, `ingest/` per the layout
+  in design doc 0001 §9.
 - Config/data paths come from `directories::ProjectDirs`.
 
 ## Code Conventions
