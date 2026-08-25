@@ -54,6 +54,15 @@ These come from the spec and apply to every change:
 - The agent may continue ahead via stacked PRs, capped at 2.
 - Before opening a new stacked PR, check for review feedback (Copilot, Remi,
   human) on existing PRs and incorporate it.
+- Review cast: Copilot auto-reviews with inline comments; Remi is a required
+  reviewer; Grey may also post folded third-party reviews (e.g., deepseek) as
+  PR comments from his own account — treat those as review feedback, not as
+  Grey's own inline comments.
+- **Merging**: GitHub disallows merge commits on this repo. Rebase the branch
+  onto `main` locally, force-push, then `gh pr merge <n> --rebase`. GitHub
+  auto-deletes the PR branch on merge; local cleanup is `git worktree
+remove`, `git branch -d` (the "not fully merged" warning is expected —
+  rebase-merge rewrote the SHAs), and `git fetch --prune`.
 - The first increment is a design PR (event schema + command surface) that must
   answer: lead identity & re-ingest semantics, full lifecycle events, alpha CSV
   fate, and the review-loop interaction model. Its design doc lands in
