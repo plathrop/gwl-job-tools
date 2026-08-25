@@ -52,3 +52,4 @@
 {"type":"update","issueId":"GWLJ-9x3rbj","timestamp":"2026-08-25T18:29:43.008Z","data":{},"source":"gwl-job-tools"}
 {"type":"create","issueId":"GWLJ-oujjs3","timestamp":"2026-08-25T18:29:43.736Z","data":{"title":"SQLite projection","type":"task","priority":4,"description":"Add a SQLite projection (read model) over the JSONL event log for ad-hoc querying (e.g., show ignored jobs, applied in last 30 days). The JSONL event log remains the source of truth; SQLite is a derived cache rebuilt by replaying the log. Deferred from v0 (in-memory projection is sufficient for a single-user CLI).","parent":"GWLJ-32p6d0"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-32p6d0","timestamp":"2026-08-25T18:29:43.739Z","data":{},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-rk2cnb","timestamp":"2026-08-25T18:37:59.512Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
