@@ -30,7 +30,7 @@ A deterministic pipeline with these stages:
 ### 1. Ingest
 
 Accept a URL or a file (HTML/PDF/text). Fetch and extract the main text. Emit a
-`lead_ingested` event containing the raw text plus best-effort structured
+`ingested` event containing the raw text plus best-effort structured
 fields: title, company, compensation, location, req id, and source. Sources are
 pluggable adapters; v0 ships only the drop-in adapter (Greenhouse/Ashby/Lever
 adapters are vNext).
@@ -38,7 +38,7 @@ adapters are vNext).
 ### 2. Hard filters (gates)
 
 Binary reject, not scored. A lead failing any gate is rejected and durably
-recorded via a `lead_rejected { gate, reason }` event. Gates:
+recorded via a `rejected { gate, reason }` event. Gates:
 
 - **remote-only** — reject non-remote positions.
 - **compensation floor** — reject below the configured floor.
@@ -64,22 +64,22 @@ Dimensions:
 Composite = weighted sum (`Σ(wᵢ·scoreᵢ) / Σwᵢ`), default equal weights,
 configurable. The breakdown must be human-readable (e.g.,
 `75 = 0.3·level(80) + 0.3·skills(90) + 0.4·comp(60)`) so I can debug _why_ a
-lead ranked where it did. Emit a `lead_scored` event.
+lead ranked where it did. Emit a `scored` event.
 
 ### 4. Review queue
 
 Ranked by composite score. Interactive CLI. The queue shows a deferral count
-per lead (number of times marked no-action). I mark each lead with one of:
+per lead (number of times marked defer). I mark each lead with one of:
 
 | Mark                    | Meaning                                                                                                     |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------- |
 | **apply-automatically** | This mark _is_ the approval (no second confirmation). Tool prepares the full package and opens the posting. |
 | **apply-manual**        | I take personal action (internal contact, custom cover letter). Tool facilitates.                           |
-| **no-action**           | Stays in the queue; reappears next review.                                                                  |
+| **defer**               | Stays in the queue; reappears next review.                                                                  |
 | **ignore**              | Durable; never re-matches on future runs.                                                                   |
 
-Emit a `lead_reviewed` event. Marks are latest-wins projections over
-`lead_reviewed` events (re-marking a lead emits a new event; the projection
+Emit a `reviewed` event. Marks are latest-wins projections over
+`reviewed` events (re-marking a lead emits a new event; the projection
 takes the latest).
 
 ### 5. Apply package
@@ -87,7 +87,7 @@ takes the latest).
 - **apply-automatically** — attach the generic cover letter (config path) + a
   generated "answers cheat sheet" (common ATS questions → resume-derived
   answers, rendered and displayed alongside; nothing is auto-filled in v0) +
-  the resume PDF; emit `lead_apply_queued`; open the posting URL.
+  the resume PDF; emit `apply_queued`; open the posting URL.
   In v0 this degrades to manual submit; Playwright autofill is vNext.
 - **apply-manual** — provide the JD + resume context + the same cheat sheet.
 
@@ -146,10 +146,19 @@ rebuilt on startup for the queue. SQLite projection is deferred.
   The design PR must answer: (a) lead identity — what uniquely identifies a
   lead (URL? req id? title+company hash?) and re-ingest semantics for
   updated/reposted leads; (b) the full lifecycle in the event schema,
-  including outcome events (e.g., `lead_applied`, `lead_screened`) even if v0
+  including outcome events (e.g., `applied`, `screened`) even if v0
   emits only a subset; (c) the alpha's fate — fresh start vs. one-time CSV
   import of `events.csv`; (d) the review queue's interaction model — a prompt
   loop is plenty for v0 (a ratatui TUI is a vNext-sized dependency).
+
+  Increment 0 answered these in
+  `docs/design/0001-event-schema-and-command-surface.md`. Two answers
+  supersede this text: the alpha's fate is **fresh start** (no CSV import —
+  `docs/decisions/0001-fresh-start-over-alpha-csv-import.md`), and the
+  event/mark/command vocabulary was renamed (`no-action` → `defer`,
+  `lead_`-prefixed event types drop the prefix, the queue command is `list`)
+  — this document has been updated to match
+  (`docs/decisions/0002-v0-naming.md`).
 
 ## Key Decisions (already made — do not re-litigate)
 
@@ -179,7 +188,7 @@ v0 is done when I can:
 2. Have it pass hard filters (remote, comp floor, blacklist) and produce a
    composite score with a human-readable breakdown.
 3. See a ranked review queue.
-4. Mark each lead apply-automatically / apply-manual / no-action / ignore,
+4. Mark each lead apply-automatically / apply-manual / defer / ignore,
    durably.
 5. For apply-automatically: get the full package (generic letter + cheat sheet +
    resume PDF) and the posting URL opened.

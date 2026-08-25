@@ -17,12 +17,12 @@ follow. It answers the four Increment 0 questions:
 It supersedes the placeholder `lead open|list|close` subcommands, which are
 removed when the first pipeline increment lands.
 
-**Deviations from the spec** (introduced in design review; the spec text is
-unchanged and this document supersedes it where they differ): the `no-action`
-mark is renamed `defer`; the queue command is `list` (not `queue`); event
-types drop the semantically null `lead_` prefix (the `lead/<id>` stream
-prefix already namespaces them); and question (c) is answered **fresh
-start** — the alpha CSV import is dropped (§6).
+**Review-round decisions:** two naming/scope changes from design review are
+recorded as decision records —
+`docs/decisions/0001-fresh-start-over-alpha-csv-import.md` (question (c) is
+answered **fresh start**; no import) and `docs/decisions/0002-v0-naming.md`
+(the `no-action` mark is `defer`, event types carry no `lead_` prefix, the
+queue command is `list`). The spec has been updated to match.
 
 ## 1. Model overview
 
