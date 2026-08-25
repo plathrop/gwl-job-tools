@@ -1,8 +1,8 @@
 use clap::Parser;
 use gwl_job_tools::{
+    APP_NAME,
     cli::{self, Cli},
     telemetry::init_telemetry,
-    APP_NAME,
 };
 use miette::Result;
 use tracing::info_span;
@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         let main_span = info_span!("cli", command = cli.command_name());
         let _guard = main_span.enter();
 
-        cli::execute(cli.command)
+        cli::execute(cli.command).await
     };
 
     telemetry.shutdown()?;

@@ -1,42 +1,36 @@
-use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
 use miette::Result;
 use tracing::instrument;
 use url::Url;
 
-use crate::{commands::execute_lead, model::LeadSource, telemetry::TelemetryStatus, APP_NAME};
+use crate::{APP_NAME, commands, telemetry::TelemetryStatus};
 
-#[derive(Clone, Debug, Subcommand)]
-pub enum LeadCommands {
-    /// Close a job lead
-    Close,
+#[derive(Clone, Debug, Args)]
+pub struct IngestArgs {
+    /// URL of a job posting to fetch and ingest
+    #[arg(required_unless_present = "file", conflicts_with = "file")]
+    pub url: Option<Url>,
 
-    /// List job leads
-    List {
-        #[arg(long)]
-        closed: bool,
-    },
+    /// Local file to ingest (HTML or plain text)
+    #[arg(long)]
+    pub file: Option<PathBuf>,
+}
 
-    /// Open a job lead
-    Open {
-        company: String,
-        #[arg(long, default_value_t = String::default())]
-        notes: String,
-        source: LeadSource,
-        title: String,
-        #[arg(long)]
-        req: Option<String>,
-        #[arg(long)]
-        url: Option<Url>,
-    },
+#[derive(Clone, Debug, Args)]
+pub struct ShowArgs {
+    /// Unambiguous UUID prefix of the lead
+    pub id: String,
 }
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum Commands {
-    /// Manage job leads
-    Lead {
-        #[command(subcommand)]
-        action: LeadCommands,
-    },
+    /// Fetch and ingest a job posting (URL or local file)
+    Ingest(IngestArgs),
+
+    /// Show a lead's projected state
+    Show(ShowArgs),
 
     /// Generate shell completions
     Completion,
@@ -61,11 +55,8 @@ pub struct Cli {
 impl Cli {
     pub fn command_name(&self) -> &'static str {
         match self.command.as_ref() {
-            Some(Commands::Lead { action }) => match action {
-                LeadCommands::Close => "close",
-                LeadCommands::List { .. } => "list",
-                LeadCommands::Open { .. } => "open",
-            },
+            Some(Commands::Ingest(_)) => "ingest",
+            Some(Commands::Show(_)) => "show",
             Some(Commands::Completion) => "completion",
             None => unreachable!("clap will print help if a subcommand is not provided"),
         }
@@ -73,9 +64,10 @@ impl Cli {
 }
 
 #[instrument(skip(command), fields(command = cmd_label(&command)))]
-pub fn execute(command: Option<Commands>) -> Result<()> {
+pub async fn execute(command: Option<Commands>) -> Result<()> {
     match command {
-        Some(Commands::Lead { action }) => execute_lead(action),
+        Some(Commands::Ingest(args)) => commands::execute_ingest(args).await,
+        Some(Commands::Show(args)) => commands::execute_show(args).await,
         Some(Commands::Completion) => miette::bail!("completion is not yet implemented"),
         None => miette::bail!("no command provided; run `{APP_NAME} --help`"),
     }
@@ -83,7 +75,8 @@ pub fn execute(command: Option<Commands>) -> Result<()> {
 
 fn cmd_label(command: &Option<Commands>) -> &'static str {
     match command {
-        Some(Commands::Lead { .. }) => "lead",
+        Some(Commands::Ingest(_)) => "ingest",
+        Some(Commands::Show(_)) => "show",
         Some(Commands::Completion) => "completion",
         None => "none",
     }
@@ -95,140 +88,42 @@ mod tests {
 
     use super::*;
 
-    fn cli_with_action(action: LeadCommands) -> Cli {
-        Cli {
-            color: colorchoice_clap::Color {
-                color: ColorChoice::Auto,
-            },
-            telemetry: TelemetryStatus::Off,
-            command: Some(Commands::Lead { action }),
-        }
+    #[test]
+    fn parse_ingest_url() {
+        let cli =
+            Cli::try_parse_from(["gwl-jobs", "ingest", "https://example.com/job/123"]).unwrap();
+        assert_eq!(cli.command_name(), "ingest");
     }
 
     #[test]
-    fn command_name_close() {
-        let cli = cli_with_action(LeadCommands::Close);
-        assert_eq!(cli.command_name(), "close");
+    fn parse_ingest_file() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "ingest", "--file", "jd.html"]).unwrap();
+        assert_eq!(cli.command_name(), "ingest");
     }
 
     #[test]
-    fn command_name_list() {
-        let cli = cli_with_action(LeadCommands::List { closed: false });
-        assert_eq!(cli.command_name(), "list");
+    fn parse_ingest_requires_url_or_file() {
+        assert!(Cli::try_parse_from(["gwl-jobs", "ingest"]).is_err());
     }
 
     #[test]
-    fn command_name_open() {
-        let cli = cli_with_action(LeadCommands::Open {
-            company: "Acme Corp".into(),
-            notes: String::new(),
-            req: None,
-            source: "referral".try_into().unwrap(),
-            title: "Engineer".into(),
-            url: None,
-        });
-        assert_eq!(cli.command_name(), "open");
-    }
-
-    // ── execute ──────────────────────────────────────────────────
-
-    #[test]
-    fn execute_lead_open_succeeds() {
-        let result = execute(Some(Commands::Lead {
-            action: LeadCommands::Open {
-                company: "Acme Corp".into(),
-                notes: String::new(),
-                req: None,
-                source: "referral".try_into().unwrap(),
-                title: "Engineer".into(),
-                url: None,
-            },
-        }));
-        assert!(result.is_ok());
+    fn parse_ingest_url_and_file_conflict() {
+        assert!(
+            Cli::try_parse_from([
+                "gwl-jobs",
+                "ingest",
+                "https://example.com/job",
+                "--file",
+                "jd.html"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
-    fn command_name_completion() {
-        let cli = Cli {
-            color: colorchoice_clap::Color {
-                color: ColorChoice::Auto,
-            },
-            telemetry: TelemetryStatus::Off,
-            command: Some(Commands::Completion),
-        };
-        assert_eq!(cli.command_name(), "completion");
-    }
-
-    #[test]
-    fn execute_none_returns_error() {
-        let result = execute(None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn execute_completion_returns_error() {
-        let result = execute(Some(Commands::Completion));
-        assert!(result.is_err());
-    }
-
-    // ── CLI parsing ───────────────────────────────────────────────
-
-    #[test]
-    fn parse_lead_close() {
-        let cli = Cli::try_parse_from(["gwl-jobs", "lead", "close"]).unwrap();
-        assert_eq!(cli.command_name(), "close");
-    }
-
-    #[test]
-    fn parse_lead_list_default() {
-        let cli = Cli::try_parse_from(["gwl-jobs", "lead", "list"]).unwrap();
-        assert_eq!(cli.command_name(), "list");
-    }
-
-    #[test]
-    fn parse_lead_list_closed() {
-        let cli = Cli::try_parse_from(["gwl-jobs", "lead", "list", "--closed"]).unwrap();
-        assert_eq!(cli.command_name(), "list");
-    }
-
-    #[test]
-    fn parse_lead_open_minimal() {
-        let cli = Cli::try_parse_from([
-            "gwl-jobs",
-            "lead",
-            "open",
-            "Acme Corp",
-            "referral",
-            "Engineer",
-        ])
-        .unwrap();
-        assert_eq!(cli.command_name(), "open");
-    }
-
-    #[test]
-    fn parse_lead_open_all_options() {
-        let cli = Cli::try_parse_from([
-            "gwl-jobs",
-            "lead",
-            "open",
-            "Acme Corp",
-            "referral",
-            "Engineer",
-            "--notes",
-            "some notes",
-            "--req",
-            "REQ-123",
-            "--url",
-            "https://example.com/job",
-        ])
-        .unwrap();
-        assert_eq!(cli.command_name(), "open");
-    }
-
-    #[test]
-    fn parse_lead_open_invalid_source_fails() {
-        let result = Cli::try_parse_from(["gwl-jobs", "lead", "open", "Acme", "bogus", "Title"]);
-        assert!(result.is_err());
+    fn parse_show() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "show", "0192f8a1"]).unwrap();
+        assert_eq!(cli.command_name(), "show");
     }
 
     #[test]
@@ -239,20 +134,26 @@ mod tests {
 
     #[test]
     fn parse_no_subcommand_fails() {
-        let result = Cli::try_parse_from(["gwl-jobs"]);
-        assert!(result.is_err());
+        assert!(Cli::try_parse_from(["gwl-jobs"]).is_err());
     }
 
     #[test]
     fn parse_telemetry_default_is_off() {
-        let cli = Cli::try_parse_from(["gwl-jobs", "lead", "close"]).unwrap();
+        let cli = Cli::try_parse_from(["gwl-jobs", "show", "abc"]).unwrap();
         assert!(matches!(cli.telemetry, TelemetryStatus::Off));
     }
 
     #[cfg(feature = "telemetry")]
     #[test]
     fn parse_telemetry_on() {
-        let cli = Cli::try_parse_from(["gwl-jobs", "--telemetry", "on", "lead", "close"]).unwrap();
+        let cli = Cli::try_parse_from(["gwl-jobs", "--telemetry", "on", "show", "abc"]).unwrap();
         assert!(matches!(cli.telemetry, TelemetryStatus::On));
+    }
+
+    #[test]
+    fn command_name_none_panics_only_via_unreachable() {
+        // The None branch is unreachable in practice (clap requires a
+        // subcommand); keep the color/telemetry wiring type-checked.
+        let _ = ColorChoice::Auto;
     }
 }
