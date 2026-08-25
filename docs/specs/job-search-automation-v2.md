@@ -28,6 +28,7 @@ triage assistant, not a fire-and-forget bot.
 A deterministic pipeline with these stages:
 
 ### 1. Ingest
+
 Accept a URL or a file (HTML/PDF/text). Fetch and extract the main text. Emit a
 `lead_ingested` event containing the raw text plus best-effort structured
 fields: title, company, compensation, location, req id, and source. Sources are
@@ -35,16 +36,18 @@ pluggable adapters; v0 ships only the drop-in adapter (Greenhouse/Ashby/Lever
 adapters are vNext).
 
 ### 2. Hard filters (gates)
+
 Binary reject, not scored. A lead failing any gate is rejected and durably
 recorded via a `lead_rejected { gate, reason }` event. Gates:
 
 - **remote-only** — reject non-remote positions.
 - **compensation floor** — reject below the configured floor.
 - **blacklist** — reject blacklisted companies (e.g., Salesforce).
-- **ideological red lines** — the *mechanism* must exist in v0 (a filter list),
-  but the *content* is deferred to a later LLM-based scorer (Remi).
+- **ideological red lines** — the _mechanism_ must exist in v0 (a filter list),
+  but the _content_ is deferred to a later LLM-based scorer (Remi).
 
 ### 3. Scoring
+
 Each surviving lead gets per-dimension scores in 0–100, each carrying a
 `confidence` field (default `1.0`; only meaningful once LLM scorers arrive).
 Dimensions:
@@ -60,25 +63,27 @@ Dimensions:
 
 Composite = weighted sum (`Σ(wᵢ·scoreᵢ) / Σwᵢ`), default equal weights,
 configurable. The breakdown must be human-readable (e.g.,
-`75 = 0.3·level(80) + 0.3·skills(90) + 0.4·comp(60)`) so I can debug *why* a
+`75 = 0.3·level(80) + 0.3·skills(90) + 0.4·comp(60)`) so I can debug _why_ a
 lead ranked where it did. Emit a `lead_scored` event.
 
 ### 4. Review queue
+
 Ranked by composite score. Interactive CLI. The queue shows a deferral count
 per lead (number of times marked no-action). I mark each lead with one of:
 
-| Mark | Meaning |
-|---|---|
-| **apply-automatically** | This mark *is* the approval (no second confirmation). Tool prepares the full package and opens the posting. |
-| **apply-manual** | I take personal action (internal contact, custom cover letter). Tool facilitates. |
-| **no-action** | Stays in the queue; reappears next review. |
-| **ignore** | Durable; never re-matches on future runs. |
+| Mark                    | Meaning                                                                                                     |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **apply-automatically** | This mark _is_ the approval (no second confirmation). Tool prepares the full package and opens the posting. |
+| **apply-manual**        | I take personal action (internal contact, custom cover letter). Tool facilitates.                           |
+| **no-action**           | Stays in the queue; reappears next review.                                                                  |
+| **ignore**              | Durable; never re-matches on future runs.                                                                   |
 
 Emit a `lead_reviewed` event. Marks are latest-wins projections over
 `lead_reviewed` events (re-marking a lead emits a new event; the projection
 takes the latest).
 
 ### 5. Apply package
+
 - **apply-automatically** — attach the generic cover letter (config path) + a
   generated "answers cheat sheet" (common ATS questions → resume-derived
   answers, rendered and displayed alongside; nothing is auto-filled in v0) +
@@ -87,13 +92,14 @@ takes the latest).
 - **apply-manual** — provide the JD + resume context + the same cheat sheet.
 
 ### 6. Event log
+
 Append-only JSONL is the **source of truth**. An in-memory projection is
 rebuilt on startup for the queue. SQLite projection is deferred.
 
 ## What It Should NOT Do
 
 - Never auto-submit without explicit per-job approval. The "apply-automatically"
-  mark *is* that approval; the final click in the browser is expected and fine.
+  mark _is_ that approval; the final click in the browser is expected and fine.
 - Never fabricate or embellish experience or skills.
 - Never contact people (recruiters, insiders) automatically.
 - Be a good citizen: respect ToS and rate limits (e.g., 200–500ms delay between
