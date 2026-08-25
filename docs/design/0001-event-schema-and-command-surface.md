@@ -203,6 +203,15 @@ produces them in v0.
 `extracted` fields are best-effort; any may be absent. `raw_text` is stored
 in the log (it is the source of truth; volume is trivial at this scale).
 
+`source` identifies the adapter that produced the event. v0 ships the
+platform-aware **drop-in adapter**: a dropped URL matching a known board
+(Greenhouse, Ashby, Lever, Workday) is fetched via the board's **public JSON
+API first** — structured, ToS-friendly, and robust against anti-scraping
+frontends — falling back to HTML fetch + main-text extraction for unknown
+sites or unrecognized API responses. `source` records the platform
+(`greenhouse`/`ashby`/`lever`/`workday`) or `drop-in`. This is extraction
+for URLs already in hand; discovery (watchlist polling) remains vNext.
+
 **`updated`** ● — re-ingest matched an existing, non-ignored lead.
 
 ```json
@@ -452,7 +461,9 @@ src/
     jsonl.rs        # append-only JSONL implementation
     upcast.rs       # upcaster registry
   projections/      # LeadIndex, LeadBook, queue views
-  ingest/           # source adapters (v0: drop-in)
+  ingest/           # source adapters (v0: platform-aware drop-in)
+    platforms.rs    # board detection, public JSON API adapters
+    extract.rs      # field extraction, HTML main-text fallback
   config.rs         # TOML config + AppPaths
   telemetry.rs      # as-is
 ```

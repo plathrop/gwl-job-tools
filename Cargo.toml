@@ -24,15 +24,23 @@ telemetry = [
 clap = { version = "4.6.6", features = ["derive", "env", "cargo", "unicode", "wrap_help"] }
 colorchoice-clap = "1.0"
 directories = "6.0"
+dom_smoothie = "0.18.0"
+fs2 = "0.4.3"
+html2text = "0.17.1"
+jiff = { version = "0.2.35", features = ["serde"] }
 miette = { version = "7.6.0", features = ["fancy", "derive"] }
 opentelemetry = { version = "0.32.0", features = ["trace"], optional = true }
 opentelemetry-otlp = { version = "0.32", features = ["http-proto", "reqwest-client", "reqwest-rustls"], optional = true }
 opentelemetry-semantic-conventions = { version = "0.26", optional = true }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"], optional = true }
+regex = "1.13.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_with = { version = "3.22", features = ["json"] }
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "sync", "time"] }
+toml = "1.1.4"
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "0.33.0", optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "registry"] }
@@ -42,3 +50,6 @@ uuid = { version = "1.24", features = ["v4", "v7", "serde", "fast-rng"] }
 [[bin]]
 name = "gwl-jobs"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3.27.0"

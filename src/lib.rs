@@ -6,7 +6,10 @@
 pub mod cli;
 pub mod commands;
 pub mod config;
-pub mod model;
+pub mod domain;
+pub mod event_store;
+pub mod ingest;
+pub mod projections;
 pub mod telemetry;
 
 pub const APP_NAME: &str = "gwl-jobs";

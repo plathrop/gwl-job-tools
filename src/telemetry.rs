@@ -6,11 +6,11 @@ use tracing_subscriber::{registry, util::SubscriberInitExt};
 #[cfg(feature = "telemetry")]
 use {
     miette::IntoDiagnostic,
-    opentelemetry::{global, trace::TracerProvider as _, KeyValue},
+    opentelemetry::{KeyValue, global, trace::TracerProvider as _},
     opentelemetry_otlp::{SpanExporter, WithExportConfig},
     opentelemetry_sdk::{
-        trace::{SdkTracer, SdkTracerProvider},
         Resource,
+        trace::{SdkTracer, SdkTracerProvider},
     },
     opentelemetry_semantic_conventions::resource as semconv_resource,
     std::time::Duration,
@@ -61,7 +61,7 @@ pub fn init_telemetry(target: TelemetryStatus, name: &str) -> Result<TelemetryGu
                     .with(fmt::layer().with_target(false).with_writer(std::io::stderr)),
             );
 
-            let provider = build_otlp_provider(&name)?;
+            let provider = build_otlp_provider(name)?;
             global::set_tracer_provider(provider.clone());
 
             let tracer = provider.tracer(name.to_owned());
