@@ -50,6 +50,7 @@ These come from the spec and apply to every change:
 ## Delivery Workflow
 
 - Deliver in small increments, each as a PR. PRs are the review checkpoint.
+- When opening a PR, add @remi-ashe as a reviewer.
 - The agent may continue ahead via stacked PRs, capped at 2.
 - Before opening a new stacked PR, check for review feedback (Copilot, Remi,
   human) on existing PRs and incorporate it.
