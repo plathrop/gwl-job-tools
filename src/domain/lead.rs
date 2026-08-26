@@ -9,11 +9,22 @@ use miette::Result;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::domain::events::{
-    EventEnvelope, ExtractedFields, IngestedPayload, PendingEvent, ReingestSuppressedPayload,
-    UpdatedPayload, event_type,
+use crate::domain::{
+    events::{
+        EventEnvelope, ExtractedFields, IngestedPayload, PendingEvent, ReingestSuppressedPayload,
+        SnapshotFields, UpdatedPayload, event_type,
+    },
+    identity::LeadIdentity,
 };
-use crate::domain::identity::LeadIdentity;
+
+/// Parse the lead id out of a `lead/<uuid>` stream name. Lives here (not on
+/// the stream-agnostic `EventEnvelope`) because the `lead/` prefix is lead
+/// aggregate knowledge.
+pub fn stream_lead_id(stream: &str) -> Option<Uuid> {
+    stream
+        .strip_prefix("lead/")
+        .and_then(|s| Uuid::parse_str(s).ok())
+}
 
 /// Replayed state of a single lead stream.
 #[derive(Clone, Debug, Default)]
@@ -37,17 +48,15 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
     match event.event_type.as_str() {
         event_type::INGESTED | event_type::UPDATED => {
             state.exists = true;
-            if let Ok(payload) =
-                serde_json::from_value::<IngestedPayloadView>(event.payload.clone())
-            {
-                state.snapshot = Some(payload.extracted);
-                state.url = payload.url;
-                state.raw_text = payload.raw_text;
+            if let Ok(snapshot) = serde_json::from_value::<SnapshotFields>(event.payload.clone()) {
+                state.snapshot = Some(snapshot.extracted);
+                state.url = snapshot.url;
+                state.raw_text = snapshot.raw_text;
             }
         }
         // Marks are latest-wins (design doc §3). The `reviewed` event lands
         // with Increment 4; the suppression rule below already honors it.
-        "reviewed" => {
+        event_type::REVIEWED => {
             state.latest_mark = event
                 .payload
                 .get("mark")
@@ -56,16 +65,6 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
         }
         _ => {}
     }
-}
-
-/// Both `ingested` and `updated` carry the same snapshot fields; deserialize
-/// either for state purposes.
-#[derive(serde::Deserialize)]
-struct IngestedPayloadView {
-    #[serde(default)]
-    extracted: ExtractedFields,
-    url: Option<String>,
-    raw_text: Option<String>,
 }
 
 /// What an ingest command decided to append.
@@ -96,10 +95,12 @@ pub fn decide_ingest(
         let payload = IngestedPayload {
             dedupe_key: identity.dedupe_key.clone(),
             identifiers: identity.identifiers.clone(),
-            source: source.into(),
-            url,
-            raw_text: Some(raw_text),
-            extracted,
+            snapshot: SnapshotFields {
+                source: source.into(),
+                url,
+                raw_text: Some(raw_text),
+                extracted,
+            },
         };
         return Ok((
             IngestKind::New,
@@ -132,10 +133,12 @@ pub fn decide_ingest(
         dedupe_key: identity.dedupe_key.clone(),
         identifiers: identity.identifiers.clone(),
         changed: changed.clone(),
-        source: source.into(),
-        url,
-        raw_text: Some(raw_text),
-        extracted,
+        snapshot: SnapshotFields {
+            source: source.into(),
+            url,
+            raw_text: Some(raw_text),
+            extracted,
+        },
     };
     Ok((
         IngestKind::Updated { changed },
@@ -258,6 +261,35 @@ mod tests {
         assert!(matches!(kind, IngestKind::Updated { .. }));
     }
 
+    #[test]
+    fn updated_reports_url_change() {
+        let mut state = LeadState {
+            exists: true,
+            seq: 1,
+            ..Default::default()
+        };
+        state.snapshot = Some(extracted("Engineer"));
+        state.url = Some("https://example.com/old".into());
+        state.raw_text = Some("body".into());
+
+        let (kind, events) = decide_ingest(
+            &state,
+            &identity(),
+            "drop-in",
+            Some("https://example.com/new".into()),
+            "body".into(),
+            extracted("Engineer"),
+        )
+        .unwrap();
+        assert_eq!(
+            kind,
+            IngestKind::Updated {
+                changed: vec!["url".into()]
+            }
+        );
+        assert_eq!(events[0].payload["changed"][0], "url");
+    }
+
     // ── evolve ───────────────────────────────────────────────────
 
     #[test]
@@ -291,7 +323,7 @@ mod tests {
         );
 
         let reviewed = EventEnvelope {
-            event_type: "reviewed".into(),
+            event_type: event_type::REVIEWED.into(),
             seq: 2,
             payload: serde_json::json!({"mark": "ignore"}),
             ..ingested
@@ -320,5 +352,53 @@ mod tests {
         evolve(&mut state, &unknown);
         assert_eq!(state.seq, 7);
         assert!(!state.exists);
+    }
+
+    #[test]
+    fn replay_then_decide_suppresses_ignored_lead() {
+        // Integration: replay an ingested → reviewed{ignore} stream through
+        // evolve, then decide_ingest must suppress (not update). The unit
+        // test above constructs the state by hand; this exercises the real
+        // replay path the command layer uses.
+        let mut state = LeadState::default();
+        let ingested = EventEnvelope {
+            envelope_version: 1,
+            id: Uuid::now_v7(),
+            stream: "lead/x".into(),
+            seq: 1,
+            event_type: event_type::INGESTED.into(),
+            schema_version: 1,
+            occurred_at: jiff::Timestamp::now(),
+            recorded_at: jiff::Timestamp::now(),
+            causation_id: None,
+            correlation_id: Uuid::now_v7(),
+            payload: serde_json::json!({
+                "dedupe_key": "tc:abc",
+                "identifiers": {"tc": "tc:abc"},
+                "source": "drop-in",
+                "raw_text": "body",
+                "extracted": {"title": "Engineer", "company": "Acme"}
+            }),
+        };
+        evolve(&mut state, &ingested);
+        let reviewed = EventEnvelope {
+            event_type: event_type::REVIEWED.into(),
+            seq: 2,
+            payload: serde_json::json!({"mark": "ignore"}),
+            ..ingested
+        };
+        evolve(&mut state, &reviewed);
+
+        let (kind, events) = decide_ingest(
+            &state,
+            &identity(),
+            "drop-in",
+            Some("https://example.com/j".into()),
+            "body".into(),
+            extracted("Engineer"),
+        )
+        .unwrap();
+        assert_eq!(kind, IngestKind::Suppressed);
+        assert_eq!(events[0].event_type, event_type::REINGEST_SUPPRESSED);
     }
 }

@@ -1,8 +1,7 @@
 //! Source adapters: fetch and extraction (design doc 0001 §9; v0 ships the
 //! platform-aware drop-in adapter only — see `platforms`).
 
-use std::path::Path;
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use miette::{Context, IntoDiagnostic, Result, bail, miette};
 use tracing::{debug, instrument, warn};
@@ -15,7 +14,160 @@ pub mod platforms;
 
 /// Politeness delay before every HTTP request (spec: 200–500ms).
 const POLITENESS_DELAY: Duration = Duration::from_millis(300);
+/// Bounded total request timeout: the writer lock is acquired after the
+/// fetch, but a stalled endpoint must still not hang the CLI forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Cap on server-directed retry waits. Longer than this and we give up
+/// rather than retry early (which would violate the control header).
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(2);
 const MAX_RETRIES: u32 = 1;
+
+/// A raw HTTP response, reduced to what the politeness layer needs.
+#[derive(Clone, Debug)]
+pub struct FetchResponse {
+    pub status: u16,
+    pub retry_after: Option<String>,
+    pub body: String,
+}
+
+/// Transport seam. The good-citizen logic (politeness delay, retry
+/// honoring `Retry-After`, status handling) lives in `PoliteClient` and is
+/// tested against scripted `Fetcher` implementations — no network, no mock
+/// server.
+pub trait Fetcher {
+    fn get(&self, url: &Url) -> impl Future<Output = Result<FetchResponse>> + Send;
+}
+
+/// Production transport: reqwest with a bounded timeout and an honest UA.
+pub struct HttpFetcher {
+    client: reqwest::Client,
+}
+
+impl HttpFetcher {
+    pub fn new() -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/plathrop/gwl-job-tools)"
+            ))
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .into_diagnostic()?;
+        Ok(Self { client })
+    }
+}
+
+impl Fetcher for HttpFetcher {
+    async fn get(&self, url: &Url) -> Result<FetchResponse> {
+        let response = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .into_diagnostic()?;
+        let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = response.text().await.into_diagnostic()?;
+        Ok(FetchResponse {
+            status,
+            retry_after,
+            body,
+        })
+    }
+}
+
+/// HTTP client with good-citizen behavior baked in: politeness delay
+/// between requests, redirect following (reqwest default, in `HttpFetcher`),
+/// and one retry honoring `Retry-After` on 429/503.
+pub struct PoliteClient<F: Fetcher> {
+    fetcher: F,
+    politeness_delay: Duration,
+    max_retry_delay: Duration,
+}
+
+impl<F: Fetcher> PoliteClient<F> {
+    pub fn new(fetcher: F) -> Self {
+        Self {
+            fetcher,
+            politeness_delay: POLITENESS_DELAY,
+            max_retry_delay: MAX_RETRY_DELAY,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_delays(politeness: Duration, max_retry: Duration, fetcher: F) -> Self {
+        Self {
+            fetcher,
+            politeness_delay: politeness,
+            max_retry_delay: max_retry,
+        }
+    }
+
+    async fn get(&self, url: &Url) -> Result<FetchResponse> {
+        let mut attempt = 0;
+        loop {
+            // Be a good citizen: fixed delay before every request.
+            tokio::time::sleep(self.politeness_delay).await;
+            debug!(%url, attempt, "fetching");
+            let response = self.fetcher.get(url).await?;
+            let status = response.status;
+            if (status == 429 || status == 503) && attempt < MAX_RETRIES {
+                // Obey control headers: seconds or HTTP-date forms.
+                let delay = parse_retry_after(response.retry_after.as_deref())
+                    .unwrap_or(DEFAULT_RETRY_DELAY);
+                if delay > self.max_retry_delay {
+                    bail!(
+                        "{url} asked us to retry after {delay:?} (over the {:?} local \
+                         cap); giving up rather than retrying early",
+                        self.max_retry_delay
+                    );
+                }
+                warn!(%url, ?delay, "rate-limited; honoring Retry-After");
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+                continue;
+            }
+            if !(200..300).contains(&status) {
+                bail!("fetching {url} failed with status {status}");
+            }
+            return Ok(response);
+        }
+    }
+
+    pub async fn get_text(&self, url: &Url) -> Result<String> {
+        Ok(self.get(url).await?.body)
+    }
+
+    pub async fn get_json(&self, url: &Url) -> Result<serde_json::Value> {
+        let body = self.get(url).await?.body;
+        serde_json::from_str(&body)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("parsing JSON from {url}"))
+    }
+}
+
+/// `Retry-After` in either of its two forms: delay-seconds or HTTP-date.
+fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
+    let value = value?.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    date.duration_since(std::time::SystemTime::now()).ok()
+}
+
+pub type HttpClient = PoliteClient<HttpFetcher>;
+
+pub fn default_client() -> Result<HttpClient> {
+    Ok(PoliteClient::new(HttpFetcher::new()?))
+}
 
 /// The result of fetching and extracting a posting, ready for identity
 /// computation and the `ingested`/`updated` payload.
@@ -27,78 +179,11 @@ pub struct IngestOutcome {
     pub extracted: ExtractedFields,
 }
 
-/// HTTP client with good-citizen behavior baked in: politeness delay,
-/// honest user agent, redirect following (reqwest default), and one retry
-/// honoring `Retry-After` on 429/503.
-pub struct HttpClient {
-    client: reqwest::Client,
-}
-
-impl HttpClient {
-    pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent(concat!(
-                env!("CARGO_PKG_NAME"),
-                "/",
-                env!("CARGO_PKG_VERSION"),
-                " (+https://github.com/plathrop/gwl-job-tools)"
-            ))
-            .build()
-            .into_diagnostic()?;
-        Ok(Self { client })
-    }
-
-    async fn get(&self, url: &Url) -> Result<reqwest::Response> {
-        let mut attempt = 0;
-        loop {
-            // Be a good citizen: fixed delay between requests.
-            tokio::time::sleep(POLITENESS_DELAY).await;
-            debug!(%url, attempt, "fetching");
-            let response = self
-                .client
-                .get(url.clone())
-                .send()
-                .await
-                .into_diagnostic()?;
-            let status = response.status();
-            if (status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE)
-                && attempt < MAX_RETRIES
-            {
-                // Obey control headers.
-                let retry_after = response
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(2)
-                    .min(10);
-                warn!(%url, retry_after, "rate-limited; honoring Retry-After");
-                tokio::time::sleep(Duration::from_secs(retry_after)).await;
-                attempt += 1;
-                continue;
-            }
-            if !status.is_success() {
-                bail!("fetching {url} failed with status {status}");
-            }
-            return Ok(response);
-        }
-    }
-
-    pub async fn get_text(&self, url: &Url) -> Result<String> {
-        self.get(url).await?.text().await.into_diagnostic()
-    }
-
-    pub async fn get_json(&self, url: &Url) -> Result<serde_json::Value> {
-        self.get(url).await?.json().await.into_diagnostic()
-    }
-}
-
 /// Ingest a posting URL: public JSON API first for known boards, HTML fetch
 /// + main-text extraction as the fallback (unknown sites, API failures with
 /// unrecognized response shapes).
 #[instrument(skip(http), fields(url = %url))]
-pub async fn ingest_url(url: &Url, http: &HttpClient) -> Result<IngestOutcome> {
+pub async fn ingest_url<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Result<IngestOutcome> {
     if let Some(platform) = platforms::detect(url) {
         match ingest_via_api(url, platform, http).await {
             Ok(outcome) => return Ok(outcome),
@@ -114,10 +199,10 @@ pub async fn ingest_url(url: &Url, http: &HttpClient) -> Result<IngestOutcome> {
     ingest_via_html(url, http).await
 }
 
-async fn ingest_via_api(
+async fn ingest_via_api<F: Fetcher>(
     url: &Url,
     platform: platforms::Platform,
-    http: &HttpClient,
+    http: &PoliteClient<F>,
 ) -> Result<IngestOutcome> {
     let api_url = platforms::api_url(url, platform)
         .ok_or_else(|| miette!("could not build API URL for {url}"))?;
@@ -141,7 +226,7 @@ async fn ingest_via_api(
     })
 }
 
-async fn ingest_via_html(url: &Url, http: &HttpClient) -> Result<IngestOutcome> {
+async fn ingest_via_html<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Result<IngestOutcome> {
     let html = http
         .get_text(url)
         .await
@@ -195,8 +280,186 @@ pub fn ingest_file(path: &Path, content: &str) -> Result<IngestOutcome> {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::VecDeque, path::PathBuf, sync::Mutex};
+
     use super::*;
-    use std::path::PathBuf;
+
+    // ── Scripted Fetcher seam ────────────────────────────────────
+
+    struct ScriptedFetcher {
+        responses: Mutex<VecDeque<FetchResponse>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedFetcher {
+        fn with(responses: Vec<FetchResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    fn response(status: u16, retry_after: Option<&str>, body: &str) -> FetchResponse {
+        FetchResponse {
+            status,
+            retry_after: retry_after.map(str::to_string),
+            body: body.into(),
+        }
+    }
+
+    impl Fetcher for ScriptedFetcher {
+        async fn get(&self, url: &Url) -> Result<FetchResponse> {
+            self.calls.lock().unwrap().push(url.to_string());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| miette!("scripted fetcher ran out of responses"))
+        }
+    }
+
+    fn client_with(fetcher: ScriptedFetcher) -> PoliteClient<ScriptedFetcher> {
+        PoliteClient::with_delays(Duration::ZERO, Duration::from_secs(30), fetcher)
+    }
+
+    // ── Good-citizen behavior ────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_seconds_waits_and_retries_once() {
+        let fetcher = ScriptedFetcher::with(vec![
+            response(429, Some("2"), ""),
+            response(200, None, "ok"),
+        ]);
+        let client = client_with(fetcher);
+        let start = tokio::time::Instant::now();
+        let url = Url::parse("https://example.com/j").unwrap();
+
+        let text = client.get_text(&url).await.unwrap();
+
+        assert_eq!(text, "ok");
+        assert_eq!(client.fetcher.calls().len(), 2);
+        assert!(start.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_http_date_is_honored() {
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(3));
+        let fetcher = ScriptedFetcher::with(vec![
+            response(503, Some(&date), ""),
+            response(200, None, "ok"),
+        ]);
+        let client = client_with(fetcher);
+        let url = Url::parse("https://example.com/j").unwrap();
+
+        let text = client.get_text(&url).await.unwrap();
+
+        assert_eq!(text, "ok");
+        assert_eq!(client.fetcher.calls().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn second_rate_limit_gives_up() {
+        let fetcher = ScriptedFetcher::with(vec![response(429, None, ""), response(429, None, "")]);
+        let client = client_with(fetcher);
+        let url = Url::parse("https://example.com/j").unwrap();
+
+        assert!(client.get_text(&url).await.is_err());
+        assert_eq!(client.fetcher.calls().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_retryable_status_errors_without_retrying() {
+        let fetcher = ScriptedFetcher::with(vec![response(404, None, "not found")]);
+        let client = client_with(fetcher);
+        let url = Url::parse("https://example.com/j").unwrap();
+
+        assert!(client.get_text(&url).await.is_err());
+        assert_eq!(client.fetcher.calls().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_after_over_cap_bails_instead_of_retrying_early() {
+        let fetcher = ScriptedFetcher::with(vec![response(429, Some("120"), "")]);
+        let client = client_with(fetcher);
+        let url = Url::parse("https://example.com/j").unwrap();
+
+        assert!(client.get_text(&url).await.is_err());
+        assert_eq!(client.fetcher.calls().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn politeness_delay_applies_before_every_request() {
+        let fetcher =
+            ScriptedFetcher::with(vec![response(200, None, "a"), response(200, None, "b")]);
+        let client =
+            PoliteClient::with_delays(Duration::from_millis(300), Duration::from_secs(30), fetcher);
+        let start = tokio::time::Instant::now();
+        let url = Url::parse("https://example.com/j").unwrap();
+
+        client.get_text(&url).await.unwrap();
+        client.get_text(&url).await.unwrap();
+
+        assert!(start.elapsed() >= Duration::from_millis(600));
+    }
+
+    // ── API → HTML fallback orchestration ────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn unrecognized_api_response_falls_back_to_html() {
+        let posting = Url::parse("https://job-boards.greenhouse.io/acme/jobs/123").unwrap();
+        let html = "<html><head><title>Engineer — Acme</title></head><body>\
+                    <article><h1>Platform Engineer</h1>\
+                    <p>Remote role building platforms with a wonderful team of \
+                    experienced engineers who care deeply about reliability, \
+                    operability, and mentoring across the organization daily.</p>\
+                    </article></body></html>";
+        let fetcher = ScriptedFetcher::with(vec![
+            // API returns a valid-JSON body missing every expected field.
+            response(200, None, "{}"),
+            response(200, None, html),
+        ]);
+        let client = client_with(fetcher);
+
+        let outcome = ingest_url(&posting, &client).await.unwrap();
+
+        assert_eq!(outcome.source, "drop-in");
+        let calls = client.fetcher.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0],
+            "https://boards-api.greenhouse.io/v1/boards/acme/jobs/123"
+        );
+        assert_eq!(calls[1], posting.to_string());
+        assert!(outcome.raw_text.contains("Platform Engineer"));
+    }
+
+    // ── parse_retry_after ────────────────────────────────────────
+
+    #[test]
+    fn parses_retry_after_seconds() {
+        assert_eq!(parse_retry_after(Some("7")), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn parses_retry_after_http_date() {
+        let date = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(5));
+        let parsed = parse_retry_after(Some(&date)).unwrap();
+        assert!(parsed <= Duration::from_secs(5));
+        assert!(parsed > Duration::from_secs(3));
+    }
+
+    #[test]
+    fn unparseable_retry_after_is_none() {
+        assert_eq!(parse_retry_after(Some("garbage")), None);
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    // ── file drops ───────────────────────────────────────────────
 
     #[test]
     fn file_drop_plain_text() {

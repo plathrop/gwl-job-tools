@@ -68,8 +68,10 @@ pub async fn execute(command: Option<Commands>) -> Result<()> {
     match command {
         Some(Commands::Ingest(args)) => commands::execute_ingest(args).await,
         Some(Commands::Show(args)) => commands::execute_show(args).await,
-        Some(Commands::Completion) => miette::bail!("completion is not yet implemented"),
-        None => miette::bail!("no command provided; run `{APP_NAME} --help`"),
+        Some(Commands::Completion) => Err(miette::miette!("completion is not yet implemented")),
+        None => Err(miette::miette!(
+            "no command provided; run `{APP_NAME} --help"
+        )),
     }
 }
 

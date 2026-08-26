@@ -86,15 +86,17 @@ pub fn canonicalize_url(url: &Url) -> String {
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
     params.sort();
+    // Rebuild through query_pairs_mut so names/values are re-encoded
+    // correctly; interpolating decoded values into the query string would
+    // split parameters (`a%26b` → `a&b`) and collapse distinct postings.
     if params.is_empty() {
         canonical.set_query(None);
     } else {
-        let query: String = params
-            .iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        canonical.set_query(Some(&query));
+        let mut pairs = canonical.query_pairs_mut();
+        pairs.clear();
+        for (name, value) in &params {
+            pairs.append_pair(name, value);
+        }
     }
 
     let path = canonical.path().trim_end_matches('/').to_string();
@@ -162,9 +164,10 @@ mod tests {
     fn drops_tracking_params_keeps_job_id() {
         let url =
             Url::parse("https://example.com/job?id=123&utm_source=li&fbclid=xyz&r=A%2FB").unwrap();
+        // Unknown params are preserved with their encoding intact.
         assert_eq!(
             canonicalize_url(&url),
-            "https://example.com/job?id=123&r=A/B"
+            "https://example.com/job?id=123&r=A%2FB"
         );
     }
 
@@ -190,6 +193,15 @@ mod tests {
     fn keeps_non_default_port() {
         let url = Url::parse("https://example.com:8443/job").unwrap();
         assert_eq!(canonicalize_url(&url), "https://example.com:8443/job");
+    }
+
+    #[test]
+    fn preserves_percent_encoded_query_values() {
+        // `a%26b` decodes to `a&b`; re-serializing it unencoded splits one
+        // parameter into two (`token=a` and `b`), collapsing distinct
+        // postings. Unknown query params must be preserved (design doc §2).
+        let url = Url::parse("https://example.com/j?token=a%26b&utm_source=x").unwrap();
+        assert_eq!(canonicalize_url(&url), "https://example.com/j?token=a%26b");
     }
 
     // ── slugify / normalize ──────────────────────────────────────

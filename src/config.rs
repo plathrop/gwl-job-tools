@@ -1,5 +1,7 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use directories::ProjectDirs;
 use miette::{Context, IntoDiagnostic, Result};
@@ -21,12 +23,12 @@ pub struct Config {
     pub blacklist: Vec<String>,
     pub aliases: HashMap<String, String>,
     pub scoring_weights: ScoringWeights,
-    pub generic_letter_path: Option<PathBuf>,
+    pub cover_letter_path: Option<PathBuf>,
     pub target_companies: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ScoringWeights {
     pub level: f64,
     pub skills: f64,
@@ -152,7 +154,7 @@ compensation_floor = 180000
 compensation_ceiling = 300000
 remote_only = true
 blacklist = ["salesforce"]
-generic_letter_path = "~/letters/generic.pdf"
+cover_letter_path = "~/letters/generic.pdf"
 target_companies = []
 
 [aliases]
@@ -176,6 +178,10 @@ compensation = 0.4
             Some("Kubernetes")
         );
         assert_eq!(config.scoring_weights.compensation, 0.4);
+        assert_eq!(
+            config.cover_letter_path.as_deref(),
+            Some(Path::new("~/letters/generic.pdf"))
+        );
         assert!(config.target_companies.is_empty());
     }
 
@@ -185,6 +191,23 @@ compensation = 0.4
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(config_dir.join(Config::FILE_NAME), "bogus_key = 1\n").unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        assert!(Config::load(&paths).is_err());
+    }
+
+    #[test]
+    fn unknown_scoring_weight_key_is_rejected() {
+        // A typo inside [scoring_weights] currently falls back to the
+        // default weight silently (deny_unknown_fields only applies at the
+        // top level). A misspelled weight would silently change ranking.
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(Config::FILE_NAME),
+            "[scoring_weights]\ncompensaton = 0.4\n",
+        )
+        .unwrap();
         let paths = AppPaths::new(config_dir, dir.path().join("data"));
         assert!(Config::load(&paths).is_err());
     }

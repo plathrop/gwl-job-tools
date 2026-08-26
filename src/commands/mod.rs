@@ -1,20 +1,24 @@
 //! Command implementations. Thin: I/O wiring around the domain.
 
-use miette::{Context, IntoDiagnostic, Result, bail, miette};
+use miette::{Context, IntoDiagnostic, Result, miette};
 use serde::Serialize;
 use serde_with::skip_serializing_none;
 use tracing::{info, instrument};
 use url::Url;
 use uuid::Uuid;
 
-use crate::cli::{IngestArgs, ShowArgs};
-use crate::config::{AppPaths, Config};
-use crate::domain::events::ExtractedFields;
-use crate::domain::identity::{self, compute_identity};
-use crate::domain::lead::{self, IngestKind, LeadState};
-use crate::event_store::{EventStore, JsonlEventStore};
-use crate::ingest::{self, HttpClient};
-use crate::projections::{self, Projection};
+use crate::{
+    cli::{IngestArgs, ShowArgs},
+    config::{AppPaths, Config},
+    domain::{
+        events::ExtractedFields,
+        identity::{self, compute_identity},
+        lead::{self, IngestKind, LeadState},
+    },
+    event_store::{EventStore, JsonlEventStore},
+    ingest::{self, IngestOutcome},
+    projections::{self, LeadRecord, Projection},
+};
 
 const EVENT_LOG_NAME: &str = "events.jsonl";
 
@@ -23,15 +27,11 @@ pub async fn execute_ingest(args: IngestArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
     let _config = Config::load(&paths)?;
 
-    // Acquire the single-writer lock for the whole read→decide→append cycle
-    // (durability contract, design doc 0001 §1).
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let events = store.replay()?;
-    let projection = projections::rebuild(&events);
-
+    // Fetch/extract *before* acquiring the single-writer lock: network waits
+    // must not hold the lock (durability contract, design doc 0001 §1).
     let outcome = match (&args.url, &args.file) {
         (Some(url), None) => {
-            let http = HttpClient::new()?;
+            let http = ingest::default_client()?;
             ingest::ingest_url(url, &http).await?
         }
         (None, Some(path)) => {
@@ -40,9 +40,30 @@ pub async fn execute_ingest(args: IngestArgs) -> Result<()> {
                 .wrap_err_with(|| format!("reading {}", path.display()))?;
             ingest::ingest_file(path, &content)?
         }
-        _ => bail!("exactly one of <url> or --file <path> is required"),
+        _ => return Err(miette!("exactly one of <url> or --file <path> is required")),
     };
 
+    // Acquire the lock only for the fast read → decide → append cycle.
+    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let events = store.replay()?;
+    let projection = projections::rebuild(&events)?;
+
+    let summary = record_ingest(&mut store, &projection, outcome)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&summary).into_diagnostic()?
+    );
+    Ok(())
+}
+
+/// The testable core of ingest: given an extraction outcome, match identity
+/// against the projection, decide events, and append them. No network, no
+/// filesystem beyond the store itself.
+pub fn record_ingest(
+    store: &mut impl EventStore,
+    projection: &Projection,
+    outcome: IngestOutcome,
+) -> Result<IngestSummary> {
     // Store the canonical URL (tracking params stripped) so re-ingests via
     // differently-tagged links don't record spurious `url` changes.
     let canonical_url = outcome
@@ -90,7 +111,7 @@ pub async fn execute_ingest(args: IngestArgs) -> Result<()> {
         IngestKind::Suppressed => info!(%lead_id, "re-ingest suppressed (ignored lead)"),
     }
 
-    let summary = IngestSummary {
+    Ok(IngestSummary {
         lead_id,
         kind: match &kind {
             IngestKind::New => "ingested",
@@ -105,24 +126,19 @@ pub async fn execute_ingest(args: IngestArgs) -> Result<()> {
         source: outcome.source,
         url: canonical_url,
         extracted: outcome.extracted,
-    };
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&summary).into_diagnostic()?
-    );
-    Ok(())
+    })
 }
 
 #[skip_serializing_none]
-#[derive(Serialize)]
-struct IngestSummary {
-    lead_id: Uuid,
-    kind: &'static str,
-    changed: Option<Vec<String>>,
-    dedupe_key: String,
-    source: String,
-    url: Option<String>,
-    extracted: ExtractedFields,
+#[derive(Clone, Debug, Serialize)]
+pub struct IngestSummary {
+    pub lead_id: Uuid,
+    pub kind: &'static str,
+    pub changed: Option<Vec<String>>,
+    pub dedupe_key: String,
+    pub source: String,
+    pub url: Option<String>,
+    pub extracted: ExtractedFields,
 }
 
 #[instrument(skip_all)]
@@ -130,21 +146,25 @@ pub async fn execute_show(args: ShowArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
     let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let events = store.replay()?;
-    let projection = projections::rebuild(&events);
+    let projection = projections::rebuild(&events)?;
 
-    let matches = projection.find_by_id_prefix(&args.id);
-    match matches.as_slice() {
-        [] => bail!("no lead matches id prefix '{}'", args.id),
-        [record] => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(record).into_diagnostic()?
-            );
-            Ok(())
-        }
+    let record = select_lead(&projection, &args.id)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(record).into_diagnostic()?
+    );
+    Ok(())
+}
+
+/// Resolve a `<lead>` argument (unambiguous UUID prefix, design doc §8) to a
+/// single projection record.
+pub fn select_lead<'a>(projection: &'a Projection, prefix: &str) -> Result<&'a LeadRecord> {
+    match projection.find_by_id_prefix(prefix).as_slice() {
+        [] => Err(miette!("no lead matches id prefix '{prefix}'")),
+        [record] => Ok(record),
         many => Err(miette!(
             "id prefix '{}' is ambiguous (matches {} leads: {})",
-            args.id,
+            prefix,
             many.len(),
             many.iter()
                 .map(|r| r.lead_id.to_string())
@@ -154,72 +174,151 @@ pub async fn execute_show(args: ShowArgs) -> Result<()> {
     }
 }
 
-/// Read access for tests and future commands.
-#[allow(dead_code)]
-pub fn load_projection(paths: &AppPaths) -> Result<Projection> {
-    let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    Ok(projections::rebuild(&store.replay()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event_store::EventStore as _;
 
-    /// Golden round-trip: append events through the store, replay, and
-    /// verify the projection reflects them (design doc 0001 §10).
+    fn outcome(raw_text: &str) -> IngestOutcome {
+        IngestOutcome {
+            source: "drop-in".into(),
+            url: None,
+            raw_text: raw_text.into(),
+            extracted: ExtractedFields::default(),
+        }
+    }
+
+    fn store_and_projection(dir: &tempfile::TempDir) -> (JsonlEventStore, Projection) {
+        let store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        (store, projection)
+    }
+
+    // ── record_ingest: dedupe → decide → append ──────────────────
+
+    #[test]
+    fn unstructured_drop_dedupes_on_reingest() {
+        // Regression (Remi's raw-fallback bug): an unstructured posting with
+        // no req/url/title/company falls back to a `raw:` dedupe key — and
+        // re-ingesting it must match the same lead, not mint a new one.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+
+        let first = record_ingest(
+            &mut store,
+            &projection,
+            outcome("totally unstructured body"),
+        )
+        .unwrap();
+        assert_eq!(first.kind, "ingested");
+        assert!(first.dedupe_key.starts_with("raw:"));
+
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let second = record_ingest(
+            &mut store,
+            &projection,
+            outcome("totally unstructured body"),
+        )
+        .unwrap();
+        assert_eq!(second.kind, "updated");
+        assert_eq!(second.changed, Some(vec![]));
+        assert_eq!(second.lead_id, first.lead_id);
+    }
+
+    #[test]
+    fn reingest_with_tracking_params_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut with_url = outcome("body");
+        with_url.url = Some("https://example.com/job/1".into());
+        let first = record_ingest(&mut store, &projection, with_url).unwrap();
+
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let mut tagged = outcome("body");
+        tagged.url = Some("https://example.com/job/1?utm_source=newsletter".into());
+        let second = record_ingest(&mut store, &projection, tagged).unwrap();
+
+        assert_eq!(second.kind, "updated");
+        assert_eq!(second.changed, Some(vec![]));
+        assert_eq!(second.lead_id, first.lead_id);
+        // The stored URL is canonical (tracking params stripped).
+        assert_eq!(second.url.as_deref(), Some("https://example.com/job/1"));
+    }
+
+    #[test]
+    fn changed_content_reports_changed_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut first_outcome = outcome("body v1");
+        first_outcome.url = Some("https://example.com/job/1".into());
+        record_ingest(&mut store, &projection, first_outcome).unwrap();
+
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let mut second_outcome = outcome("body v2");
+        second_outcome.url = Some("https://example.com/job/1".into());
+        let second = record_ingest(&mut store, &projection, second_outcome).unwrap();
+
+        assert_eq!(second.changed, Some(vec!["raw_text".to_string()]));
+    }
+
+    // ── select_lead ──────────────────────────────────────────────
+
+    fn projection_with_leads(dir: &tempfile::TempDir, count: usize) -> Projection {
+        let mut store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
+        let mut projection = projections::rebuild(&[]).unwrap();
+        for _ in 0..count {
+            let mut outcome = outcome("body");
+            outcome.url = Some(format!("https://example.com/{}", Uuid::now_v7()));
+            record_ingest(&mut store, &projection, outcome).unwrap();
+            projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        }
+        projection
+    }
+
+    #[test]
+    fn select_lead_unique_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let projection = projection_with_leads(&dir, 1);
+        let id = projection.leads.keys().next().unwrap().to_string();
+        let record = select_lead(&projection, &id[..8]).unwrap();
+        assert_eq!(record.lead_id.to_string(), id);
+    }
+
+    #[test]
+    fn select_lead_no_match_bails() {
+        let projection = projections::rebuild(&[]).unwrap();
+        assert!(select_lead(&projection, "deadbeef").is_err());
+    }
+
+    #[test]
+    fn select_lead_ambiguous_prefix_bails() {
+        let dir = tempfile::tempdir().unwrap();
+        // Two leads that share a one-character prefix is guaranteed with
+        // enough leads; simpler: prefix "" matches everything.
+        let projection = projection_with_leads(&dir, 2);
+        assert!(select_lead(&projection, "").is_err());
+    }
+
+    // ── golden round-trip (design doc §10) ───────────────────────
+
+    /// Write → replay → projection equality, through the real store.
     #[test]
     fn golden_log_replay_projection() {
         let dir = tempfile::tempdir().unwrap();
-        let paths = AppPaths::new(dir.path().join("config"), dir.path().join("data"));
-        let log_path = paths.data_dir().join(EVENT_LOG_NAME);
+        let (mut store, projection) = store_and_projection(&dir);
 
-        let lead_id = Uuid::now_v7();
-        let stream = LeadState::stream_id(lead_id);
-        let mut store = JsonlEventStore::open(&log_path).unwrap();
+        let mut outcome = outcome("body");
+        outcome.url = Some("https://example.com/job/9".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+        outcome.extracted.req_id = Some("R-9".into());
+        let summary = record_ingest(&mut store, &projection, outcome).unwrap();
 
-        let state = LeadState::default();
-        let identity = crate::domain::identity::compute_identity(
-            &ExtractedFields {
-                title: Some("Staff Engineer".into()),
-                company: Some("Acme".into()),
-                ..Default::default()
-            },
-            None,
-            "body",
-        );
-        let (_, pending) = lead::decide_ingest(
-            &state,
-            &identity,
-            "drop-in",
-            None,
-            "body".into(),
-            ExtractedFields {
-                title: Some("Staff Engineer".into()),
-                company: Some("Acme".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        store.append(&stream, 0, &pending, Uuid::now_v7()).unwrap();
-
-        // Replay from disk and project.
         let replayed = store.replay().unwrap();
         assert_eq!(replayed.len(), 1);
-        let projection = projections::rebuild(&replayed);
-        let record = projection.leads.get(&lead_id).unwrap();
+        assert_eq!(replayed[0].seq, 1);
+        let projection = projections::rebuild(&replayed).unwrap();
+        let record = projection.leads.get(&summary.lead_id).unwrap();
         assert_eq!(record.extracted.title.as_deref(), Some("Staff Engineer"));
-        assert_eq!(
-            projection.lookup(&crate::domain::identity::compute_identity(
-                &ExtractedFields {
-                    title: Some("staff engineer".into()),
-                    company: Some("ACME".into()),
-                    ..Default::default()
-                },
-                None,
-                "different body",
-            )),
-            Some(lead_id)
-        );
+        assert_eq!(record.dedupe_key.as_deref(), Some("req:acme:r-9"));
     }
 }

@@ -14,11 +14,29 @@ use uuid::Uuid;
 pub const ENVELOPE_VERSION: u32 = 1;
 
 /// Event type strings. The `lead/<id>` stream prefix namespaces them, so the
-/// types carry no aggregate prefix (decision record 0002).
+/// types carry no aggregate prefix (decision record 0002). Types the v0
+/// pipeline does not emit yet are defined here anyway (design doc 0001 §3),
+/// so consumers match constants rather than literals.
 pub mod event_type {
+    // Pipeline events (design doc 0001 §3).
     pub const INGESTED: &str = "ingested";
     pub const UPDATED: &str = "updated";
     pub const REINGEST_SUPPRESSED: &str = "reingest_suppressed";
+    pub const REJECTED: &str = "rejected";
+    pub const SCORED: &str = "scored";
+    pub const REVIEWED: &str = "reviewed";
+    pub const APPLY_QUEUED: &str = "apply_queued";
+
+    // Outcome events (design doc 0001 §3; emitted by `gwl-jobs outcome`).
+    pub const APPLIED: &str = "applied";
+    pub const SCREENED: &str = "screened";
+    pub const INTERVIEWED: &str = "interviewed";
+    pub const OFFERED: &str = "offered";
+    pub const ACCEPTED: &str = "accepted";
+    pub const REJECTED_BY_EMPLOYER: &str = "rejected_by_employer";
+    pub const WITHDRAWN: &str = "withdrawn";
+    pub const DECLINED: &str = "declined";
+    pub const ARCHIVED: &str = "archived";
 }
 
 #[skip_serializing_none]
@@ -36,14 +54,6 @@ pub struct EventEnvelope {
     pub causation_id: Option<Uuid>,
     pub correlation_id: Uuid,
     pub payload: serde_json::Value,
-}
-
-impl EventEnvelope {
-    pub fn lead_id(&self) -> Option<Uuid> {
-        self.stream
-            .strip_prefix("lead/")
-            .and_then(|s| Uuid::parse_str(s).ok())
-    }
 }
 
 /// An event that has been decided but not yet appended. The store fills in
@@ -142,15 +152,26 @@ impl ExtractedFields {
     }
 }
 
+/// The posting snapshot carried by both `ingested` and `updated` payloads
+/// (flattened inline, so the serialized shapes are unchanged). Also what
+/// `evolve` deserializes to refresh state.
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SnapshotFields {
+    pub source: String,
+    pub url: Option<String>,
+    pub raw_text: Option<String>,
+    #[serde(default)]
+    pub extracted: ExtractedFields,
+}
+
 #[skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct IngestedPayload {
     pub dedupe_key: String,
     pub identifiers: Identifiers,
-    pub source: String,
-    pub url: Option<String>,
-    pub raw_text: Option<String>,
-    pub extracted: ExtractedFields,
+    #[serde(flatten)]
+    pub snapshot: SnapshotFields,
 }
 
 #[skip_serializing_none]
@@ -159,10 +180,8 @@ pub struct UpdatedPayload {
     pub dedupe_key: String,
     pub identifiers: Identifiers,
     pub changed: Vec<String>,
-    pub source: String,
-    pub url: Option<String>,
-    pub raw_text: Option<String>,
-    pub extracted: ExtractedFields,
+    #[serde(flatten)]
+    pub snapshot: SnapshotFields,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -222,22 +241,33 @@ mod tests {
     }
 
     #[test]
-    fn lead_id_parses_from_stream() {
-        let id = Uuid::now_v7();
+    fn envelope_serializes_to_expected_shape() {
+        // Pin the on-disk shape: the event type is serialized under `type`
+        // (not `event_type`), `causation_id` is omitted when None, and the
+        // envelope metadata fields are present. A future field rename or
+        // serde attribute change must not silently alter the log format.
         let envelope = EventEnvelope {
-            envelope_version: 1,
+            envelope_version: ENVELOPE_VERSION,
             id: Uuid::now_v7(),
-            stream: format!("lead/{id}"),
+            stream: "lead/x".into(),
             seq: 1,
-            event_type: "ingested".into(),
+            event_type: event_type::INGESTED.into(),
             schema_version: 1,
             occurred_at: Timestamp::now(),
             recorded_at: Timestamp::now(),
             causation_id: None,
             correlation_id: Uuid::now_v7(),
-            payload: serde_json::json!({}),
+            payload: serde_json::json!({"dedupe_key": "tc:abc"}),
         };
-        assert_eq!(envelope.lead_id(), Some(id));
+        let v: serde_json::Value = serde_json::to_value(&envelope).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj["type"], "ingested");
+        assert!(!obj.contains_key("event_type"));
+        assert!(!obj.contains_key("causation_id"));
+        assert_eq!(obj["envelope_version"], 1);
+        assert_eq!(obj["seq"], 1);
+        assert_eq!(obj["schema_version"], 1);
+        assert_eq!(obj["payload"]["dedupe_key"], "tc:abc");
     }
 
     // ── ExtractedFields::diff ────────────────────────────────────
@@ -259,6 +289,47 @@ mod tests {
         assert_eq!(a.diff(&a, true, true), vec!["raw_text", "url"]);
     }
 
+    #[test]
+    fn diff_covers_every_struct_field() {
+        // Guard against fields being added to `ExtractedFields` without
+        // updating `diff`: a snapshot differing in every field must report
+        // all of them (plus raw_text/url, which are passed separately).
+        let a = ExtractedFields {
+            title: Some("a".into()),
+            company: Some("a".into()),
+            req_id: Some("a".into()),
+            location: Some("a".into()),
+            remote: Some(true),
+            comp: Some(CompRange {
+                min: Some(1),
+                max: None,
+                currency: "USD".into(),
+                period: "year".into(),
+                raw: "a".into(),
+            }),
+        };
+        let b = ExtractedFields {
+            title: Some("b".into()),
+            company: Some("b".into()),
+            req_id: Some("b".into()),
+            location: Some("b".into()),
+            remote: Some(false),
+            comp: Some(CompRange {
+                min: Some(2),
+                max: None,
+                currency: "USD".into(),
+                period: "year".into(),
+                raw: "b".into(),
+            }),
+        };
+        let changed = a.diff(&b, true, true);
+        for field in [
+            "title", "company", "req_id", "location", "remote", "comp", "raw_text", "url",
+        ] {
+            assert!(changed.contains(&field.into()), "diff missed {field}");
+        }
+    }
+
     // ── Payload round-trips ──────────────────────────────────────
 
     #[test]
@@ -270,17 +341,56 @@ mod tests {
                 url: Some("url:https://example.com/job".into()),
                 tc: Some("tc:9f2c".into()),
             },
-            source: "greenhouse".into(),
-            url: Some("https://example.com/job".into()),
-            raw_text: Some("body".into()),
-            extracted: ExtractedFields {
-                title: Some("Engineer".into()),
-                ..Default::default()
+            snapshot: SnapshotFields {
+                source: "greenhouse".into(),
+                url: Some("https://example.com/job".into()),
+                raw_text: Some("body".into()),
+                extracted: ExtractedFields {
+                    title: Some("Engineer".into()),
+                    ..Default::default()
+                },
             },
         };
         let v = serde_json::to_value(&payload).unwrap();
+        // Flattened: snapshot fields serialize inline (shape unchanged).
+        assert_eq!(v["source"], "greenhouse");
+        assert!(v.get("snapshot").is_none());
         let back: IngestedPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back.dedupe_key, "req:nvidia:jr2018233");
-        assert_eq!(back.extracted.title.as_deref(), Some("Engineer"));
+        assert_eq!(back.snapshot.extracted.title.as_deref(), Some("Engineer"));
+    }
+
+    #[test]
+    fn envelope_serializes_to_exact_expected_bytes() {
+        // Byte-level golden test (design doc §10): a future field rename or
+        // serde attribute change must not silently alter the on-disk format.
+        let envelope = EventEnvelope {
+            envelope_version: ENVELOPE_VERSION,
+            id: Uuid::from_u128(0x0192f8a1_0000_7000_8000_000000000001),
+            stream: "lead/0192f8a1-0000-7000-8000-000000000002".into(),
+            seq: 1,
+            event_type: event_type::INGESTED.into(),
+            schema_version: 1,
+            occurred_at: Timestamp::from_second(1_700_000_000).unwrap(),
+            recorded_at: Timestamp::from_second(1_700_000_001).unwrap(),
+            causation_id: None,
+            correlation_id: Uuid::from_u128(0x0192f8a1_0000_7000_8000_000000000003),
+            payload: serde_json::json!({"dedupe_key": "tc:abc"}),
+        };
+        assert_eq!(
+            serde_json::to_string(&envelope).unwrap(),
+            concat!(
+                "{\"envelope_version\":1,",
+                "\"id\":\"0192f8a1-0000-7000-8000-000000000001\",",
+                "\"stream\":\"lead/0192f8a1-0000-7000-8000-000000000002\",",
+                "\"seq\":1,",
+                "\"type\":\"ingested\",",
+                "\"schema_version\":1,",
+                "\"occurred_at\":\"2023-11-14T22:13:20Z\",",
+                "\"recorded_at\":\"2023-11-14T22:13:21Z\",",
+                "\"correlation_id\":\"0192f8a1-0000-7000-8000-000000000003\",",
+                "\"payload\":{\"dedupe_key\":\"tc:abc\"}}"
+            )
+        );
     }
 }
