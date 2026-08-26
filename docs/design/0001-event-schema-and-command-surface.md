@@ -47,9 +47,15 @@ queue command is `list`). The spec has been updated to match.
   descriptor, followed by `fsync`. The two-event `reviewed` + `apply_queued`
   batch (§5) therefore cannot be split by anything short of a crash
   mid-write.
-- **Crash recovery.** On replay, a malformed trailing line (a torn write) is
-  discarded with a warning; any other malformed line is a hard error. A batch
-  torn between its events can leave a prefix visible — the §7
+- **Crash recovery.** On replay, a malformed trailing line (a torn write)
+  is discarded with a warning — and truncated to its byte offset while the
+  writer lock is held, so the next append starts at a clean offset.
+  Truncating a torn tail is not "rewriting the log": the torn bytes were
+  never a committed event — only complete, parseable events are sacred. A
+  _syntactically complete_ final line that fails validation (envelope
+  version, upcast path) is corruption, not a torn tail, and is a hard
+  error. Any other malformed line anywhere is likewise a hard error. A
+  batch torn between its events can leave a prefix visible — the §7
   pending-recovery rule (an `apply-automatically` mark with no subsequent
   `apply_queued` stays pending) is the semantic backstop.
 
@@ -118,6 +124,17 @@ Computed from extracted fields, first applicable rule wins:
    dedupe for that board until its adapter lands.
 3. **`tc:<sha256>`** — SHA-256 over `normalize(title) + "\n" +
 normalize(company)`. Fallback for file drops with no URL or req id.
+4. **`raw:<sha256>`** — SHA-256 over the raw text. Last resort for postings
+   with no usable structured fields at all (no title, no company, no URL);
+   added in Increment 1 after review found the three-form scheme left such
+   drops unkeyable.
+
+The dedupe key is an **opaque equality token**: it is minted in exactly one
+place and has **no parsers by design** — nothing in the system splits it
+back into parts, because the parts already live in typed form alongside it
+(`extracted`, `identifiers`). The prefixes exist to namespace the forms
+against each other and for human log-debugging, not for programmatic
+parsing.
 
 All available identifier forms (req, url, title-company) are stored in the
 event payload and indexed by the projection, regardless of which form became
@@ -160,7 +177,12 @@ drop can merge onto a lead that merely shares its title and company. These
 cases are ambiguous by inspection; acceptable at this volume. The converse
 does not self-heal: once a lead is keyed `tc:`-only, a later URL-bearing
 repost of the same posting mints a new lead (strong forms match first), so
-duplicates of that kind are tolerated until source adapters land.
+duplicates of that kind are tolerated until source adapters land. A second
+limitation in the same family: the req form embeds a slugified company
+string, so the same company extracted differently across sources
+(`req:nvidia:…` vs `req:nvidia-corporation:…`) mints different keys —
+company canonicalization belongs to a future Company aggregate, not to
+v0's normalization heuristics.
 
 ## 3. Event schema (question b)
 
@@ -431,7 +453,7 @@ Supersedes and removes the placeholder `lead open|list|close`.
 | `gwl-jobs review`                                     | Interactive prompt loop (§5).                                                                                                                | `reviewed`, `apply_queued`                                                  |
 | `gwl-jobs mark <lead> <mark> [--note]`                | Non-interactive mark (scriptable). `apply-automatically` runs the same prepare → batch-append → open flow as the review loop's `a` key (§5). | `reviewed` (+ `apply_queued`)                                               |
 | `gwl-jobs package <lead>`                             | (Re)build the apply package for a lead marked `apply-automatically`; re-print and re-open the URL. Bails on unmarked leads — mark first.     | `apply_queued`                                                              |
-| `gwl-jobs show <lead>`                                | Full detail: snapshot, score history, marks, events.                                                                                         | —                                                                           |
+| `gwl-jobs show <lead>`                                | Full detail: snapshot, score history, marks, events. (Steel-thread scope: snapshot + mark + counts; grows as scores/marks/events land.)      | —                                                                           |
 | `gwl-jobs outcome <lead> <type> [--note] [--at <ts>]` | Record an outcome (§3 table).                                                                                                                | `applied` / `screened` / …                                                  |
 | `gwl-jobs events [--lead <id>] [--type <t>]`          | Dump/filter the raw log (debugging, golden tests).                                                                                           | —                                                                           |
 | `gwl-jobs completion`                                 | Shell completions (existing).                                                                                                                | —                                                                           |

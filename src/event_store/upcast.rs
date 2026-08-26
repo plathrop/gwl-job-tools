@@ -7,7 +7,7 @@
 //! Every event type is currently at version 1, so the registry is empty and
 //! `upcast` is the identity function — the seam exists from day one.
 
-use miette::{Result, bail};
+use miette::{Result, miette};
 use serde_json::Value;
 
 /// Upcast `payload` of `event_type` from `schema_version` to the current
@@ -15,10 +15,10 @@ use serde_json::Value;
 pub fn upcast(event_type: &str, schema_version: u32, payload: Value) -> Result<Value> {
     match schema_version {
         1 => Ok(payload),
-        unknown => bail!(
+        unknown => Err(miette!(
             "no upcast path for event type '{event_type}' at schema_version {unknown}; \
              this build understands version 1"
-        ),
+        )),
     }
 }
 

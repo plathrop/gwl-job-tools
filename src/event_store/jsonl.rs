@@ -7,9 +7,11 @@
 //! - Replay tolerates a torn trailing line (crash mid-write) with a warning;
 //!   any other malformed line is a hard error.
 
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use fs2::FileExt;
 use jiff::Timestamp;
@@ -17,9 +19,10 @@ use miette::{Context, IntoDiagnostic, Result, bail, miette};
 use tracing::{instrument, warn};
 use uuid::Uuid;
 
-use crate::domain::events::{ENVELOPE_VERSION, EventEnvelope, PendingEvent};
-use crate::event_store::EventStore;
-use crate::event_store::upcast::upcast;
+use crate::{
+    domain::events::{ENVELOPE_VERSION, EventEnvelope, PendingEvent},
+    event_store::{EventStore, upcast::upcast},
+};
 
 pub struct JsonlEventStore {
     path: PathBuf,
@@ -66,64 +69,86 @@ impl JsonlEventStore {
     }
 
     fn read_envelopes(&self) -> Result<Vec<EventEnvelope>> {
-        let file = File::open(&self.path)
+        let bytes = std::fs::read(&self.path)
             .into_diagnostic()
             .wrap_err_with(|| format!("reading event log {}", self.path.display()))?;
-        let mut envelopes = Vec::new();
-        let lines: Vec<String> = BufReader::new(file)
-            .lines()
-            .collect::<std::io::Result<Vec<_>>>()
-            .into_diagnostic()?;
+        let text = String::from_utf8(bytes).into_diagnostic()?;
+
+        // Track each line's byte offset so a torn tail can be truncated
+        // precisely.
+        let mut offset = 0usize;
+        let mut lines: Vec<(usize, &str)> = Vec::new();
+        for line in text.split('\n') {
+            lines.push((offset, line));
+            offset += line.len() + 1;
+        }
 
         let line_count = lines.len();
-        for (idx, line) in lines.into_iter().enumerate() {
+        let mut envelopes = Vec::new();
+        for (idx, (line_offset, line)) in lines.into_iter().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            match parse_envelope(&line) {
-                Ok(envelope) => envelopes.push(envelope),
-                Err(err) => {
-                    // Torn tail: a crash mid-write can leave a partial final
-                    // line. Discard it with a warning; anything else is
-                    // corruption and a hard error (design doc §1).
-                    let is_last = idx == line_count - 1;
-                    if is_last {
-                        warn!(
-                            line = idx + 1,
-                            error = %err,
-                            "discarding torn trailing line in event log (crash mid-write?)"
-                        );
-                    } else {
-                        return Err(err).wrap_err_with(|| {
-                            format!(
-                                "malformed event at {} line {} (not a torn tail; \
-                                 refusing to replay a corrupt log)",
-                                self.path.display(),
-                                idx + 1
-                            )
-                        });
-                    }
+            let is_last = idx == line_count - 1;
+            // A torn tail is a *syntax*-level failure on the final line: a
+            // crash mid-write. Validation failures (envelope version,
+            // upcast path) on complete lines are corruption — a hard error
+            // wherever they appear.
+            let mut envelope: EventEnvelope = match serde_json::from_str(line) {
+                Ok(envelope) => envelope,
+                Err(err) if is_last => {
+                    warn!(
+                        line = idx + 1,
+                        error = %err,
+                        "discarding and truncating torn trailing line in event log \
+                         (crash mid-write?)"
+                    );
+                    self.truncate_at(line_offset)?;
+                    break;
                 }
+                Err(err) => {
+                    return Err(err).into_diagnostic().wrap_err_with(|| {
+                        format!(
+                            "malformed event at {} line {} (not a torn tail; \
+                             refusing to replay a corrupt log)",
+                            self.path.display(),
+                            idx + 1
+                        )
+                    });
+                }
+            };
+            envelope.payload = upcast(
+                &envelope.event_type,
+                envelope.schema_version,
+                envelope.payload.take(),
+            )
+            .wrap_err_with(|| format!("event {} ({})", envelope.id, envelope.event_type))?;
+            if envelope.envelope_version != ENVELOPE_VERSION {
+                bail!(
+                    "unsupported envelope_version {} on event {} (this build understands \
+                     {ENVELOPE_VERSION})",
+                    envelope.envelope_version,
+                    envelope.id
+                );
             }
+            envelopes.push(envelope);
         }
         Ok(envelopes)
     }
-}
 
-fn parse_envelope(line: &str) -> Result<EventEnvelope> {
-    let mut envelope: EventEnvelope = serde_json::from_str(line).into_diagnostic()?;
-    envelope.payload = upcast(
-        &envelope.event_type,
-        envelope.schema_version,
-        envelope.payload.take(),
-    )?;
-    if envelope.envelope_version != ENVELOPE_VERSION {
-        bail!(
-            "unsupported envelope_version {} (this build understands {ENVELOPE_VERSION})",
-            envelope.envelope_version
-        );
+    /// Truncate the log to `offset`, removing a torn tail. Safe because the
+    /// store holds the single-writer lock for its lifetime. This is not
+    /// "rewriting the log": the torn bytes were never a committed event —
+    /// only complete, parseable events are sacred (design doc §1).
+    fn truncate_at(&self, offset: usize) -> Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .into_diagnostic()?;
+        file.set_len(offset as u64).into_diagnostic()?;
+        file.sync_all().into_diagnostic()?;
+        Ok(())
     }
-    Ok(envelope)
 }
 
 impl EventStore for JsonlEventStore {
@@ -169,13 +194,23 @@ impl EventStore for JsonlEventStore {
         }
 
         if !batch.is_empty() {
-            // One write for the whole batch (the commit unit), then fsync.
+            // One write(2) for the whole batch (the commit unit), then
+            // fsync. `write_all` can issue multiple write(2) calls after a
+            // short write, so use a single `write` and treat a short count
+            // as a failed/torn append (replay recovery will discard it).
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&self.path)
                 .into_diagnostic()?;
-            file.write_all(batch.as_bytes()).into_diagnostic()?;
+            let written = file.write(batch.as_bytes()).into_diagnostic()?;
+            if written != batch.len() {
+                bail!(
+                    "short write appending to event log ({written} of {} bytes); \
+                     the log may hold a torn tail that replay will discard",
+                    batch.len()
+                );
+            }
             file.sync_all().into_diagnostic()?;
         }
 
@@ -284,7 +319,7 @@ mod tests {
     // ── torn tail tolerance ──────────────────────────────────────
 
     #[test]
-    fn torn_trailing_line_is_discarded() {
+    fn torn_trailing_line_is_discarded_and_truncated() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let mut store = JsonlEventStore::open(&path).unwrap();
@@ -296,6 +331,7 @@ mod tests {
                 Uuid::now_v7(),
             )
             .unwrap();
+        let good_len = std::fs::metadata(&path).unwrap().len();
 
         // Simulate a crash mid-write: partial JSON, no newline.
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
@@ -305,6 +341,54 @@ mod tests {
         let replayed = store.replay().unwrap();
         assert_eq!(replayed.len(), 1);
         assert_eq!(replayed[0].payload["ok"], true);
+        // The torn tail is truncated while the lock is held, so the next
+        // append starts at a clean offset.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
+
+        store
+            .append(
+                "lead/00000000-0000-7000-8000-000000000004",
+                1,
+                &[pending(serde_json::json!({"after": "torn"}))],
+                Uuid::now_v7(),
+            )
+            .unwrap();
+        assert_eq!(store.replay().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn complete_event_with_unknown_version_is_hard_error_even_on_last_line() {
+        // A syntactically complete final line that fails validation is
+        // corruption, not a torn tail — it must not be silently discarded.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut store = JsonlEventStore::open(&path).unwrap();
+        store
+            .append(
+                "lead/00000000-0000-7000-8000-000000000006",
+                0,
+                &[pending(serde_json::json!({}))],
+                Uuid::now_v7(),
+            )
+            .unwrap();
+
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        let bogus = serde_json::json!({
+            "envelope_version": 99,
+            "id": Uuid::now_v7(),
+            "stream": "lead/00000000-0000-7000-8000-000000000006",
+            "seq": 2,
+            "type": "ingested",
+            "schema_version": 1,
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "recorded_at": "2026-01-01T00:00:00Z",
+            "correlation_id": Uuid::now_v7(),
+            "payload": {}
+        });
+        writeln!(file, "{}", serde_json::to_string(&bogus).unwrap()).unwrap();
+        drop(file);
+
+        assert!(store.replay().is_err());
     }
 
     #[test]
@@ -332,7 +416,7 @@ mod tests {
                 &[pending(serde_json::json!({}))],
                 Uuid::now_v7(),
             )
-            .unwrap();
+            .unwrap_err(); // append validates seq by loading, so it refuses too
 
         assert!(store.replay().is_err());
     }

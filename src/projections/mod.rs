@@ -5,13 +5,17 @@
 use std::collections::HashMap;
 
 use jiff::Timestamp;
+use miette::{IntoDiagnostic, Result};
 use serde::Serialize;
 use serde_json::Value;
 use serde_with::skip_serializing_none;
 use uuid::Uuid;
 
-use crate::domain::events::{EventEnvelope, ExtractedFields, Identifiers, event_type};
-use crate::domain::identity::LeadIdentity;
+use crate::domain::{
+    events::{EventEnvelope, ExtractedFields, Identifiers, event_type},
+    identity::LeadIdentity,
+    lead::stream_lead_id,
+};
 
 #[skip_serializing_none]
 #[derive(Clone, Debug, Serialize)]
@@ -34,30 +38,37 @@ pub struct Projection {
     req_index: HashMap<String, Uuid>,
     url_index: HashMap<String, Uuid>,
     tc_index: HashMap<String, Uuid>,
+    /// Every lead's dedupe key, indexed. This makes "the dedupe key is
+    /// always matchable" an invariant — it is what covers the `raw:`
+    /// fallback form, which has no slot in `Identifiers`.
+    dedupe_index: HashMap<String, Uuid>,
 }
 
 impl Projection {
     /// Match an incoming posting's identity against the index (design doc
     /// §2): `req:` and `url:` hits always match, checked in precedence
     /// order; the `tc:` fallback is consulted **only** when the incoming
-    /// posting carries neither a req nor a URL identifier.
+    /// posting carries neither a req nor a URL identifier; finally, the
+    /// dedupe key itself matches (covers `raw:`-keyed leads).
     pub fn lookup(&self, identity: &LeadIdentity) -> Option<Uuid> {
-        if let Some(req) = &identity.identifiers.req {
-            if let Some(id) = self.req_index.get(req) {
-                return Some(*id);
-            }
+        if let Some(req) = &identity.identifiers.req
+            && let Some(id) = self.req_index.get(req)
+        {
+            return Some(*id);
         }
-        if let Some(url) = &identity.identifiers.url {
-            if let Some(id) = self.url_index.get(url) {
-                return Some(*id);
-            }
+        if let Some(url) = &identity.identifiers.url
+            && let Some(id) = self.url_index.get(url)
+        {
+            return Some(*id);
         }
-        if identity.identifiers.req.is_none() && identity.identifiers.url.is_none() {
-            if let Some(tc) = &identity.identifiers.tc {
-                return self.tc_index.get(tc).copied();
-            }
+        if identity.identifiers.req.is_none()
+            && identity.identifiers.url.is_none()
+            && let Some(tc) = &identity.identifiers.tc
+            && let Some(id) = self.tc_index.get(tc)
+        {
+            return Some(*id);
         }
-        None
+        self.dedupe_index.get(&identity.dedupe_key).copied()
     }
 
     /// Leads whose id (hyphenated) starts with the given prefix. Used for
@@ -84,17 +95,29 @@ struct IngestView {
     extracted: ExtractedFields,
 }
 
-pub fn rebuild(events: &[EventEnvelope]) -> Projection {
+pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
     let mut projection = Projection::default();
     for event in events {
-        let Some(lead_id) = event.lead_id() else {
+        let Some(lead_id) = stream_lead_id(&event.stream) else {
             continue;
         };
         match event.event_type.as_str() {
             event_type::INGESTED | event_type::UPDATED => {
-                let Ok(view) = serde_json::from_value::<IngestView>(event.payload.clone()) else {
-                    continue;
-                };
+                // A payload we cannot decode is source-of-truth corruption,
+                // not something to skip: a stale projection can mint a
+                // duplicate lead on the next ingest. Fail loudly with the
+                // event's identity.
+                let view = serde_json::from_value::<IngestView>(event.payload.clone())
+                    .into_diagnostic()
+                    .map_err(|e| {
+                        e.wrap_err(format!(
+                            "decoding {} payload of event {} (seq {})",
+                            event.event_type, event.id, event.seq
+                        ))
+                    })?;
+                projection
+                    .dedupe_index
+                    .insert(view.dedupe_key.clone(), lead_id);
                 index_identifiers(&mut projection, lead_id, &view.identifiers);
                 let record = projection
                     .leads
@@ -114,14 +137,15 @@ pub fn rebuild(events: &[EventEnvelope]) -> Projection {
                 record.dedupe_key = Some(view.dedupe_key);
                 record.identifiers = view.identifiers;
                 record.source = Some(view.source);
-                if view.url.is_some() {
-                    record.url = view.url;
-                }
+                // Mirror the event snapshot exactly: an `updated` that
+                // drops the URL (e.g. a file re-ingest of a URL-ingested
+                // lead) removes it here too.
+                record.url = view.url;
                 record.extracted = view.extracted;
                 record.event_count += 1;
                 record.last_event = event.recorded_at;
             }
-            "reviewed" => {
+            event_type::REVIEWED => {
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
                     record.latest_mark = event
                         .payload
@@ -140,7 +164,7 @@ pub fn rebuild(events: &[EventEnvelope]) -> Projection {
             }
         }
     }
-    projection
+    Ok(projection)
 }
 
 fn index_identifiers(projection: &mut Projection, lead_id: Uuid, identifiers: &Identifiers) {
@@ -211,7 +235,7 @@ mod tests {
                 Some("tc:abc"),
             ),
         )];
-        let projection = rebuild(&events);
+        let projection = rebuild(&events).unwrap();
         let record = projection.leads.get(&lead_id).unwrap();
         assert_eq!(record.extracted.title.as_deref(), Some("Engineer"));
         assert_eq!(record.event_count, 1);
@@ -254,7 +278,7 @@ mod tests {
                 }),
             ),
         ];
-        let projection = rebuild(&events);
+        let projection = rebuild(&events).unwrap();
         let record = projection.leads.get(&lead_id).unwrap();
         assert_eq!(record.extracted.title.as_deref(), Some("Senior Engineer"));
         assert_eq!(record.event_count, 2);
@@ -271,7 +295,7 @@ mod tests {
             event_type::INGESTED,
             ingested_payload(None, Some("url:https://example.com/j"), Some("tc:abc")),
         )];
-        let projection = rebuild(&events);
+        let projection = rebuild(&events).unwrap();
 
         // Incoming with a strong identifier must NOT merge via tc.
         let with_strong = LeadIdentity {
@@ -305,7 +329,7 @@ mod tests {
             event_type::INGESTED,
             ingested_payload(None, Some("url:https://example.com/j"), None),
         )];
-        let projection = rebuild(&events);
+        let projection = rebuild(&events).unwrap();
         // Posting gained a req id on repost; still matches via URL index.
         let identity = LeadIdentity {
             dedupe_key: "req:acme:r-1".into(),
@@ -314,6 +338,62 @@ mod tests {
                 url: Some("url:https://example.com/j".into()),
                 tc: None,
             },
+        };
+        assert_eq!(projection.lookup(&identity), Some(lead_id));
+    }
+
+    #[test]
+    fn req_hit_wins_over_different_url() {
+        // A lead indexed with req:A and url:X; an incoming posting carrying
+        // req:A and a *different* url:Y must match via req (precedence
+        // order), not fall through to a url miss.
+        let lead_id = Uuid::now_v7();
+        let events = vec![envelope(
+            lead_id,
+            1,
+            event_type::INGESTED,
+            ingested_payload(
+                Some("req:acme:r-1"),
+                Some("url:https://example.com/x"),
+                None,
+            ),
+        )];
+        let projection = rebuild(&events).unwrap();
+        let identity = LeadIdentity {
+            dedupe_key: "req:acme:r-1".into(),
+            identifiers: Identifiers {
+                req: Some("req:acme:r-1".into()),
+                url: Some("url:https://example.com/y".into()),
+                tc: None,
+            },
+        };
+        assert_eq!(projection.lookup(&identity), Some(lead_id));
+    }
+
+    #[test]
+    fn raw_fallback_key_is_matchable_on_reingest() {
+        // A posting with no req/url/title/company falls back to a `raw:`
+        // dedupe key (identity.rs). That key is stored in `dedupe_key` but
+        // never indexed, so re-ingesting the same unstructured drop mints a
+        // new lead. Either index the `raw:` form or reject such postings;
+        // this test documents the "index it" intent.
+        let lead_id = Uuid::now_v7();
+        let events = vec![envelope(
+            lead_id,
+            1,
+            event_type::INGESTED,
+            serde_json::json!({
+                "dedupe_key": "raw:abc123",
+                "identifiers": {},
+                "source": "drop-in",
+                "raw_text": "unstructured body",
+                "extracted": {}
+            }),
+        )];
+        let projection = rebuild(&events).unwrap();
+        let identity = LeadIdentity {
+            dedupe_key: "raw:abc123".into(),
+            identifiers: Identifiers::default(),
         };
         assert_eq!(projection.lookup(&identity), Some(lead_id));
     }
@@ -329,9 +409,37 @@ mod tests {
             event_type::INGESTED,
             ingested_payload(None, None, Some("tc:abc")),
         )];
-        let projection = rebuild(&events);
+        let projection = rebuild(&events).unwrap();
         let prefix = &lead_id.to_string()[..8];
         assert_eq!(projection.find_by_id_prefix(prefix).len(), 1);
         assert!(projection.find_by_id_prefix("zzzzzzzz").is_empty());
+    }
+
+    #[test]
+    fn find_by_id_prefix_returns_all_matches() {
+        // Two leads sharing a prefix must both be returned so the caller can
+        // report ambiguity (design doc §8: "unambiguous UUID prefix").
+        let a = Uuid::parse_str("0192f8a1-0000-7000-8000-000000000001").unwrap();
+        let b = Uuid::parse_str("0192f8a1-0000-7000-8000-000000000002").unwrap();
+        let events = vec![
+            envelope(
+                a,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, None, Some("tc:a")),
+            ),
+            envelope(
+                b,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, None, Some("tc:b")),
+            ),
+        ];
+        let projection = rebuild(&events).unwrap();
+        let matches = projection.find_by_id_prefix("0192f8a1");
+        assert_eq!(matches.len(), 2);
+        let ids: Vec<Uuid> = matches.iter().map(|r| r.lead_id).collect();
+        assert!(ids.contains(&a));
+        assert!(ids.contains(&b));
     }
 }

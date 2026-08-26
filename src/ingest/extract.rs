@@ -43,33 +43,49 @@ pub fn extract_fields(text: &str, location: Option<&str>) -> ExtractedFields {
     }
 }
 
+/// Remote detection is a weak signal and we treat it that way (this feeds
+/// the remote-only gate in Increment 2): a location string lacking
+/// "remote" is not proof of on-site — postings can be remote and still
+/// list a physical location — so the body is consulted before concluding
+/// `Some(false)`.
 fn detect_remote(location: Option<&str>, text: &str) -> Option<bool> {
-    if let Some(loc) = location {
-        return Some(loc.to_lowercase().contains("remote"));
-    }
-    // No location at all: look for an explicit "remote" mention in the
-    // first chunk of the body (best-effort).
-    let head: String = text.chars().take(2000).collect();
-    if Regex::new(r"(?i)\bremote\b").unwrap().is_match(&head) {
-        Some(true)
-    } else {
-        None
+    let remote_re = Regex::new(r"(?i)\bremote\b").unwrap();
+    let body_says_remote = remote_re.is_match(&text.chars().take(4000).collect::<String>());
+    match location {
+        Some(loc) if loc.to_lowercase().contains("remote") => Some(true),
+        Some(_) if body_says_remote => Some(true),
+        Some(_) => Some(false),
+        None if body_says_remote => Some(true),
+        None => None,
     }
 }
 
+/// Hours per year used to annualize hourly rates (40 h/wk × 52 wk).
+/// Compensation is normalized to USD/year at the extraction edge: the
+/// internal representation (and the event payload) is always a yearly
+/// total, with `period` recording the source period detected. We roll the
+/// multiplication ourselves rather than pulling in `rusty_money` for now —
+/// the only arithmetic anywhere in v0 is this conversion and integer
+/// floor/ceiling comparisons, and USD is the only currency handled;
+/// integrating a money type is filed as a follow-up pebble.
+const HOURS_PER_YEAR: u64 = 2080;
+
 /// Salary range patterns: `$220,000 - $290,000`, `$220k–$290k`,
 /// `USD 220,000 to 290,000`. Single amounts (`$180,000/yr`) set `min` only.
+/// `min`/`max` are always USD/year (hourly rates are annualized).
 pub fn extract_comp(text: &str) -> Option<CompRange> {
-    let period = detect_period(text);
     let range_re = Regex::new(
         r"(?i)(?:USD\s*)?\$\s*(\d{2,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(k)?\s*(?:-|–|—|\bto\b)\s*(?:USD\s*)?\$?\s*(\d{2,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(k)?",
     )
     .unwrap();
     if let Some(caps) = range_re.captures(text) {
+        let m = caps.get(0).unwrap();
+        let period = detect_period_near(text, m.start(), m.end());
         let min = parse_amount(&caps[1], caps.get(2).map(|m| m.as_str()), &period);
         let max = parse_amount(&caps[3], caps.get(4).map(|m| m.as_str()), &period);
         if let (Some(min), Some(max)) = (min, max) {
             let raw = caps[0].trim().to_string();
+            let (min, max) = annualize(min, max, &period);
             return Some(CompRange {
                 min: Some(min),
                 max: Some(max),
@@ -82,8 +98,11 @@ pub fn extract_comp(text: &str) -> Option<CompRange> {
 
     let single_re = Regex::new(r"(?i)(?:USD\s*)?\$\s*(\d{2,3}(?:,\d{3})+)\s*(k)?").unwrap();
     if let Some(caps) = single_re.captures(text) {
+        let m = caps.get(0).unwrap();
+        let period = detect_period_near(text, m.start(), m.end());
         if let Some(amount) = parse_amount(&caps[1], caps.get(2).map(|m| m.as_str()), &period) {
             let raw = caps[0].trim().to_string();
+            let (amount, _) = annualize(amount, amount, &period);
             return Some(CompRange {
                 min: Some(amount),
                 max: None,
@@ -94,6 +113,14 @@ pub fn extract_comp(text: &str) -> Option<CompRange> {
         }
     }
     None
+}
+
+fn annualize(min: u64, max: u64, period: &str) -> (u64, u64) {
+    if period == "hour" {
+        (min * HOURS_PER_YEAR, max * HOURS_PER_YEAR)
+    } else {
+        (min, max)
+    }
 }
 
 fn parse_amount(digits: &str, k_suffix: Option<&str>, period: &str) -> Option<u64> {
@@ -115,12 +142,31 @@ fn parse_amount(digits: &str, k_suffix: Option<&str>, period: &str) -> Option<u6
     }
 }
 
-fn detect_period(text: &str) -> String {
-    let re = Regex::new(r"(?i)\b(per\s+hour|hourly|/hr|an\s+hour)\b").unwrap();
-    if re.is_match(text) {
-        "hour".into()
-    } else {
-        "year".into()
+/// Determine the period from the period keyword *nearest* the matched
+/// amount. A posting that says "$150,000 - $200,000 annually. We also pay
+/// hourly contractors" is annual — "annually" sits right next to the
+/// range, "hourly" paragraphs away. Defaults to "year" when no keyword is
+/// nearby (salary ranges without a stated period are annual).
+fn detect_period_near(text: &str, start: usize, end: usize) -> String {
+    let window_start = text.floor_char_boundary(start.saturating_sub(120));
+    let window_end = text.ceil_char_boundary((end + 120).min(text.len()));
+    let window = &text[window_start..window_end];
+    let mid = (start + end) / 2;
+
+    let hourly_re = Regex::new(r"(?i)\b(per\s+hour|hourly|/hr|an\s+hour)\b").unwrap();
+    let yearly_re = Regex::new(r"(?i)\b(annually|yearly|per\s+year|/yr|a\s+year)\b").unwrap();
+    let nearest = |re: &Regex| {
+        re.find_iter(window)
+            .map(|m| {
+                let pos = window_start + m.start();
+                pos.abs_diff(mid)
+            })
+            .min()
+    };
+    match (nearest(&hourly_re), nearest(&yearly_re)) {
+        (Some(h), Some(y)) if h < y => "hour".into(),
+        (Some(_), None) => "hour".into(),
+        _ => "year".into(),
     }
 }
 
@@ -183,16 +229,41 @@ mod tests {
 
     #[test]
     fn comp_hourly_period() {
+        // Hourly rates are annualized at the edge (USD/year internally).
         let comp = extract_comp("Rate: $85 - $110 per hour").unwrap();
         assert_eq!(comp.period, "hour");
-        assert_eq!(comp.min, Some(85));
-        assert_eq!(comp.max, Some(110));
+        assert_eq!(comp.min, Some(85 * 2080));
+        assert_eq!(comp.max, Some(110 * 2080));
     }
 
     #[test]
     fn comp_rejects_implausible_amounts() {
         assert!(extract_comp("over 5,000 customers and $4,999 raised").is_none());
         assert!(extract_comp("founded in 2019").is_none());
+    }
+
+    #[test]
+    fn comp_annual_range_survives_unrelated_hourly_mention() {
+        // `detect_period` scans the whole posting, so an unrelated "hourly"
+        // mention elsewhere flips the period to "hour" and the annual range
+        // is then rejected as implausible. The range's own context should
+        // determine the period.
+        let comp =
+            extract_comp("Salary: $150,000 - $200,000 annually. We also pay hourly contractors.")
+                .unwrap();
+        assert_eq!(comp.min, Some(150_000));
+        assert_eq!(comp.max, Some(200_000));
+        assert_eq!(comp.period, "year");
+    }
+
+    #[test]
+    fn comp_rejects_above_annual_ceiling() {
+        assert!(extract_comp("Salary: $10,000,000 per year").is_none());
+    }
+
+    #[test]
+    fn comp_rejects_below_hourly_floor() {
+        assert!(extract_comp("Rate: $5 per hour").is_none());
     }
 
     #[test]
@@ -219,12 +290,23 @@ mod tests {
         assert_eq!(extract_req_id("no identifier here"), None);
     }
 
+    #[test]
+    fn req_id_requires_a_digit() {
+        // Rules out plain words that happen to match the shape.
+        assert_eq!(extract_req_id("Req ID: ABCDEF"), None);
+    }
+
     // ── remote detection ─────────────────────────────────────────
 
     #[test]
     fn remote_from_location() {
         assert_eq!(detect_remote(Some("Remote, US"), ""), Some(true));
         assert_eq!(detect_remote(Some("San Francisco, CA"), ""), Some(false));
+        // A physical location plus a body that says remote is still remote.
+        assert_eq!(
+            detect_remote(Some("San Francisco, CA"), "This role is remote-friendly."),
+            Some(true)
+        );
     }
 
     #[test]

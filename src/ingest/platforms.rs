@@ -14,8 +14,7 @@ use miette::{Context, Result, bail};
 use serde_json::Value;
 use url::Url;
 
-use crate::domain::events::ExtractedFields;
-use crate::ingest::extract;
+use crate::{domain::events::ExtractedFields, ingest::extract};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Platform {

@@ -29,11 +29,16 @@ A deterministic pipeline with these stages:
 
 ### 1. Ingest
 
-Accept a URL or a file (HTML/PDF/text). Fetch and extract the main text. Emit a
+Accept a URL or a file (HTML/PDF/text; PDF support is deferred to
+GWLJ-mxyp63, which also covers headless print-to-PDF for JS-rendered
+sites). Fetch and extract the main text. Emit a
 `ingested` event containing the raw text plus best-effort structured
 fields: title, company, compensation, location, req id, and source. Sources are
-pluggable adapters; v0 ships only the drop-in adapter (Greenhouse/Ashby/Lever
-adapters are vNext).
+pluggable adapters; v0 ships the platform-aware drop-in adapter — URLs
+matching known boards (Greenhouse/Ashby/Lever/Workday) are fetched via the
+board's public JSON API first, with HTML fetch as the fallback
+(`docs/decisions/0003-api-first-extraction-in-v0.md`). Discovery
+(watchlist polling) remains vNext.
 
 ### 2. Hard filters (gates)
 
@@ -132,7 +137,7 @@ rebuilt on startup for the queue. SQLite projection is deferred.
 - **Event-sourcing**: append-only JSONL event log is the source of truth;
   in-memory projection for reads.
 - **Config**: TOML file. Contents: compensation floor + ceiling, remote-only
-  flag, blacklist, alias table, scoring weights, generic-letter path,
+  flag, blacklist, alias table, scoring weights, cover-letter path,
   target-companies list (empty for now).
 - **Pluggable extension points** (design for, do not build): additional scoring
   types/sources (LLM scorers, embeddings), source adapters

@@ -1,5 +1,4 @@
 [package]
-rust-version = "1.85"
 edition = "2024"
 name = "gwl-job-tools"
 description = "A simple job search tracker."
@@ -27,6 +26,7 @@ directories = "6.0"
 dom_smoothie = "0.18.0"
 fs2 = "0.4.3"
 html2text = "0.17.1"
+httpdate = "1.0.3"
 jiff = { version = "0.2.35", features = ["serde"] }
 miette = { version = "7.6.0", features = ["fancy", "derive"] }
 opentelemetry = { version = "0.32.0", features = ["trace"], optional = true }
@@ -53,3 +53,4 @@ path = "src/main.rs"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+tokio = { version = "1.53.1", features = ["test-util"] }
