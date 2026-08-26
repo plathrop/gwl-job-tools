@@ -193,7 +193,8 @@ fn parse_lever(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
         bail!("lever API response missing text (shape changed?)");
     }
     // Lever returns `descriptionPlain` plus optional `lists` and
-    // `additional` (HTML). Prefer plain text; fall back to the HTML parts.
+    // `additional` (HTML, with `additionalPlain` when available). Prefer
+    // plain text; fall back to the HTML parts.
     let body_html = if let Some(plain) = str_field(body, &["descriptionPlain"]) {
         let mut text = plain.to_string();
         if let Some(lists) = body.get("lists").and_then(Value::as_array) {
@@ -203,6 +204,13 @@ fn parse_lever(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
                     text.push_str(&extract::html_to_text(content));
                 }
             }
+        }
+        if let Some(additional) = str_field(body, &["additionalPlain"]) {
+            text.push('\n');
+            text.push_str(additional);
+        } else if let Some(additional) = str_field(body, &["additional"]) {
+            text.push('\n');
+            text.push_str(&extract::html_to_text(additional));
         }
         text
     } else {
@@ -215,6 +223,9 @@ fn parse_lever(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
                     html.push_str(content);
                 }
             }
+        }
+        if let Some(additional) = str_field(body, &["additional"]) {
+            html.push_str(additional);
         }
         html
     };
@@ -420,6 +431,22 @@ mod tests {
         let (raw_text, _) = finalize(&api);
         assert!(raw_text.contains("We are hiring."));
         assert!(raw_text.contains("5+ years"));
+    }
+
+    #[test]
+    fn parses_lever_additional_section() {
+        let body = serde_json::json!({
+            "id": "abc-123",
+            "text": "Staff Software Engineer",
+            "categories": {"location": "Remote"},
+            "descriptionPlain": "We are hiring.",
+            "additionalPlain": "Salary: $190,000 - $230,000."
+        });
+        let url = Url::parse("https://jobs.lever.co/acme/abc-123").unwrap();
+        let api = parse_api_response(Platform::Lever, &body, &url).unwrap();
+        let (raw_text, fields) = finalize(&api);
+        assert!(raw_text.contains("$190,000"));
+        assert_eq!(fields.comp.unwrap().min, Some(190_000));
     }
 
     #[test]

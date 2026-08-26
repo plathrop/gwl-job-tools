@@ -188,6 +188,12 @@ pub struct UpdatedPayload {
 pub struct ReingestSuppressedPayload {
     pub dedupe_key: String,
     pub suppressed_by_mark: String,
+    /// The incoming posting's identifiers, so the projection can index them
+    /// even though the lead is suppressed: a later copy carrying only one of
+    /// these forms must still match the durably ignored lead (durable
+    /// ignore, design doc §2).
+    #[serde(default)]
+    pub identifiers: Identifiers,
 }
 
 #[cfg(test)]

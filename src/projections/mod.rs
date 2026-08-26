@@ -156,6 +156,25 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                     record.last_event = event.recorded_at;
                 }
             }
+            event_type::REINGEST_SUPPRESSED => {
+                // A suppressed repost still teaches the index its
+                // identifiers: a later copy carrying only one of these
+                // forms must keep matching the durably ignored lead.
+                #[derive(serde::Deserialize)]
+                struct SuppressedView {
+                    dedupe_key: String,
+                    #[serde(default)]
+                    identifiers: Identifiers,
+                }
+                if let Ok(view) = serde_json::from_value::<SuppressedView>(event.payload.clone()) {
+                    projection.dedupe_index.insert(view.dedupe_key, lead_id);
+                    index_identifiers(&mut projection, lead_id, &view.identifiers);
+                }
+                if let Some(record) = projection.leads.get_mut(&lead_id) {
+                    record.event_count += 1;
+                    record.last_event = event.recorded_at;
+                }
+            }
             _ => {
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
                     record.event_count += 1;

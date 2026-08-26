@@ -31,6 +31,24 @@ pub struct FetchResponse {
     pub body: String,
 }
 
+/// Fetch failures that must NOT trigger the API→HTML fallback. The fallback
+/// exists for *shape* failures (unrecognized API responses); retrying a
+/// rate-limited or unreachable host via its page URL would violate control
+/// headers or just fail again — so these propagate. Non-rate-limit HTTP
+/// statuses (404, 500, …) are ordinary outcomes and DO fall back: a dead
+/// API endpoint says nothing about the page.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+pub enum FetchError {
+    #[error(
+        "rate limited fetching {url}: server asked for a retry after {delay:?}, over the local cap"
+    )]
+    #[diagnostic(code(gwl_jobs::rate_limited))]
+    RateLimited { url: String, delay: Duration },
+    #[error("transport error fetching {url}: {message}")]
+    #[diagnostic(code(gwl_jobs::transport))]
+    Transport { url: String, message: String },
+}
+
 /// Transport seam. The good-citizen logic (politeness delay, retry
 /// honoring `Retry-After`, status handling) lives in `PoliteClient` and is
 /// tested against scripted `Fetcher` implementations — no network, no mock
@@ -62,19 +80,26 @@ impl HttpFetcher {
 
 impl Fetcher for HttpFetcher {
     async fn get(&self, url: &Url) -> Result<FetchResponse> {
+        let transport = |e: reqwest::Error| FetchError::Transport {
+            url: url.to_string(),
+            message: e.to_string(),
+        };
         let response = self
             .client
             .get(url.clone())
             .send()
             .await
-            .into_diagnostic()?;
+            .map_err(|e| miette::Report::new(transport(e)))?;
         let status = response.status().as_u16();
         let retry_after = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
-        let body = response.text().await.into_diagnostic()?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| miette::Report::new(transport(e)))?;
         Ok(FetchResponse {
             status,
             retry_after,
@@ -123,11 +148,11 @@ impl<F: Fetcher> PoliteClient<F> {
                 let delay = parse_retry_after(response.retry_after.as_deref())
                     .unwrap_or(DEFAULT_RETRY_DELAY);
                 if delay > self.max_retry_delay {
-                    bail!(
-                        "{url} asked us to retry after {delay:?} (over the {:?} local \
-                         cap); giving up rather than retrying early",
-                        self.max_retry_delay
-                    );
+                    return Err(FetchError::RateLimited {
+                        url: url.to_string(),
+                        delay,
+                    }
+                    .into());
                 }
                 warn!(%url, ?delay, "rate-limited; honoring Retry-After");
                 tokio::time::sleep(delay).await;
@@ -188,6 +213,16 @@ pub async fn ingest_url<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Result
         match ingest_via_api(url, platform, http).await {
             Ok(outcome) => return Ok(outcome),
             Err(err) => {
+                // Only *shape* failures fall back to HTML. Rate-limit and
+                // transport failures propagate: fetching the same host's
+                // page after a 429 would violate the control header we just
+                // honored, and an unreachable host will not answer either
+                // way. (Non-rate-limit statuses are NOT FetchErrors and do
+                // fall back — a dead API endpoint says nothing about the
+                // page.)
+                if err.downcast_ref::<FetchError>().is_some() {
+                    return Err(err);
+                }
                 warn!(
                     error = %err,
                     platform = platform.source_name(),
@@ -436,6 +471,22 @@ mod tests {
         );
         assert_eq!(calls[1], posting.to_string());
         assert!(outcome.raw_text.contains("Platform Engineer"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_api_does_not_fall_back_to_same_host() {
+        // A 429 whose Retry-After exceeds the local cap must propagate —
+        // fetching the posting page on the SAME host after the server told
+        // us to back off would violate the control header.
+        let posting =
+            Url::parse("https://nvidia.wd5.myworkdayjobs.com/en-US/Site/job/X_JR1").unwrap();
+        let fetcher = ScriptedFetcher::with(vec![response(429, Some("120"), "")]);
+        let client = client_with(fetcher);
+
+        let result = ingest_url(&posting, &client).await;
+
+        assert!(result.is_err());
+        assert_eq!(client.fetcher.calls().len(), 1);
     }
 
     // ── parse_retry_after ────────────────────────────────────────

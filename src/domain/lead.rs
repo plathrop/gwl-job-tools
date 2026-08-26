@@ -112,6 +112,7 @@ pub fn decide_ingest(
         let payload = ReingestSuppressedPayload {
             dedupe_key: identity.dedupe_key.clone(),
             suppressed_by_mark: "ignore".into(),
+            identifiers: identity.identifiers.clone(),
         };
         return Ok((
             IngestKind::Suppressed,
