@@ -72,51 +72,53 @@ impl JsonlEventStore {
         let bytes = std::fs::read(&self.path)
             .into_diagnostic()
             .wrap_err_with(|| format!("reading event log {}", self.path.display()))?;
-        let text = String::from_utf8(bytes).into_diagnostic()?;
 
-        // Track each line's byte offset so a torn tail can be truncated
-        // precisely.
+        // Commit policy: every appended batch ends with '\n' and is fsync'd,
+        // so a file that does not end with a newline has a torn tail — the
+        // final record was never committed, whether or not its bytes happen
+        // to parse. It is discarded and truncated; only complete,
+        // newline-terminated, parseable events are sacred (design doc §1).
+        let terminated = bytes.last() == Some(&b'\n');
+
+        // Split on newlines at the byte level (never decoding the whole log
+        // up front): a short write can split a multibyte UTF-8 character in
+        // `raw_text`, and that must not turn into a hard UTF-8 error — the
+        // torn final slice is recoverable, everything before it is not.
         let mut offset = 0usize;
-        let mut lines: Vec<(usize, &str)> = Vec::new();
-        for line in text.split('\n') {
-            lines.push((offset, line));
-            offset += line.len() + 1;
+        let mut lines: Vec<(usize, &[u8])> = Vec::new();
+        for slice in bytes.split(|b| *b == b'\n') {
+            lines.push((offset, slice));
+            offset += slice.len() + 1;
         }
 
         let line_count = lines.len();
         let mut envelopes = Vec::new();
-        for (idx, (line_offset, line)) in lines.into_iter().enumerate() {
-            if line.trim().is_empty() {
+        for (idx, (line_offset, slice)) in lines.into_iter().enumerate() {
+            if slice.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
             let is_last = idx == line_count - 1;
-            // A torn tail is a *syntax*-level failure on the final line: a
-            // crash mid-write. Validation failures (envelope version,
-            // upcast path) on complete lines are corruption — a hard error
-            // wherever they appear.
-            let mut envelope: EventEnvelope = match serde_json::from_str(line) {
-                Ok(envelope) => envelope,
-                Err(err) if is_last => {
-                    warn!(
-                        line = idx + 1,
-                        error = %err,
-                        "discarding and truncating torn trailing line in event log \
-                         (crash mid-write?)"
-                    );
-                    self.truncate_at(line_offset)?;
-                    break;
-                }
-                Err(err) => {
-                    return Err(err).into_diagnostic().wrap_err_with(|| {
-                        format!(
-                            "malformed event at {} line {} (not a torn tail; \
-                             refusing to replay a corrupt log)",
-                            self.path.display(),
-                            idx + 1
-                        )
-                    });
-                }
-            };
+            if is_last && !terminated {
+                warn!(
+                    line = idx + 1,
+                    "discarding and truncating uncommitted trailing record in event log \
+                     (crash mid-write?)"
+                );
+                self.truncate_at(line_offset)?;
+                break;
+            }
+            // Syntax-level parse failure on a committed (newline-terminated)
+            // line is corruption, as is any validation failure (envelope
+            // version, upcast path) — hard errors wherever they appear.
+            let mut envelope: EventEnvelope = serde_json::from_slice(slice)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!(
+                        "malformed event at {} line {} (refusing to replay a corrupt log)",
+                        self.path.display(),
+                        idx + 1
+                    )
+                })?;
             envelope.payload = upcast(
                 &envelope.event_type,
                 envelope.schema_version,
@@ -354,6 +356,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.replay().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn unterminated_complete_record_is_torn_and_truncated() {
+        // A short write can end exactly after a complete JSON object but
+        // before its newline. The record parses, but its batch never
+        // committed (every committed batch ends with '\n'), so it is torn:
+        // discarded and truncated before the next append can corrupt it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut store = JsonlEventStore::open(&path).unwrap();
+        store
+            .append(
+                "lead/00000000-0000-7000-8000-000000000007",
+                0,
+                &[pending(serde_json::json!({"ok": true}))],
+                Uuid::now_v7(),
+            )
+            .unwrap();
+        let good_len = std::fs::metadata(&path).unwrap().len();
+
+        // Complete, parseable JSON object, NO trailing newline.
+        let orphan = serde_json::json!({
+            "envelope_version": 1,
+            "id": Uuid::now_v7(),
+            "stream": "lead/00000000-0000-7000-8000-000000000007",
+            "seq": 2,
+            "type": "ingested",
+            "schema_version": 1,
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "recorded_at": "2026-01-01T00:00:00Z",
+            "correlation_id": Uuid::now_v7(),
+            "payload": {}
+        });
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(serde_json::to_string(&orphan).unwrap().as_bytes())
+            .unwrap();
+        drop(file);
+
+        let replayed = store.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
+    }
+
+    #[test]
+    fn split_multibyte_char_in_torn_tail_is_recoverable() {
+        // A short write can split a multibyte UTF-8 character in raw_text;
+        // decoding the whole log up front would hard-fail on what is really
+        // an ordinary torn tail.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut store = JsonlEventStore::open(&path).unwrap();
+        store
+            .append(
+                "lead/00000000-0000-7000-8000-000000000008",
+                0,
+                &[pending(serde_json::json!({"ok": true}))],
+                Uuid::now_v7(),
+            )
+            .unwrap();
+        let good_len = std::fs::metadata(&path).unwrap().len();
+
+        // First bytes of an incomplete record whose final character is a
+        // split 4-byte UTF-8 sequence (e.g. an emoji in raw_text).
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"envelope_version\":1,\"payload\":\"\xf0\x9f")
+            .unwrap();
+        drop(file);
+
+        let replayed = store.replay().unwrap();
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), good_len);
     }
 
     #[test]

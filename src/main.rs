@@ -5,7 +5,7 @@ use gwl_job_tools::{
     telemetry::init_telemetry,
 };
 use miette::Result;
-use tracing::info_span;
+use tracing::{Instrument, info_span};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -16,12 +16,13 @@ async fn main() -> Result<()> {
 
     let telemetry = init_telemetry(cli.telemetry, APP_NAME)?;
 
-    let result = {
-        let main_span = info_span!("cli", command = cli.command_name());
-        let _guard = main_span.enter();
-
-        cli::execute(cli.command).await
-    };
+    // Instrument the future rather than holding an entered-span guard across
+    // the .await (an entered guard is thread-local and would mis-attribute
+    // unrelated executor work to this span).
+    let command_name = cli.command_name();
+    let result = cli::execute(cli.command)
+        .instrument(info_span!("cli", command = command_name))
+        .await;
 
     telemetry.shutdown()?;
 

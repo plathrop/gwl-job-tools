@@ -50,7 +50,12 @@ pub fn extract_fields(text: &str, location: Option<&str>) -> ExtractedFields {
 /// `Some(false)`.
 fn detect_remote(location: Option<&str>, text: &str) -> Option<bool> {
     let remote_re = Regex::new(r"(?i)\bremote\b").unwrap();
-    let body_says_remote = remote_re.is_match(&text.chars().take(4000).collect::<String>());
+    let negated_re = Regex::new(
+        r"(?i)\b(not|no|never|isn't|isnt|aren't|arent)\s+(?:a\s+|an\s+)?remote\b\w*|\bnon-remote\b|\bremote\s+is\s+not\b",
+    )
+    .unwrap();
+    let head: String = text.chars().take(4000).collect();
+    let body_says_remote = remote_re.is_match(&negated_re.replace_all(&head, ""));
     match location {
         Some(loc) if loc.to_lowercase().contains("remote") => Some(true),
         Some(_) if body_says_remote => Some(true),
@@ -316,6 +321,21 @@ mod tests {
             Some(true)
         );
         assert_eq!(detect_remote(None, "Join us in our NYC office."), None);
+    }
+
+    #[test]
+    fn remote_negations_are_not_evidence() {
+        assert_eq!(
+            detect_remote(Some("NYC"), "this role is not remote"),
+            Some(false)
+        );
+        assert_eq!(detect_remote(None, "this role is not remote"), None);
+        assert_eq!(detect_remote(None, "non-remote position"), None);
+        assert_eq!(
+            detect_remote(Some("Denver"), "remote is not an option here"),
+            Some(false)
+        );
+        assert_eq!(detect_remote(None, "fully remote team"), Some(true));
     }
 
     // ── prettify_slug ────────────────────────────────────────────
