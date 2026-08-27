@@ -79,19 +79,19 @@ Every line in the log is one envelope:
 }
 ```
 
-| Field              | Meaning                                                              |
-| ------------------ | -------------------------------------------------------------------- |
-| `envelope_version` | Version of the envelope shape itself (§4).                           |
-| `id`               | UUIDv7, unique per event.                                            |
-| `stream`           | `lead/<lead_id>`; the aggregate stream.                              |
-| `seq`              | Per-stream sequence, 1-based, gapless. Optimistic concurrency.       |
-| `type`             | Event type (§3).                                                     |
-| `schema_version`   | Version of this event type's payload shape (§4).                     |
-| `occurred_at`      | When the thing happened (user-supplied for retro-recorded outcomes). |
-| `recorded_at`      | When the event was appended.                                         |
-| `causation_id`     | ID of the event that directly caused this one, if any.               |
-| `correlation_id`   | One UUID per command invocation; groups a command's events.          |
-| `payload`          | Event-type-specific body.                                            |
+| Field              | Meaning                                                                                                                                                               |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `envelope_version` | Version of the envelope shape itself (§4).                                                                                                                            |
+| `id`               | UUIDv7, unique per event.                                                                                                                                             |
+| `stream`           | `lead/<lead_id>`; the aggregate stream.                                                                                                                               |
+| `seq`              | Per-stream sequence, 1-based, gapless. Optimistic concurrency.                                                                                                        |
+| `type`             | Event type (§3).                                                                                                                                                      |
+| `schema_version`   | Version of this event type's payload shape (§4).                                                                                                                      |
+| `occurred_at`      | When the thing happened (user-supplied for retro-recorded outcomes).                                                                                                  |
+| `recorded_at`      | When the event was appended.                                                                                                                                          |
+| `causation_id`     | ID of the event that directly caused this one, if any. Within a batch, an event without an explicit cause is caused by the event it follows (chained at append time). |
+| `correlation_id`   | One UUID per command invocation; groups a command's events.                                                                                                           |
+| `payload`          | Event-type-specific body.                                                                                                                                             |
 
 `recorded_at` - `occurred_at` is meaningful for retro-recorded outcomes;
 for pipeline events they are near-identical.
@@ -276,6 +276,15 @@ instead expressed as a fourth scoring dimension (`remote`: confident remote
 = 100, unknown = 50; confident non-remote never reaches scoring), which is
 how remote roles bubble to the top of the queue. (Confirmed 2026-08-26; the
 dimension lands with Increment 3.)
+
+The **blacklist** gate matches on word-boundary token containment plus
+alphanumeric-folded equality for spacing variants — deliberately not plain
+substring matching (`apple` must not reject `Pineapple`; `meta` must not
+reject `Metabase`). "Salesforce", "Salesforce, Inc.", and "Sales Force"
+all match the entry `salesforce`. Because fallback ingest paths (HTML/file)
+don't always extract a company, a conservative title-derived fallback
+(`Title — Company`, `Title at Company`) feeds the gate so the
+non-negotiable holds on every ingest path.
 
 **`scored`** ● — survived all gates.
 

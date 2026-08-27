@@ -273,6 +273,11 @@ async fn ingest_via_html<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Resul
     let mut extracted = extract::extract_fields(&raw_text, None);
     extracted.title = title;
     extracted.req_id = extract::extract_req_id(&raw_text);
+    // Company fallback so the blacklist gate holds on the HTML path too.
+    extracted.company = extracted
+        .title
+        .as_deref()
+        .and_then(extract::company_from_title);
     Ok(IngestOutcome {
         source: "drop-in".into(),
         url: Some(url.to_string()),
@@ -305,6 +310,11 @@ pub fn ingest_file(path: &Path, content: &str) -> Result<IngestOutcome> {
     let mut extracted = extract::extract_fields(&raw_text, None);
     extracted.title = title;
     extracted.req_id = extract::extract_req_id(&raw_text);
+    // Company fallback so the blacklist gate holds on file drops too.
+    extracted.company = extracted
+        .title
+        .as_deref()
+        .and_then(extract::company_from_title);
     Ok(IngestOutcome {
         source: "drop-in".into(),
         url: None,
