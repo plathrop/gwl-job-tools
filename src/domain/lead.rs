@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::domain::{
     events::{
         EventEnvelope, ExtractedFields, IngestedPayload, PendingEvent, ReingestSuppressedPayload,
-        SnapshotFields, UpdatedPayload, event_type,
+        RejectedPayload, SnapshotFields, UpdatedPayload, event_type,
     },
+    gates::GateFailure,
     identity::LeadIdentity,
 };
 
@@ -35,6 +36,8 @@ pub struct LeadState {
     pub snapshot: Option<ExtractedFields>,
     pub url: Option<String>,
     pub raw_text: Option<String>,
+    /// Count of gate/score evaluations (rejected + scored events).
+    pub eval_revision: u64,
 }
 
 impl LeadState {
@@ -63,6 +66,9 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
+        event_type::REJECTED | event_type::SCORED => {
+            state.eval_revision += 1;
+        }
         _ => {}
     }
 }
@@ -90,6 +96,7 @@ pub fn decide_ingest(
     url: Option<String>,
     raw_text: String,
     extracted: ExtractedFields,
+    gate_failures: Vec<GateFailure>,
 ) -> Result<(IngestKind, Vec<PendingEvent>)> {
     if !state.exists {
         let payload = IngestedPayload {
@@ -102,10 +109,9 @@ pub fn decide_ingest(
                 extracted,
             },
         };
-        return Ok((
-            IngestKind::New,
-            vec![PendingEvent::new(event_type::INGESTED, None, &payload)?],
-        ));
+        let mut events = vec![PendingEvent::new(event_type::INGESTED, None, &payload)?];
+        events.extend(rejection_events(state, gate_failures)?);
+        return Ok((IngestKind::New, events));
     }
 
     if state.latest_mark.as_deref() == Some("ignore") {
@@ -141,10 +147,33 @@ pub fn decide_ingest(
             extracted,
         },
     };
-    Ok((
-        IngestKind::Updated { changed },
-        vec![PendingEvent::new(event_type::UPDATED, None, &payload)?],
-    ))
+    let mut events = vec![PendingEvent::new(event_type::UPDATED, None, &payload)?];
+    events.extend(rejection_events(state, gate_failures)?);
+    Ok((IngestKind::Updated { changed }, events))
+}
+
+/// One `rejected` event per failed gate, sharing the evaluation's revision
+/// (the count of prior gate/score evaluations, +1). Causation within the
+/// batch is chained at append time, so these are caused by the snapshot
+/// event they follow.
+fn rejection_events(
+    state: &LeadState,
+    gate_failures: Vec<GateFailure>,
+) -> Result<Vec<PendingEvent>> {
+    gate_failures
+        .into_iter()
+        .map(|failure| {
+            PendingEvent::new(
+                event_type::REJECTED,
+                None,
+                &RejectedPayload {
+                    gate: failure.gate.as_str().into(),
+                    reason: failure.reason,
+                    revision: state.eval_revision + 1,
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -182,6 +211,7 @@ mod tests {
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
+            vec![],
         )
         .unwrap();
         assert_eq!(kind, IngestKind::New);
@@ -208,6 +238,7 @@ mod tests {
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Senior Engineer"),
+            vec![],
         )
         .unwrap();
         assert_eq!(
@@ -218,6 +249,56 @@ mod tests {
         );
         assert_eq!(events[0].event_type, event_type::UPDATED);
         assert_eq!(events[0].payload["changed"][0], "title");
+    }
+
+    #[test]
+    fn gate_failures_emit_rejected_with_revision() {
+        let failure = GateFailure {
+            gate: crate::domain::gates::Gate::RemoteOnly,
+            reason: "confident non-remote".into(),
+        };
+        let (kind, events) = decide_ingest(
+            &LeadState::default(),
+            &identity(),
+            "drop-in",
+            Some("https://example.com/j".into()),
+            "body".into(),
+            extracted("Engineer"),
+            vec![failure],
+        )
+        .unwrap();
+        assert_eq!(kind, IngestKind::New);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, event_type::REJECTED);
+        assert_eq!(events[1].payload["gate"], "remote-only");
+        assert_eq!(events[1].payload["revision"], 1);
+    }
+
+    #[test]
+    fn revision_increments_across_evaluations() {
+        // A lead previously evaluated once (one rejected event) re-evaluates
+        // at revision 2.
+        let state = LeadState {
+            exists: true,
+            seq: 2,
+            eval_revision: 1,
+            ..Default::default()
+        };
+        let failure = GateFailure {
+            gate: crate::domain::gates::Gate::Blacklist,
+            reason: "blacklisted".into(),
+        };
+        let (_, events) = decide_ingest(
+            &state,
+            &identity(),
+            "drop-in",
+            Some("https://example.com/j".into()),
+            "body2".into(),
+            extracted("Engineer"),
+            vec![failure],
+        )
+        .unwrap();
+        assert_eq!(events[1].payload["revision"], 2);
     }
 
     #[test]
@@ -234,6 +315,7 @@ mod tests {
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
+            vec![],
         )
         .unwrap();
         assert_eq!(kind, IngestKind::Suppressed);
@@ -257,6 +339,7 @@ mod tests {
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
+            vec![],
         )
         .unwrap();
         assert!(matches!(kind, IngestKind::Updated { .. }));
@@ -280,6 +363,7 @@ mod tests {
             Some("https://example.com/new".into()),
             "body".into(),
             extracted("Engineer"),
+            vec![],
         )
         .unwrap();
         assert_eq!(
@@ -397,6 +481,7 @@ mod tests {
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
+            vec![],
         )
         .unwrap();
         assert_eq!(kind, IngestKind::Suppressed);

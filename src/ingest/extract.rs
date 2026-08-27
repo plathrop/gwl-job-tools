@@ -54,7 +54,20 @@ fn detect_remote(location: Option<&str>, text: &str) -> Option<bool> {
         r"(?i)\b(not|no|never|isn't|isnt|aren't|arent)\s+(?:a\s+|an\s+)?remote\b\w*|\bnon-remote\b|\bremote\s+is\s+not\b",
     )
     .unwrap();
+    // Explicit work-arrangement negatives (confirmed design, 2026-08-26):
+    // "hybrid", "on-site in X", "in-office", "must be located/based in"
+    // are confident on-site signals and fail the gate even when the word
+    // "remote" appears somewhere (e.g. "not remote" variants aside,
+    // "hybrid with remote Fridays" is still hybrid).
+    let negative_re = Regex::new(
+        r"(?i)\bhybrid\b|\bon[- ]site\b|\bin[- ]office\b|\bmust be (located|based) in\b",
+    )
+    .unwrap();
     let head: String = text.chars().take(4000).collect();
+    let location_text = location.unwrap_or_default();
+    if negative_re.is_match(location_text) || negative_re.is_match(&head) {
+        return Some(false);
+    }
     let body_says_remote = remote_re.is_match(&negated_re.replace_all(&head, ""));
     match location {
         Some(loc) if loc.to_lowercase().contains("remote") => Some(true),
@@ -336,6 +349,30 @@ mod tests {
             Some(false)
         );
         assert_eq!(detect_remote(None, "fully remote team"), Some(true));
+    }
+
+    #[test]
+    fn explicit_onsite_signals_win_over_remote_mentions() {
+        // Confirmed design: hybrid/on-site/in-office are confident negatives
+        // even when "remote" appears somewhere in the posting.
+        assert_eq!(
+            detect_remote(Some("Denver, CO"), "hybrid role"),
+            Some(false)
+        );
+        assert_eq!(
+            detect_remote(None, "This is a hybrid position with remote flexibility."),
+            Some(false)
+        );
+        assert_eq!(
+            detect_remote(Some("Hybrid - San Francisco"), ""),
+            Some(false)
+        );
+        assert_eq!(detect_remote(None, "on-site in Austin"), Some(false));
+        assert_eq!(detect_remote(None, "3 days in-office weekly"), Some(false));
+        assert_eq!(
+            detect_remote(None, "must be located in the Bay Area"),
+            Some(false)
+        );
     }
 
     // ── prettify_slug ────────────────────────────────────────────

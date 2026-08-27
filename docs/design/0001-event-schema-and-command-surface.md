@@ -267,6 +267,16 @@ for URLs already in hand; discovery (watchlist polling) remains vNext.
 LLM scorer that fills it is vNext. `revision` counts gate/score evaluations
 of this lead (re-ingests re-evaluate).
 
+Gate philosophy: gates reject only on high-confidence negatives. The
+`remote-only` gate rejects confident non-remote postings (explicit
+hybrid/on-site signals count even when "remote" is mentioned) and passes
+unknown remote status through to review — a false rejection is an invisible
+loss, a false pass costs one review-card glance. Positive remote signal is
+instead expressed as a fourth scoring dimension (`remote`: confident remote
+= 100, unknown = 50; confident non-remote never reaches scoring), which is
+how remote roles bubble to the top of the queue. (Confirmed 2026-08-26; the
+dimension lands with Increment 3.)
+
 **`scored`** ● — survived all gates.
 
 ```json

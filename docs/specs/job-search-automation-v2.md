@@ -45,7 +45,12 @@ board's public JSON API first, with HTML fetch as the fallback
 Binary reject, not scored. A lead failing any gate is rejected and durably
 recorded via a `rejected { gate, reason }` event. Gates:
 
-- **remote-only** — reject non-remote positions.
+- **remote-only** — reject confident non-remote positions only (explicit
+  hybrid/on-site/in-office signals count as confident even when "remote"
+  is mentioned somewhere). Unknown/unclear remote status passes to review
+  and is flagged there — a false rejection is an invisible loss, a false
+  pass costs one glance at a review card. (Confirmed 2026-08-26; pairs with
+  the `remote` scoring dimension below that bubbles positive signals.)
 - **compensation floor** — reject below the configured floor.
 - **blacklist** — reject blacklisted companies (e.g., Salesforce).
 - **ideological red lines** — the _mechanism_ must exist in v0 (a filter list),
@@ -65,6 +70,9 @@ Dimensions:
   ceiling = 100. Unknown/missing comp passes the floor gate; the comp
   dimension drops out of the composite with weight renormalization, and the
   breakdown notes it.
+- **remote** — positive remote signals bubble to the top: confident remote
+  = 100, unknown = 50. (Confident non-remote never reaches scoring — the
+  gate rejects it. Added 2026-08-26.)
 
 Composite = weighted sum (`Σ(wᵢ·scoreᵢ) / Σwᵢ`), default equal weights,
 configurable. The breakdown must be human-readable (e.g.,
