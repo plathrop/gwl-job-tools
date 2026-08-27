@@ -67,7 +67,15 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
                 .map(str::to_string);
         }
         event_type::REJECTED | event_type::SCORED => {
-            state.eval_revision += 1;
+            // revision counts *evaluations*, not events: one evaluation can
+            // emit several `rejected` events (one per failed gate), all
+            // stamped with the same revision.
+            let revision = event
+                .payload
+                .get("revision")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            state.eval_revision = state.eval_revision.max(revision);
         }
         _ => {}
     }
@@ -294,6 +302,89 @@ mod tests {
             "drop-in",
             Some("https://example.com/j".into()),
             "body2".into(),
+            extracted("Engineer"),
+            vec![failure],
+        )
+        .unwrap();
+        assert_eq!(events[1].payload["revision"], 2);
+    }
+
+    #[test]
+    fn multi_failure_evaluation_stays_one_revision() {
+        // Regression: one evaluation failing two gates emits two `rejected`
+        // events at the SAME revision, and the next evaluation is revision
+        // 2 — counting events instead of reading the payload revision would
+        // over-count.
+        let failures = vec![
+            GateFailure {
+                gate: crate::domain::gates::Gate::RemoteOnly,
+                reason: "on-site".into(),
+            },
+            GateFailure {
+                gate: crate::domain::gates::Gate::Blacklist,
+                reason: "blacklisted".into(),
+            },
+        ];
+        let (_, events) = decide_ingest(
+            &LeadState::default(),
+            &identity(),
+            "drop-in",
+            Some("https://example.com/j".into()),
+            "body".into(),
+            extracted("Engineer"),
+            failures,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1].payload["revision"], 1);
+        assert_eq!(events[2].payload["revision"], 1);
+
+        // Replay both rejections through evolve, then re-evaluate.
+        let mut state = LeadState::default();
+        for event_type_and_revision in [("ingested", 0), ("rejected", 1), ("rejected", 1)] {
+            let (t, revision) = event_type_and_revision;
+            let payload = if t == "ingested" {
+                serde_json::json!({
+                    "dedupe_key": "url:https://example.com/j",
+                    "identifiers": {"url": "url:https://example.com/j"},
+                    "source": "drop-in",
+                    "raw_text": "body",
+                    "extracted": {"title": "Engineer", "company": "Acme"}
+                })
+            } else {
+                serde_json::json!({"gate": "remote-only", "reason": "x", "revision": revision})
+            };
+            state.seq += 1;
+            let seq = state.seq;
+            evolve(
+                &mut state,
+                &EventEnvelope {
+                    envelope_version: 1,
+                    id: Uuid::now_v7(),
+                    stream: "lead/x".into(),
+                    seq,
+                    event_type: t.into(),
+                    schema_version: 1,
+                    occurred_at: jiff::Timestamp::now(),
+                    recorded_at: jiff::Timestamp::now(),
+                    causation_id: None,
+                    correlation_id: Uuid::now_v7(),
+                    payload,
+                },
+            );
+        }
+        assert_eq!(state.eval_revision, 1);
+
+        let failure = GateFailure {
+            gate: crate::domain::gates::Gate::RemoteOnly,
+            reason: "still on-site".into(),
+        };
+        let (_, events) = decide_ingest(
+            &state,
+            &identity(),
+            "drop-in",
+            Some("https://example.com/j".into()),
+            "body".into(),
             extracted("Engineer"),
             vec![failure],
         )

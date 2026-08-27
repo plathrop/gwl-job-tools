@@ -37,6 +37,9 @@ pub struct ScoringWeights {
     pub level: f64,
     pub skills: f64,
     pub compensation: f64,
+    /// Fourth dimension (confirmed 2026-08-26): confident remote = 100,
+    /// unknown = 50. Lands with Increment 3.
+    pub remote: f64,
 }
 
 impl Default for ScoringWeights {
@@ -46,6 +49,7 @@ impl Default for ScoringWeights {
             level: 1.0,
             skills: 1.0,
             compensation: 1.0,
+            remote: 1.0,
         }
     }
 }
@@ -144,6 +148,7 @@ mod tests {
         assert_eq!(config.scoring_weights.level, 1.0);
         assert_eq!(config.scoring_weights.skills, 1.0);
         assert_eq!(config.scoring_weights.compensation, 1.0);
+        assert_eq!(config.scoring_weights.remote, 1.0);
     }
 
     #[test]

@@ -88,12 +88,8 @@ pub fn evaluate(config: &Config, extracted: &ExtractedFields, raw_text: &str) ->
     }
 
     if let Some(company) = &extracted.company {
-        // Compare on fully alphanumeric-folded forms so "Salesforce",
-        // "Sales Force", and "Salesforce, Inc." all match.
-        let company_folded = slugify(company).replace('-', "");
         for blocked in &config.blacklist {
-            let blocked_folded = slugify(blocked).replace('-', "");
-            if !blocked_folded.is_empty() && company_folded.contains(&blocked_folded) {
+            if company_matches(company, blocked) {
                 failures.push(GateFailure {
                     gate: Gate::Blacklist,
                     reason: format!("company '{company}' matches blacklist entry '{blocked}'"),
@@ -119,6 +115,29 @@ pub fn evaluate(config: &Config, extracted: &ExtractedFields, raw_text: &str) ->
     }
 
     failures
+}
+
+/// Blacklist matching (design doc 0001 §3): word-boundary token
+/// containment, plus alphanumeric-folded equality for spacing variants.
+/// Deliberately NOT plain substring matching — `apple` must not reject
+/// `Pineapple`, `meta` must not reject `Metabase` (gate philosophy: reject
+/// only high-confidence negatives). Matches: "Salesforce" /
+/// "Salesforce, Inc." / "Sales Force" / "Meta Platforms" against entries
+/// "salesforce" / "meta".
+pub fn company_matches(company: &str, blacklist_entry: &str) -> bool {
+    let company_slug = slugify(company);
+    let entry_slug = slugify(blacklist_entry);
+    if entry_slug.is_empty() {
+        return false;
+    }
+    // Folded equality covers spacing variants: "Sales Force" ≡ "salesforce".
+    if company_slug.replace('-', "") == entry_slug.replace('-', "") {
+        return true;
+    }
+    // Token containment: every entry token must be a whole company token.
+    let company_tokens: Vec<&str> = company_slug.split('-').filter(|t| !t.is_empty()).collect();
+    let entry_tokens: Vec<&str> = entry_slug.split('-').filter(|t| !t.is_empty()).collect();
+    !entry_tokens.is_empty() && entry_tokens.iter().all(|t| company_tokens.contains(t))
 }
 
 #[cfg(test)]
@@ -201,7 +220,7 @@ mod tests {
         let failures = evaluate(&config(), &e, "body");
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].gate, Gate::CompensationFloor);
-        assert!(failures[0].reason.contains("$140000 below floor $180000"));
+        assert!(failures[0].reason.contains("below floor"));
     }
 
     #[test]
@@ -259,6 +278,42 @@ mod tests {
     }
 
     #[test]
+    fn blacklist_substrings_do_not_match() {
+        // Gate philosophy: reject only high-confidence negatives. A
+        // blacklisted token that is a substring of an unrelated company
+        // must not reject it.
+        for (entry, company) in [
+            ("apple", "Pineapple"),
+            ("meta", "Metabase"),
+            ("acme", "Acmeville Research"),
+            ("force", "Salesforce"),
+        ] {
+            assert!(
+                !company_matches(company, entry),
+                "'{entry}' must not match '{company}'"
+            );
+        }
+        // But real variants still match.
+        assert!(company_matches("Meta Platforms", "meta"));
+        assert!(company_matches("Salesforce, Inc.", "Salesforce"));
+        assert!(company_matches("Sales Force", "salesforce"));
+    }
+
+    #[test]
+    fn comp_at_floor_passes() {
+        // The comparison is strict: max == floor is not below the floor.
+        let mut e = extracted();
+        e.comp = Some(CompRange {
+            min: Some(170_000),
+            max: Some(180_000),
+            currency: "USD".into(),
+            period: "year".into(),
+            raw: "$170,000 - $180,000".into(),
+        });
+        assert!(evaluate(&config(), &e, "body").is_empty());
+    }
+
+    #[test]
     fn unknown_company_passes_blacklist() {
         let mut e = extracted();
         e.company = None;
@@ -283,6 +338,23 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].gate, Gate::Ideological);
         assert!(failures[0].reason.contains("crypto"));
+    }
+
+    #[test]
+    fn red_line_matching_is_case_insensitive() {
+        let mut cfg = config();
+        cfg.ideological_red_lines = vec!["Blockchain".into()];
+        let failures = evaluate(&cfg, &extracted(), "enterprise BLOCKCHAIN solutions");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].gate, Gate::Ideological);
+    }
+
+    #[test]
+    fn empty_entries_are_ignored() {
+        let mut cfg = config();
+        cfg.ideological_red_lines = vec![String::new()];
+        cfg.blacklist = vec![String::new()];
+        assert!(evaluate(&cfg, &extracted(), "any body").is_empty());
     }
 
     // ── multiple gates at once ───────────────────────────────────

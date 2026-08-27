@@ -57,15 +57,23 @@ fn detect_remote(location: Option<&str>, text: &str) -> Option<bool> {
     // Explicit work-arrangement negatives (confirmed design, 2026-08-26):
     // "hybrid", "on-site in X", "in-office", "must be located/based in"
     // are confident on-site signals and fail the gate even when the word
-    // "remote" appears somewhere (e.g. "not remote" variants aside,
-    // "hybrid with remote Fridays" is still hybrid).
+    // "remote" appears somewhere. Negated forms are masked first, so a
+    // remote posting saying "not hybrid" or "no on-site requirement" is
+    // NOT a confident negative (that would be an invisible false
+    // rejection — the failure mode the gate policy exists to avoid).
     let negative_re = Regex::new(
         r"(?i)\bhybrid\b|\bon[- ]site\b|\bin[- ]office\b|\bmust be (located|based) in\b",
     )
     .unwrap();
+    let masked_negative_re = Regex::new(
+        r"(?i)\b(not|no|never|without|instead of|rather than)\s+(?:a\s+|an\s+|any\s+)?(hybrid|on[- ]site|in[- ]office)\b\w*(\s+(requirement|policy|option))?",
+    )
+    .unwrap();
     let head: String = text.chars().take(4000).collect();
+    let head_masked = masked_negative_re.replace_all(&head, "");
     let location_text = location.unwrap_or_default();
-    if negative_re.is_match(location_text) || negative_re.is_match(&head) {
+    let location_masked = masked_negative_re.replace_all(location_text, "");
+    if negative_re.is_match(&location_masked) || negative_re.is_match(&head_masked) {
         return Some(false);
     }
     let body_says_remote = remote_re.is_match(&negated_re.replace_all(&head, ""));
@@ -200,6 +208,25 @@ pub fn extract_req_id(text: &str) -> Option<String> {
         .filter(|candidate| candidate.chars().any(|c| c.is_ascii_digit()))
 }
 
+/// Conservative company fallback for the HTML/file drop-in paths, derived
+/// from the page title: "Staff Engineer — Acme", "Engineer – Acme",
+/// "Engineer at Acme". Only fires when no other source produced a company;
+/// feeds the blacklist gate ("never match blacklisted companies" must hold
+/// on every ingest path) and display. A wrong company is worse than none,
+/// so only the last title segment after a strong separator is used.
+pub fn company_from_title(title: &str) -> Option<String> {
+    for sep in [" — ", " – ", " at "] {
+        if let Some(pos) = title.rfind(sep) {
+            let candidate = title[pos + sep.len()..].trim();
+            let candidate = candidate.split([',', '.', '|']).next().unwrap_or("").trim();
+            if candidate.len() >= 2 && candidate.chars().any(|c| c.is_alphabetic()) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Prettify a board slug into a display name: `berkshire-energy` →
 /// `Berkshire Energy`. APIs generally don't return the company display
 /// name; the slug is what the URL gives us.
@@ -317,6 +344,23 @@ mod tests {
     // ── remote detection ─────────────────────────────────────────
 
     #[test]
+    fn negated_onsite_signals_are_not_confident_negatives() {
+        // "not hybrid, fully remote" must NOT classify as Some(false) —
+        // that's the invisible false rejection the gate policy avoids.
+        assert_eq!(detect_remote(None, "not hybrid, fully remote"), Some(true));
+        assert_eq!(
+            detect_remote(None, "no on-site requirement; work from anywhere"),
+            None
+        );
+        assert_eq!(
+            detect_remote(Some("Remote"), "not a hybrid role"),
+            Some(true)
+        );
+        // Positive cases still classify.
+        assert_eq!(detect_remote(None, "hybrid role"), Some(false));
+    }
+
+    #[test]
     fn remote_from_location() {
         assert_eq!(detect_remote(Some("Remote, US"), ""), Some(true));
         assert_eq!(detect_remote(Some("San Francisco, CA"), ""), Some(false));
@@ -373,6 +417,20 @@ mod tests {
             detect_remote(None, "must be located in the Bay Area"),
             Some(false)
         );
+    }
+
+    #[test]
+    fn company_from_title_patterns() {
+        assert_eq!(
+            company_from_title("Staff Engineer — Acme"),
+            Some("Acme".into())
+        );
+        assert_eq!(
+            company_from_title("Engineer at Acme, Remote"),
+            Some("Acme".into())
+        );
+        assert_eq!(company_from_title("Staff Engineer"), None);
+        assert_eq!(company_from_title(""), None);
     }
 
     // ── prettify_slug ────────────────────────────────────────────

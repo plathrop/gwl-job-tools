@@ -389,6 +389,72 @@ mod tests {
         assert!(record.latest_rejection.is_none());
     }
 
+    #[test]
+    fn reingest_failing_different_gate_updates_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let config = Config {
+            remote_only: true,
+            compensation_floor: Some(180_000),
+            ..Default::default()
+        };
+        let mut onsite = outcome("body");
+        onsite.url = Some("https://example.com/job/1".into());
+        onsite.extracted.remote = Some(false);
+        let first = record_ingest(&mut store, &projection, &config, onsite).unwrap();
+        assert_eq!(first.rejected.unwrap()[0].gate.as_str(), "remote-only");
+
+        // Repost: now remote, but comp below floor — the rejection should
+        // move to the new gate, not just clear.
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let mut repost = outcome("body v2");
+        repost.url = Some("https://example.com/job/1".into());
+        repost.extracted.remote = Some(true);
+        repost.extracted.comp = Some(crate::domain::events::CompRange {
+            min: Some(120_000),
+            max: Some(140_000),
+            currency: "USD".into(),
+            period: "year".into(),
+            raw: "$120,000 - $140,000".into(),
+        });
+        let second = record_ingest(&mut store, &projection, &config, repost).unwrap();
+        assert_eq!(
+            second.rejected.unwrap()[0].gate.as_str(),
+            "compensation-floor"
+        );
+
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let record = projection.leads.get(&first.lead_id).unwrap();
+        let rejection = record.latest_rejection.as_ref().unwrap();
+        assert_eq!(rejection.gate, "compensation-floor");
+        assert_eq!(rejection.revision, 2);
+    }
+
+    #[test]
+    fn blacklisted_company_rejected_via_file_drop() {
+        // Pipeline-level: the blacklist gate must hold on file drops too,
+        // via the title-derived company fallback ("never match blacklisted
+        // companies" is non-negotiable on every ingest path).
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let config = Config {
+            blacklist: vec!["salesforce".into()],
+            ..Default::default()
+        };
+        let html = "<html><head><title>Staff Engineer — Salesforce</title></head><body>
+                    <article><h1>Staff Engineer</h1>
+                    <p>Join our platform team to build delightful CRM tooling with
+                    a large team of experienced engineers across the organization
+                    every single day of the week.</p>
+                    </article></body></html>";
+        let outcome = crate::ingest::ingest_file(std::path::Path::new("jd.html"), html).unwrap();
+        assert_eq!(outcome.extracted.company.as_deref(), Some("Salesforce"));
+
+        let summary = record_ingest(&mut store, &projection, &config, outcome).unwrap();
+        let rejections = summary.rejected.unwrap();
+        assert_eq!(rejections[0].gate.as_str(), "blacklist");
+    }
+
     // ── golden round-trip (design doc §10) ───────────────────────
 
     /// Write → replay → projection equality, through the real store.
