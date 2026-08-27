@@ -25,6 +25,10 @@ pub struct Config {
     pub scoring_weights: ScoringWeights,
     pub cover_letter_path: Option<PathBuf>,
     pub target_companies: Vec<String>,
+    /// Ideological red lines (spec §2): the MECHANISM ships in v0 as this
+    /// filter list over posting text; the CONTENT is deferred to the later
+    /// LLM scorer (ship empty).
+    pub ideological_red_lines: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

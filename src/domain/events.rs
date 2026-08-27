@@ -184,6 +184,15 @@ pub struct UpdatedPayload {
     pub snapshot: SnapshotFields,
 }
 
+/// A hard gate failed (design doc 0001 §3). One event per failed gate.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct RejectedPayload {
+    pub gate: String,
+    pub reason: String,
+    /// Counts gate/score evaluations of this lead (re-ingests re-evaluate).
+    pub revision: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReingestSuppressedPayload {
     pub dedupe_key: String,

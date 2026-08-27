@@ -12,6 +12,7 @@ use crate::{
     config::{AppPaths, Config},
     domain::{
         events::ExtractedFields,
+        gates::{self, GateFailure},
         identity::{self, compute_identity},
         lead::{self, IngestKind, LeadState},
     },
@@ -25,7 +26,7 @@ const EVENT_LOG_NAME: &str = "events.jsonl";
 #[instrument(skip_all)]
 pub async fn execute_ingest(args: IngestArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let _config = Config::load(&paths)?;
+    let config = Config::load(&paths)?;
 
     // Fetch/extract *before* acquiring the single-writer lock: network waits
     // must not hold the lock (durability contract, design doc 0001 §1).
@@ -48,7 +49,7 @@ pub async fn execute_ingest(args: IngestArgs) -> Result<()> {
     let events = store.replay()?;
     let projection = projections::rebuild(&events)?;
 
-    let summary = record_ingest(&mut store, &projection, outcome)?;
+    let summary = record_ingest(&mut store, &projection, &config, outcome)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&summary).into_diagnostic()?
@@ -57,11 +58,12 @@ pub async fn execute_ingest(args: IngestArgs) -> Result<()> {
 }
 
 /// The testable core of ingest: given an extraction outcome, match identity
-/// against the projection, decide events, and append them. No network, no
-/// filesystem beyond the store itself.
+/// against the projection, decide events (including gate evaluation), and
+/// append them. No network, no filesystem beyond the store itself.
 pub fn record_ingest(
     store: &mut impl EventStore,
     projection: &Projection,
+    config: &Config,
     outcome: IngestOutcome,
 ) -> Result<IngestSummary> {
     // Store the canonical URL (tracking params stripped) so re-ingests via
@@ -93,6 +95,15 @@ pub fn record_ingest(
         None => (Uuid::now_v7(), LeadState::default()),
     };
 
+    // Gates evaluate the new snapshot; failures become `rejected` events in
+    // the same batch as the snapshot event (suppressed re-ingests skip
+    // gating entirely, per the durable-ignore rule).
+    let gate_failures = if state.latest_mark.as_deref() == Some("ignore") {
+        Vec::new()
+    } else {
+        gates::evaluate(config, &outcome.extracted, &outcome.raw_text)
+    };
+
     let (kind, pending) = lead::decide_ingest(
         &state,
         &identity,
@@ -100,6 +111,7 @@ pub fn record_ingest(
         canonical_url.clone(),
         outcome.raw_text,
         outcome.extracted.clone(),
+        gate_failures.clone(),
     )?;
 
     let stream = LeadState::stream_id(lead_id);
@@ -122,6 +134,11 @@ pub fn record_ingest(
             IngestKind::Updated { changed } => Some(changed.clone()),
             _ => None,
         },
+        rejected: if gate_failures.is_empty() {
+            None
+        } else {
+            Some(gate_failures)
+        },
         dedupe_key: identity.dedupe_key,
         source: outcome.source,
         url: canonical_url,
@@ -135,6 +152,7 @@ pub struct IngestSummary {
     pub lead_id: Uuid,
     pub kind: &'static str,
     pub changed: Option<Vec<String>>,
+    pub rejected: Option<Vec<GateFailure>>,
     pub dedupe_key: String,
     pub source: String,
     pub url: Option<String>,
@@ -206,6 +224,7 @@ mod tests {
         let first = record_ingest(
             &mut store,
             &projection,
+            &Config::default(),
             outcome("totally unstructured body"),
         )
         .unwrap();
@@ -216,6 +235,7 @@ mod tests {
         let second = record_ingest(
             &mut store,
             &projection,
+            &Config::default(),
             outcome("totally unstructured body"),
         )
         .unwrap();
@@ -230,12 +250,12 @@ mod tests {
         let (mut store, projection) = store_and_projection(&dir);
         let mut with_url = outcome("body");
         with_url.url = Some("https://example.com/job/1".into());
-        let first = record_ingest(&mut store, &projection, with_url).unwrap();
+        let first = record_ingest(&mut store, &projection, &Config::default(), with_url).unwrap();
 
         let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let mut tagged = outcome("body");
         tagged.url = Some("https://example.com/job/1?utm_source=newsletter".into());
-        let second = record_ingest(&mut store, &projection, tagged).unwrap();
+        let second = record_ingest(&mut store, &projection, &Config::default(), tagged).unwrap();
 
         assert_eq!(second.kind, "updated");
         assert_eq!(second.changed, Some(vec![]));
@@ -250,12 +270,13 @@ mod tests {
         let (mut store, projection) = store_and_projection(&dir);
         let mut first_outcome = outcome("body v1");
         first_outcome.url = Some("https://example.com/job/1".into());
-        record_ingest(&mut store, &projection, first_outcome).unwrap();
+        record_ingest(&mut store, &projection, &Config::default(), first_outcome).unwrap();
 
         let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let mut second_outcome = outcome("body v2");
         second_outcome.url = Some("https://example.com/job/1".into());
-        let second = record_ingest(&mut store, &projection, second_outcome).unwrap();
+        let second =
+            record_ingest(&mut store, &projection, &Config::default(), second_outcome).unwrap();
 
         assert_eq!(second.changed, Some(vec!["raw_text".to_string()]));
     }
@@ -268,7 +289,7 @@ mod tests {
         for _ in 0..count {
             let mut outcome = outcome("body");
             outcome.url = Some(format!("https://example.com/{}", Uuid::now_v7()));
-            record_ingest(&mut store, &projection, outcome).unwrap();
+            record_ingest(&mut store, &projection, &Config::default(), outcome).unwrap();
             projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         }
         projection
@@ -298,6 +319,76 @@ mod tests {
         assert!(select_lead(&projection, "").is_err());
     }
 
+    // ── gate wiring (Increment 2) ────────────────────────────────
+
+    #[test]
+    fn gate_failure_appends_rejected_in_same_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let config = Config {
+            remote_only: true,
+            ..Default::default()
+        };
+        let mut outcome = outcome("body");
+        outcome.extracted.remote = Some(false);
+        outcome.extracted.location = Some("San Francisco, CA".into());
+        outcome.extracted.company = Some("Acme".into());
+        outcome.extracted.title = Some("Engineer".into());
+
+        let summary = record_ingest(&mut store, &projection, &config, outcome).unwrap();
+
+        assert_eq!(summary.kind, "ingested");
+        let rejections = summary.rejected.unwrap();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].gate.as_str(), "remote-only");
+
+        // ingested + rejected share one batch: consecutive seqs, one
+        // correlation id, rejection caused by the ingested event.
+        let events = store.replay().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "ingested");
+        assert_eq!(events[1].event_type, "rejected");
+        assert_eq!(events[1].seq, 2);
+        assert_eq!(events[1].correlation_id, events[0].correlation_id);
+        assert_eq!(events[1].causation_id, Some(events[0].id));
+        assert_eq!(events[1].payload["revision"], 1);
+
+        // The projection records the rejection.
+        let projection = projections::rebuild(&events).unwrap();
+        let record = projection.leads.get(&summary.lead_id).unwrap();
+        let rejection = record.latest_rejection.as_ref().unwrap();
+        assert_eq!(rejection.gate, "remote-only");
+    }
+
+    #[test]
+    fn reingest_after_fix_passing_gates_clears_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let config = Config {
+            remote_only: true,
+            ..Default::default()
+        };
+        let mut onsite = outcome("body");
+        onsite.url = Some("https://example.com/job/1".into());
+        onsite.extracted.remote = Some(false);
+        let first = record_ingest(&mut store, &projection, &config, onsite).unwrap();
+        assert!(first.rejected.is_some());
+
+        // Repost: same job, now marked remote.
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let mut repost = outcome("body");
+        repost.url = Some("https://example.com/job/1".into());
+        repost.extracted.remote = Some(true);
+        let second = record_ingest(&mut store, &projection, &config, repost).unwrap();
+        assert_eq!(second.kind, "updated");
+        assert!(second.rejected.is_none());
+
+        let events = store.replay().unwrap();
+        let projection = projections::rebuild(&events).unwrap();
+        let record = projection.leads.get(&first.lead_id).unwrap();
+        assert!(record.latest_rejection.is_none());
+    }
+
     // ── golden round-trip (design doc §10) ───────────────────────
 
     /// Write → replay → projection equality, through the real store.
@@ -311,7 +402,7 @@ mod tests {
         outcome.extracted.title = Some("Staff Engineer".into());
         outcome.extracted.company = Some("Acme".into());
         outcome.extracted.req_id = Some("R-9".into());
-        let summary = record_ingest(&mut store, &projection, outcome).unwrap();
+        let summary = record_ingest(&mut store, &projection, &Config::default(), outcome).unwrap();
 
         let replayed = store.replay().unwrap();
         assert_eq!(replayed.len(), 1);

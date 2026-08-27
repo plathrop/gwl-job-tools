@@ -27,9 +27,20 @@ pub struct LeadRecord {
     pub url: Option<String>,
     pub extracted: ExtractedFields,
     pub latest_mark: Option<String>,
+    /// The most recent gate failure, if the last gate evaluation rejected
+    /// the lead. Cleared by any subsequent `ingested`/`updated` that passed
+    /// gates (a `rejected` follows those in the same batch when it fails).
+    pub latest_rejection: Option<GateRejection>,
     pub event_count: u64,
     pub first_seen: Timestamp,
     pub last_event: Timestamp,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct GateRejection {
+    pub gate: String,
+    pub reason: String,
+    pub revision: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -130,6 +141,7 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                         url: None,
                         extracted: ExtractedFields::default(),
                         latest_mark: None,
+                        latest_rejection: None,
                         event_count: 0,
                         first_seen: event.recorded_at,
                         last_event: event.recorded_at,
@@ -142,6 +154,7 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                 // lead) removes it here too.
                 record.url = view.url;
                 record.extracted = view.extracted;
+                record.latest_rejection = None;
                 record.event_count += 1;
                 record.last_event = event.recorded_at;
             }
@@ -152,6 +165,31 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                         .get("mark")
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    record.event_count += 1;
+                    record.last_event = event.recorded_at;
+                }
+            }
+            event_type::REJECTED => {
+                if let Some(record) = projection.leads.get_mut(&lead_id) {
+                    record.latest_rejection = Some(GateRejection {
+                        gate: event
+                            .payload
+                            .get("gate")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        reason: event
+                            .payload
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        revision: event
+                            .payload
+                            .get("revision")
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
+                    });
                     record.event_count += 1;
                     record.last_event = event.recorded_at;
                 }

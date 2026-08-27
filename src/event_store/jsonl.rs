@@ -177,6 +177,12 @@ impl EventStore for JsonlEventStore {
         let mut batch = String::new();
         let mut envelopes = Vec::with_capacity(events.len());
         for (i, pending) in events.iter().enumerate() {
+            // Causation chaining within a batch: an event without an
+            // explicit cause is caused by the event it follows (e.g. a
+            // `rejected` caused by its `ingested`).
+            let causation_id = pending
+                .causation_id
+                .or_else(|| envelopes.last().map(|e: &EventEnvelope| e.id));
             let envelope = EventEnvelope {
                 envelope_version: ENVELOPE_VERSION,
                 id: Uuid::now_v7(),
@@ -186,7 +192,7 @@ impl EventStore for JsonlEventStore {
                 schema_version: pending.schema_version,
                 occurred_at: now,
                 recorded_at: now,
-                causation_id: pending.causation_id,
+                causation_id,
                 correlation_id,
                 payload: pending.payload.clone(),
             };
