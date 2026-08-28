@@ -160,3 +160,5 @@
 {"type":"update","issueId":"GWLJ-1qb2wc","timestamp":"2026-08-28T21:27:15.525Z","data":{"blockedBy":["GWLJ-1lxx3e"]},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-e0ysa7","timestamp":"2026-08-28T21:27:18.700Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-mmeajy","timestamp":"2026-08-28T21:27:18.732Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-e0ysa7","timestamp":"2026-08-28T21:36:00.941Z","data":{"text":"PR #9: extract_years now prefers experience-adjacent mentions (max), falls back to first. +5 tests.","timestamp":"2026-08-28T21:36:00.941Z"},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-mmeajy","timestamp":"2026-08-28T21:36:01.723Z","data":{"text":"PR #9: --source lead source added; source→adapter rename done without upcaster (pre-release). Removed dead ApiExtraction.source.","timestamp":"2026-08-28T21:36:01.723Z"},"source":"gwl-job-tools"}
