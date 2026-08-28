@@ -62,14 +62,28 @@ pub struct GateFailure {
 pub fn evaluate(config: &Config, extracted: &ExtractedFields, raw_text: &str) -> Vec<GateFailure> {
     let mut failures = Vec::new();
 
-    if config.remote_only && extracted.remote == Some(false) {
-        failures.push(GateFailure {
-            gate: Gate::RemoteOnly,
-            reason: format!(
-                "confident non-remote signals (location: {})",
-                extracted.location.as_deref().unwrap_or("none")
-            ),
-        });
+    if config.remote_only {
+        match extracted.remote {
+            Some(false) => failures.push(GateFailure {
+                gate: Gate::RemoteOnly,
+                reason: format!(
+                    "confident non-remote signals (location: {})",
+                    extracted.location.as_deref().unwrap_or("none")
+                ),
+            }),
+            // Location listed but silent on arrangement: unknown by
+            // default, rejected only when the operator opts in.
+            None if config.reject_location_only && extracted.location.is_some() => {
+                failures.push(GateFailure {
+                    gate: Gate::RemoteOnly,
+                    reason: format!(
+                        "location '{}' listed with no remote signal (reject_location_only)",
+                        extracted.location.as_deref().unwrap_or_default()
+                    ),
+                });
+            }
+            _ => {}
+        }
     }
 
     if let (Some(floor), Some(comp)) = (config.compensation_floor, &extracted.comp) {
@@ -200,6 +214,32 @@ mod tests {
         let mut e = extracted();
         e.remote = None;
         assert!(evaluate(&config(), &e, "body").is_empty());
+    }
+
+    #[test]
+    fn location_only_passes_by_default_rejects_with_toggle() {
+        let mut e = extracted();
+        e.remote = None;
+        e.location = Some("San Francisco, CA".into());
+        // Default: permissive (start permissive, revisit if too many false
+        // leads).
+        assert!(evaluate(&config(), &e, "body").is_empty());
+        // Opt-in strictness.
+        let mut strict = config();
+        strict.reject_location_only = true;
+        let failures = evaluate(&strict, &e, "body");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].gate, Gate::RemoteOnly);
+        assert!(failures[0].reason.contains("reject_location_only"));
+        // The toggle never rejects when there IS a remote signal or no
+        // location at all.
+        let mut remote = extracted();
+        remote.remote = Some(true);
+        assert!(evaluate(&strict, &remote, "body").is_empty());
+        let mut no_loc = extracted();
+        no_loc.remote = None;
+        no_loc.location = None;
+        assert!(evaluate(&strict, &no_loc, "body").is_empty());
     }
 
     #[test]

@@ -80,7 +80,11 @@ fn detect_remote(location: Option<&str>, text: &str) -> Option<bool> {
     match location {
         Some(loc) if loc.to_lowercase().contains("remote") => Some(true),
         Some(_) if body_says_remote => Some(true),
-        Some(_) => Some(false),
+        // Location present but silent on arrangement: honestly unknown, not
+        // a confident negative. The remote-only gate treats this case as
+        // reject-or-pass by config toggle (`reject_location_only`, default
+        // false — start permissive).
+        Some(_) => None,
         None if body_says_remote => Some(true),
         None => None,
     }
@@ -363,7 +367,7 @@ mod tests {
     #[test]
     fn remote_from_location() {
         assert_eq!(detect_remote(Some("Remote, US"), ""), Some(true));
-        assert_eq!(detect_remote(Some("San Francisco, CA"), ""), Some(false));
+        assert_eq!(detect_remote(Some("San Francisco, CA"), ""), None);
         // A physical location plus a body that says remote is still remote.
         assert_eq!(
             detect_remote(Some("San Francisco, CA"), "This role is remote-friendly."),
@@ -384,13 +388,13 @@ mod tests {
     fn remote_negations_are_not_evidence() {
         assert_eq!(
             detect_remote(Some("NYC"), "this role is not remote"),
-            Some(false)
+            None
         );
         assert_eq!(detect_remote(None, "this role is not remote"), None);
         assert_eq!(detect_remote(None, "non-remote position"), None);
         assert_eq!(
             detect_remote(Some("Denver"), "remote is not an option here"),
-            Some(false)
+            None
         );
         assert_eq!(detect_remote(None, "fully remote team"), Some(true));
     }

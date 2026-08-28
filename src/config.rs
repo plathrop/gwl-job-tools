@@ -20,6 +20,11 @@ pub struct Config {
     pub compensation_floor: Option<u64>,
     pub compensation_ceiling: Option<u64>,
     pub remote_only: bool,
+    /// When true, a posting that lists a physical location but says nothing
+    /// about work arrangement is treated as non-remote by the remote-only
+    /// gate. Default false (start permissive: pass to review and revisit if
+    /// it produces too many false leads).
+    pub reject_location_only: bool,
     pub blacklist: Vec<String>,
     pub aliases: HashMap<String, String>,
     pub scoring_weights: ScoringWeights,
