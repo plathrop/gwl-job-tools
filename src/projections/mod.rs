@@ -12,7 +12,7 @@ use serde_with::skip_serializing_none;
 use uuid::Uuid;
 
 use crate::domain::{
-    events::{EventEnvelope, ExtractedFields, Identifiers, event_type},
+    events::{EventEnvelope, ExtractedFields, Identifiers, ScoredPayload, event_type},
     identity::LeadIdentity,
     lead::stream_lead_id,
 };
@@ -31,6 +31,8 @@ pub struct LeadRecord {
     /// the lead. Cleared by any subsequent `ingested`/`updated` that passed
     /// gates (a `rejected` follows those in the same batch when it fails).
     pub latest_rejection: Option<GateRejection>,
+    /// The latest `scored` payload, if the lead has ever passed gates.
+    pub latest_score: Option<ScoredPayload>,
     pub event_count: u64,
     pub first_seen: Timestamp,
     pub last_event: Timestamp,
@@ -142,6 +144,7 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                         extracted: ExtractedFields::default(),
                         latest_mark: None,
                         latest_rejection: None,
+                        latest_score: None,
                         event_count: 0,
                         first_seen: event.recorded_at,
                         last_event: event.recorded_at,
@@ -206,6 +209,23 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                     index_identifiers(&mut projection, lead_id, &view.identifiers);
                 }
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
+                    record.event_count += 1;
+                    record.last_event = event.recorded_at;
+                }
+            }
+            event_type::SCORED => {
+                // Strict, like the ingest payloads: a mistyped score is
+                // source-of-truth corruption, not a None.
+                let payload: ScoredPayload = serde_json::from_value(event.payload.clone())
+                    .into_diagnostic()
+                    .map_err(|e| {
+                        e.wrap_err(format!(
+                            "decoding scored payload of event {} (seq {})",
+                            event.id, event.seq
+                        ))
+                    })?;
+                if let Some(record) = projection.leads.get_mut(&lead_id) {
+                    record.latest_score = Some(payload);
                     record.event_count += 1;
                     record.last_event = event.recorded_at;
                 }

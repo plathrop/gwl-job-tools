@@ -12,10 +12,11 @@ use uuid::Uuid;
 use crate::domain::{
     events::{
         EventEnvelope, ExtractedFields, IngestedPayload, PendingEvent, ReingestSuppressedPayload,
-        RejectedPayload, SnapshotFields, UpdatedPayload, event_type,
+        RejectedPayload, ScoredPayload, SnapshotFields, UpdatedPayload, event_type,
     },
     gates::GateFailure,
     identity::LeadIdentity,
+    scoring::ScoreResult,
 };
 
 /// Parse the lead id out of a `lead/<uuid>` stream name. Lives here (not on
@@ -38,6 +39,8 @@ pub struct LeadState {
     pub raw_text: Option<String>,
     /// Count of gate/score evaluations (rejected + scored events).
     pub eval_revision: u64,
+    /// The latest `scored` payload, if the lead has ever passed gates.
+    pub latest_score: Option<ScoredPayload>,
 }
 
 impl LeadState {
@@ -73,6 +76,11 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
+        event_type::SCORED => {
+            if let Ok(score) = serde_json::from_value::<ScoredPayload>(event.payload.clone()) {
+                state.latest_score = Some(score);
+            }
+        }
         _ => {}
     }
 }
@@ -93,6 +101,9 @@ pub enum IngestKind {
 ///   doc §2). No re-gating, no re-scoring, no queue re-entry.
 /// - Match, otherwise → `updated` with the new snapshot and changed-field
 ///   list.
+// The argument count is the command input (identity + snapshot + evaluation)
+// plus the replayed state; bundling would obscure the decide/evolve seam.
+#[allow(clippy::too_many_arguments)]
 pub fn decide_ingest(
     state: &LeadState,
     identity: &LeadIdentity,
@@ -101,6 +112,7 @@ pub fn decide_ingest(
     raw_text: String,
     extracted: ExtractedFields,
     gate_failures: Vec<GateFailure>,
+    score: Option<ScoreResult>,
 ) -> Result<(IngestKind, Vec<PendingEvent>)> {
     if !state.exists {
         let payload = IngestedPayload {
@@ -115,6 +127,9 @@ pub fn decide_ingest(
         };
         let mut events = vec![PendingEvent::new(event_type::INGESTED, None, &payload)?];
         events.extend(rejection_events(state, gate_failures)?);
+        if let Some(score) = score {
+            events.push(scored_event(state, score)?);
+        }
         return Ok((IngestKind::New, events));
     }
 
@@ -153,7 +168,26 @@ pub fn decide_ingest(
     };
     let mut events = vec![PendingEvent::new(event_type::UPDATED, None, &payload)?];
     events.extend(rejection_events(state, gate_failures)?);
+    if let Some(score) = score {
+        events.push(scored_event(state, score)?);
+    }
     Ok((IngestKind::Updated { changed }, events))
+}
+
+/// The `scored` event for a gate-passing evaluation, sharing the evaluation's
+/// revision. `scored` is the pass-marker (decision 0006): a lead whose latest
+/// evaluation passed gates carries a `scored` event.
+fn scored_event(state: &LeadState, score: ScoreResult) -> Result<PendingEvent> {
+    PendingEvent::new(
+        event_type::SCORED,
+        None,
+        &ScoredPayload {
+            composite: score.composite,
+            revision: state.eval_revision + 1,
+            dimensions: score.dimensions,
+            breakdown: score.breakdown,
+        },
+    )
 }
 
 /// One `rejected` event per failed gate, sharing the evaluation's revision
@@ -216,6 +250,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(kind, IngestKind::New);
@@ -243,6 +278,7 @@ mod tests {
             "body".into(),
             extracted("Senior Engineer"),
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -269,6 +305,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![failure],
+            None,
         )
         .unwrap();
         assert_eq!(kind, IngestKind::New);
@@ -300,6 +337,7 @@ mod tests {
             "body2".into(),
             extracted("Engineer"),
             vec![failure],
+            None,
         )
         .unwrap();
         assert_eq!(events[1].payload["revision"], 2);
@@ -329,6 +367,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             failures,
+            None,
         )
         .unwrap();
         assert_eq!(events.len(), 3);
@@ -383,6 +422,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![failure],
+            None,
         )
         .unwrap();
         assert_eq!(events[1].payload["revision"], 2);
@@ -403,6 +443,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(kind, IngestKind::Suppressed);
@@ -427,6 +468,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![],
+            None,
         )
         .unwrap();
         assert!(matches!(kind, IngestKind::Updated { .. }));
@@ -451,6 +493,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -569,6 +612,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(kind, IngestKind::Suppressed);

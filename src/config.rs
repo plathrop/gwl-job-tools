@@ -56,6 +56,9 @@ pub struct Config {
     pub aliases: HashMap<String, String>,
     pub scoring_weights: ScoringWeights,
     pub cover_letter_path: Option<PathBuf>,
+    /// Path to a JSON Resume file (decision 0004). `None` = the skills
+    /// dimension degrades (WARN). A set-but-broken path fails loudly.
+    pub resume_path: Option<PathBuf>,
     pub target_companies: Vec<String>,
     /// Ideological red lines (spec §2): the MECHANISM ships in v0 as this
     /// filter list over posting text; the CONTENT is deferred to the later
