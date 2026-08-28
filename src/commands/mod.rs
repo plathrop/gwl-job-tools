@@ -3,7 +3,7 @@
 use miette::{Context, IntoDiagnostic, Result, miette};
 use serde::Serialize;
 use serde_with::skip_serializing_none;
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 use url::Url;
 use uuid::Uuid;
 
@@ -123,6 +123,13 @@ pub fn record_ingest(
     } else {
         None
     };
+    if let Some(score) = &score {
+        debug!(
+            composite = score.composite,
+            breakdown = %score.breakdown,
+            "lead scored"
+        );
+    }
 
     let (kind, pending) = lead::decide_ingest(
         &state,

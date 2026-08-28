@@ -40,9 +40,15 @@ pub fn score(
     if resume_skills.is_empty() {
         dropped.push("skills");
     } else {
+        // Skills match against the title too: API-sourced postings may
+        // mention a skill only in the title, not the extracted body.
+        let skills_text = match extracted.title.as_deref() {
+            Some(title) => format!("{title}\n{raw_text}"),
+            None => raw_text.to_string(),
+        };
         dims.push((
             "skills",
-            skills_score(raw_text, resume_skills, &config.aliases),
+            skills_score(&skills_text, resume_skills, &config.aliases),
         ));
     }
 
@@ -183,12 +189,8 @@ fn extract_years(text: &str) -> Option<u64> {
 /// match"), ×10. The alias table expands shorthands (`K8s` → `Kubernetes`).
 const SKILLS_MATCH_CAP: usize = 10;
 
-fn skills_score(
-    raw_text: &str,
-    resume_skills: &[String],
-    aliases: &HashMap<String, String>,
-) -> u64 {
-    let jd = raw_text.to_lowercase();
+fn skills_score(text: &str, resume_skills: &[String], aliases: &HashMap<String, String>) -> u64 {
+    let jd = text.to_lowercase();
     let matched = resume_skills
         .iter()
         .filter(|kw| keyword_matches(kw, &jd, aliases))
@@ -223,6 +225,11 @@ fn keyword_matches(keyword: &str, jd_lower: &str, aliases: &HashMap<String, Stri
 /// `\b`, this holds at punctuation edges, so single-character and punctuated
 /// keywords (`R`, `C++`, `.NET`) match correctly without over-matching (`R`
 /// must not match `Rust`, `C++` must not match `C`).
+///
+/// Known over-match (accepted): a single-character keyword (`C`) matches a
+/// punctuation-adjacent token (`C++`), because `+` is a non-alphanumeric
+/// boundary. Accepted — the resume's single-character skills are rare, and a
+/// false positive costs one glance while a false negative is invisible.
 fn token_in(token: &str, text: &str) -> bool {
     if token.is_empty() {
         return false;
@@ -260,8 +267,10 @@ fn compensation_score(config: &Config, extracted: &ExtractedFields) -> Option<u6
 
 // ── remote ───────────────────────────────────────────────────────
 
-/// Confident remote = 100, unknown = 50, confident non-remote = 0 (defensive:
-/// the remote-only gate normally rejects it before scoring).
+/// Confident remote = 100, unknown = 50, confident non-remote = 0. The
+/// remote-only gate rejects non-remote only when `remote_only` is enabled
+/// (default false); with a stock config, non-remote leads reach scoring and
+/// are downranked (0) rather than rejected.
 fn remote_score(extracted: &ExtractedFields) -> u64 {
     match extracted.remote {
         Some(true) => 100,
@@ -465,6 +474,18 @@ mod tests {
     }
 
     #[test]
+    fn single_char_keyword_over_matches_punctuated_token() {
+        // Accepted over-match (k3 review): a single-character keyword (`C`)
+        // matches a punctuation-adjacent token (`C++`), because `+` is a
+        // non-alphanumeric boundary. Pinned so the behavior is explicit, not
+        // drift.
+        assert_eq!(
+            skills_score("We use C++ heavily.", &["C".to_string()], &HashMap::new()),
+            10
+        );
+    }
+
+    #[test]
     fn skills_alias_with_punctuation_expands() {
         // Regression: `\b` cannot hold at the punctuation edges of ".NET" or
         // "C++", so aliases shaped like these never match.
@@ -604,6 +625,7 @@ mod tests {
         assert_eq!(fmt_weight(0.5), "0.5");
         assert_eq!(fmt_weight(1.0), "1");
         assert_eq!(fmt_weight(0.333), "0.333");
+        assert_eq!(fmt_weight(0.0), "0");
     }
 
     #[test]
