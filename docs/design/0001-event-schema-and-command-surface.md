@@ -237,7 +237,7 @@ API first** — structured, ToS-friendly, and robust against anti-scraping
 frontends — falling back to HTML fetch + main-text extraction for unknown
 sites or unrecognized API responses. `adapter` records the platform
 (`greenhouse`/`ashby`/`lever`/`workday`) or `drop-in`. `source` records how
-the lead was found (`search`/`recruiter`/`referer`/`unknown`), user-supplied
+the lead was found (`search`/`recruiter`/`referrer`/`unknown`), user-supplied
 via `--source` and defaulting to `unknown`. This is extraction for URLs
 already in hand; discovery (watchlist polling) remains vNext.
 

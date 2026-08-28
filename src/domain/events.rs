@@ -158,15 +158,14 @@ impl ExtractedFields {
 }
 
 /// The posting snapshot carried by both `ingested` and `updated` payloads
-/// (flattened inline, so the serialized shapes are unchanged). Also what
-/// `evolve` deserializes to refresh state.
+/// (flattened inline). Also what `evolve` deserializes to refresh state.
 #[skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SnapshotFields {
     /// The extraction adapter that produced this snapshot
     /// (`greenhouse`/`ashby`/`lever`/`workday`/`drop-in`).
     pub adapter: String,
-    /// How the lead was found (`search`/`recruiter`/`referer`/`unknown`),
+    /// How the lead was found (`search`/`recruiter`/`referrer`/`unknown`),
     /// user-supplied via `--source`; defaults to `unknown`.
     #[serde(default = "default_lead_source")]
     pub source: String,

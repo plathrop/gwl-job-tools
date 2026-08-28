@@ -26,7 +26,7 @@ pub struct LeadRecord {
     pub dedupe_key: Option<String>,
     pub identifiers: Identifiers,
     pub adapter: Option<String>,
-    /// How the lead was found (`search`/`recruiter`/`referer`/`unknown`).
+    /// How the lead was found (`search`/`recruiter`/`referrer`/`unknown`).
     pub source: Option<String>,
     pub url: Option<String>,
     pub extracted: ExtractedFields,

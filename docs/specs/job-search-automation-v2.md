@@ -33,8 +33,9 @@ Accept a URL or a file (HTML/PDF/text; PDF support is deferred to
 GWLJ-mxyp63, which also covers headless print-to-PDF for JS-rendered
 sites). Fetch and extract the main text. Emit a
 `ingested` event containing the raw text plus best-effort structured
-fields: title, company, compensation, location, req id, and source. Sources are
-pluggable adapters; v0 ships the platform-aware drop-in adapter — URLs
+fields: title, company, compensation, location, req id, and the extraction
+adapter. Adapters are
+pluggable; v0 ships the platform-aware drop-in adapter — URLs
 matching known boards (Greenhouse/Ashby/Lever/Workday) are fetched via the
 board's public JSON API first, with HTML fetch as the fallback
 (`docs/decisions/0003-api-first-extraction-in-v0.md`). Discovery

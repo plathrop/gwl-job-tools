@@ -21,7 +21,7 @@ pub struct IngestArgs {
     #[arg(long)]
     pub file: Option<PathBuf>,
 
-    /// How the lead was found (search, recruiter, referer, unknown)
+    /// How the lead was found (search, recruiter, referrer, unknown)
     #[arg(long, value_enum)]
     pub source: Option<LeadSource>,
 }
@@ -34,8 +34,8 @@ pub enum LeadSource {
     Search,
     #[value(name = "recruiter")]
     Recruiter,
-    #[value(name = "referer")]
-    Referer,
+    #[value(name = "referrer")]
+    Referrer,
     #[default]
     #[value(name = "unknown")]
     Unknown,
@@ -46,7 +46,7 @@ impl LeadSource {
         match self {
             LeadSource::Search => "search",
             LeadSource::Recruiter => "recruiter",
-            LeadSource::Referer => "referer",
+            LeadSource::Referrer => "referrer",
             LeadSource::Unknown => "unknown",
         }
     }
