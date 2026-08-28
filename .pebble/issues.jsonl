@@ -127,3 +127,5 @@
 {"type":"update","issueId":"GWLJ-mmeajy","timestamp":"2026-08-28T19:47:20.430Z","data":{"relatedTo":["GWLJ-498xbl"]},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-498xbl","timestamp":"2026-08-28T19:47:20.430Z","data":{"relatedTo":["GWLJ-mmeajy"]},"source":"gwl-job-tools"}
 {"type":"comment","issueId":"GWLJ-1lxx3e","timestamp":"2026-08-28T20:58:55.586Z","data":{"text":"Display convention (decision 0007): render timestamps in the local timezone via jiff::Zoned/TimeZone::system(); canonical storage stays UTC.","timestamp":"2026-08-28T20:58:55.586Z"},"source":"gwl-job-tools"}
+{"type":"close","issueId":"GWLJ-w8bofg","timestamp":"2026-08-28T21:01:13.129Z","data":{"reason":"Merged in PR #8: state machine commands (applied/screened/interviewed/offered/outcome) + unresponsive outcome"},"source":"gwl-job-tools"}
+{"type":"close","issueId":"GWLJ-i0eqq5","timestamp":"2026-08-28T21:01:13.899Z","data":{"reason":"Merged in PR #8: gwl-jobs events command (dump/filter the raw log)"},"source":"gwl-job-tools"}
