@@ -126,3 +126,4 @@
 {"type":"update","issueId":"GWLJ-wbpv13","timestamp":"2026-08-28T19:47:19.678Z","data":{"relatedTo":[]},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-mmeajy","timestamp":"2026-08-28T19:47:20.430Z","data":{"relatedTo":["GWLJ-498xbl"]},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-498xbl","timestamp":"2026-08-28T19:47:20.430Z","data":{"relatedTo":["GWLJ-mmeajy"]},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-1lxx3e","timestamp":"2026-08-28T20:58:55.586Z","data":{"text":"Display convention (decision 0007): render timestamps in the local timezone via jiff::Zoned/TimeZone::system(); canonical storage stays UTC.","timestamp":"2026-08-28T20:58:55.586Z"},"source":"gwl-job-tools"}
