@@ -1,7 +1,7 @@
 //! Command implementations. Thin: I/O wiring around the domain.
 
 use jiff::Timestamp;
-use miette::{Context, IntoDiagnostic, Result, miette};
+use miette::{Context, IntoDiagnostic, Result, bail, miette};
 use serde::Serialize;
 use serde_with::skip_serializing_none;
 use tracing::{debug, info, instrument};
@@ -11,11 +11,11 @@ use uuid::Uuid;
 use crate::{
     cli::{
         AppliedArgs, EventsArgs, IngestArgs, InterviewedArgs, OfferedArgs, OutcomeArgs,
-        ScreenedArgs, ShowArgs,
+        OutcomeType, ScreenedArgs, ShowArgs,
     },
     config::{AppPaths, Config},
     domain::{
-        events::{ExtractedFields, OutcomePayload, PendingEvent, event_type},
+        events::{EventEnvelope, ExtractedFields, OutcomePayload, PendingEvent, event_type},
         gates::{self, GateFailure},
         identity::{self, compute_identity},
         lead::{self, IngestKind, LeadState},
@@ -225,11 +225,21 @@ pub fn select_lead<'a>(projection: &'a Projection, prefix: &str) -> Result<&'a L
     }
 }
 
-/// Parse the `--at` flag: an RFC 3339 timestamp (e.g. 2026-08-15T00:00:00Z).
+/// Parse the `--at` flag: an RFC 3339 timestamp (e.g. 2026-08-15T00:00:00Z)
+/// or a bare date (YYYY-MM-DD, defaulting to noon UTC).
 fn parse_occurred_at(s: &str) -> Result<Timestamp> {
-    s.parse::<Timestamp>().into_diagnostic().wrap_err_with(|| {
-        format!("parsing --at '{s}' (expected RFC 3339, e.g. 2026-08-15T00:00:00Z)")
-    })
+    if let Ok(ts) = s.parse::<Timestamp>() {
+        return Ok(ts);
+    }
+    let date: jiff::civil::Date = s
+        .parse()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("parsing --at '{s}' (expected RFC 3339 or YYYY-MM-DD)"))?;
+    let zoned = date
+        .at(12, 0, 0, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .into_diagnostic()?;
+    Ok(zoned.timestamp())
 }
 
 /// Resolve a lead by prefix and append one user-recorded outcome event to its
@@ -267,6 +277,7 @@ pub async fn execute_applied(args: AppliedArgs, paths: &AppPaths) -> Result<()> 
         event_type::APPLIED,
         OutcomePayload {
             method: args.method.map(|m| m.as_str().to_string()),
+            note: args.note,
             ..Default::default()
         },
         occurred_at,
@@ -287,6 +298,7 @@ pub async fn execute_screened(args: ScreenedArgs, paths: &AppPaths) -> Result<()
         event_type::SCREENED,
         OutcomePayload {
             contact: args.contact,
+            note: args.note,
             ..Default::default()
         },
         occurred_at,
@@ -307,6 +319,7 @@ pub async fn execute_interviewed(args: InterviewedArgs, paths: &AppPaths) -> Res
         event_type::INTERVIEWED,
         OutcomePayload {
             stage: args.stage,
+            note: args.note,
             ..Default::default()
         },
         occurred_at,
@@ -325,7 +338,10 @@ pub async fn execute_offered(args: OfferedArgs, paths: &AppPaths) -> Result<()> 
         &projection,
         &args.lead,
         event_type::OFFERED,
-        OutcomePayload::default(),
+        OutcomePayload {
+            note: args.note,
+            ..Default::default()
+        },
         occurred_at,
     )?;
     println!("{lead_id}");
@@ -334,6 +350,12 @@ pub async fn execute_offered(args: OfferedArgs, paths: &AppPaths) -> Result<()> 
 
 #[instrument(skip_all)]
 pub async fn execute_outcome(args: OutcomeArgs, paths: &AppPaths) -> Result<()> {
+    if args.start_date.is_some() && args.outcome != OutcomeType::Accepted {
+        bail!("--start-date is only valid for 'accepted'");
+    }
+    if args.reason.is_some() && args.outcome != OutcomeType::Archived {
+        bail!("--reason is only valid for 'archived'");
+    }
     let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let projection = projections::rebuild(&store.replay()?)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
@@ -344,6 +366,8 @@ pub async fn execute_outcome(args: OutcomeArgs, paths: &AppPaths) -> Result<()> 
         args.outcome.as_str(),
         OutcomePayload {
             note: args.note,
+            start_date: args.start_date,
+            reason: args.reason,
             ..Default::default()
         },
         occurred_at,
@@ -356,22 +380,41 @@ pub async fn execute_outcome(args: OutcomeArgs, paths: &AppPaths) -> Result<()> 
 pub async fn execute_events(args: EventsArgs, paths: &AppPaths) -> Result<()> {
     let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let events = store.replay()?;
-    for event in events.iter().filter(|e| {
-        let lead_ok = match &args.lead {
-            Some(prefix) => lead::stream_lead_id(&e.stream)
-                .map(|id| id.to_string().starts_with(prefix))
-                .unwrap_or(false),
-            None => true,
-        };
-        let type_ok = match &args.event_type {
-            Some(t) => e.event_type == *t,
-            None => true,
-        };
-        lead_ok && type_ok
-    }) {
+    // Resolve the lead prefix once (unambiguous, like the other lead-addressed
+    // commands) so a short/empty prefix can't silently mix unrelated leads.
+    let lead_id = match &args.lead {
+        Some(prefix) => {
+            let projection = projections::rebuild(&events)?;
+            Some(select_lead(&projection, prefix)?.lead_id)
+        }
+        None => None,
+    };
+    for event in filter_events(&events, lead_id, args.event_type.as_deref()) {
         println!("{}", serde_json::to_string(event).into_diagnostic()?);
     }
     Ok(())
+}
+
+/// Filter events by lead id and/or event type.
+fn filter_events<'a>(
+    events: &'a [EventEnvelope],
+    lead_id: Option<Uuid>,
+    event_type: Option<&str>,
+) -> Vec<&'a EventEnvelope> {
+    events
+        .iter()
+        .filter(|e| {
+            let lead_ok = match lead_id {
+                Some(id) => lead::stream_lead_id(&e.stream) == Some(id),
+                None => true,
+            };
+            let type_ok = match event_type {
+                Some(t) => e.event_type == *t,
+                None => true,
+            };
+            lead_ok && type_ok
+        })
+        .collect()
 }
 
 #[cfg(test)]

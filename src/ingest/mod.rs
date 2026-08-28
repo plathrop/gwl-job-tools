@@ -273,12 +273,19 @@ async fn ingest_via_html<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Resul
         let raw_text = extract::html_to_text(&job.description_html);
         if !raw_text.trim().is_empty() {
             let mut extracted = extract::extract_fields(&raw_text, job.location.as_deref());
-            extracted.title = Some(job.title);
-            extracted.company = job.company;
+            extracted.title = Some(job.title.clone());
+            // Company fallback so the blacklist gate holds on the JSON-LD path
+            // too (a missing hiringOrganization must not disable it).
+            extracted.company = job
+                .company
+                .or_else(|| extract::company_from_title(&job.title));
             extracted.req_id = job.req_id.or_else(|| extract::extract_req_id(&raw_text));
             // The structured remote signal (jobLocationType) is more
             // authoritative than the text heuristic.
             extracted.remote = job.remote.or(extracted.remote);
+            // Structured baseSalary is more authoritative than the text
+            // heuristic.
+            extracted.comp = job.comp.or(extracted.comp);
             return Ok(IngestOutcome {
                 source: "drop-in".into(),
                 url: Some(url.to_string()),

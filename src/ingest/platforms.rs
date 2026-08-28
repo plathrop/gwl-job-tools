@@ -193,8 +193,12 @@ fn parse_ashby(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
                 .as_deref()
                 .is_some_and(|id| id_field(j, &["id"]).as_deref() == Some(id))
         })
-        .or_else(|| jobs.first())
-        .ok_or_else(|| miette!("ashby API returned no jobs"))?;
+        .ok_or_else(|| {
+            miette!(
+                "ashby API returned no job with id {:?} (deleted or mistyped?)",
+                job_id
+            )
+        })?;
 
     let title = str_field(job, &["title"]).map(str::to_string);
     if title.is_none() {
@@ -213,6 +217,16 @@ fn parse_ashby(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
             _ => None,
         },
     };
+    // The structured compensation tier summary is appended to the body so the
+    // text-based comp extraction picks it up (the API URL requests
+    // includeCompensation=true).
+    let mut body_html = str_field(job, &["descriptionHtml"])
+        .unwrap_or_default()
+        .to_string();
+    if let Some(summary) = str_field(job, &["compensation", "compensationTierSummary"]) {
+        body_html.push_str("\nCompensation: ");
+        body_html.push_str(summary);
+    }
     Ok(ApiExtraction {
         source: Platform::Ashby.source_name(),
         title,
@@ -220,9 +234,7 @@ fn parse_ashby(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
         req_id: id_field(job, &["id"]),
         location,
         remote,
-        body_html: str_field(job, &["descriptionHtml"])
-            .unwrap_or_default()
-            .to_string(),
+        body_html,
     })
 }
 

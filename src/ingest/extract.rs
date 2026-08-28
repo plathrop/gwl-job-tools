@@ -90,6 +90,7 @@ pub struct JsonLdJobPosting {
     pub location: Option<String>,
     pub req_id: Option<String>,
     pub remote: Option<bool>,
+    pub comp: Option<CompRange>,
 }
 
 /// Extract a `JobPosting` from any JSON-LD script tag in the page. Returns
@@ -124,7 +125,11 @@ fn find_job_posting(value: &serde_json::Value) -> Option<JsonLdJobPosting> {
         if !is_job_posting(candidate) {
             continue;
         }
-        let title = candidate.get("title").and_then(serde_json::Value::as_str)?;
+        // A candidate without a title must not abort the search — the next
+        // posting in the graph may be usable.
+        let Some(title) = candidate.get("title").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
         return Some(JsonLdJobPosting {
             title: title.to_string(),
             description_html: candidate
@@ -144,6 +149,7 @@ fn find_job_posting(value: &serde_json::Value) -> Option<JsonLdJobPosting> {
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string),
             remote: extract_json_ld_remote(candidate),
+            comp: extract_json_ld_comp(candidate),
         });
     }
     None
@@ -192,9 +198,54 @@ fn extract_json_ld_remote(job: &serde_json::Value) -> Option<bool> {
         .and_then(serde_json::Value::as_str)?;
     match t.to_ascii_uppercase().as_str() {
         "TELECOMMUTE" => Some(true),
-        "ONSITE" | "HYBRID" => Some(false),
+        "ONSITE" | "ON_SITE" | "HYBRID" => Some(false),
         _ => None,
     }
+}
+
+/// Extract schema.org `baseSalary` (a `MonetaryAmount` with a
+/// `QuantitativeValue`). Hourly rates are annualized to match `extract_comp`.
+fn extract_json_ld_comp(job: &serde_json::Value) -> Option<CompRange> {
+    let salary = job.get("baseSalary")?;
+    let value = salary.get("value")?;
+    let min = value
+        .get("minValue")
+        .and_then(serde_json::Value::as_f64)
+        .map(|v| v.round() as u64);
+    let max = value
+        .get("maxValue")
+        .and_then(serde_json::Value::as_f64)
+        .map(|v| v.round() as u64);
+    if min.is_none() && max.is_none() {
+        return None;
+    }
+    let currency = salary
+        .get("currency")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("USD")
+        .to_string();
+    let hourly = value
+        .get("unitText")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|u| u.eq_ignore_ascii_case("HOUR"));
+    let (min, max) = if hourly {
+        (min.map(|v| v * 2080), max.map(|v| v * 2080))
+    } else {
+        (min, max)
+    };
+    let raw = match (min, max) {
+        (Some(lo), Some(hi)) => format!("${lo} - ${hi}"),
+        (Some(lo), None) => format!("${lo}"),
+        (None, Some(hi)) => format!("${hi}"),
+        (None, None) => String::new(),
+    };
+    Some(CompRange {
+        min,
+        max,
+        currency,
+        period: if hourly { "hour".into() } else { "year".into() },
+        raw,
+    })
 }
 
 /// Best-effort structured fields from plain text (and optional location

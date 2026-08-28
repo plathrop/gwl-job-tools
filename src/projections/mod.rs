@@ -267,11 +267,22 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                         ))
                     })?;
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
-                    record.latest_outcome = Some(OutcomeView {
-                        event_type: event.event_type.clone(),
-                        note: payload.note,
-                        occurred_at: event.occurred_at,
-                    });
+                    // Retro-dated events must not regress the projected state:
+                    // recording `screened --at <older>` after `accepted` must
+                    // not make `show` report `screened`. Only replace when the
+                    // new event's `occurred_at` is at least as recent (replay
+                    // order is the tie-breaker, since `>=` replaces on equal).
+                    let is_newer = record
+                        .latest_outcome
+                        .as_ref()
+                        .is_none_or(|current| event.occurred_at >= current.occurred_at);
+                    if is_newer {
+                        record.latest_outcome = Some(OutcomeView {
+                            event_type: event.event_type.clone(),
+                            note: payload.note,
+                            occurred_at: event.occurred_at,
+                        });
+                    }
                     record.event_count += 1;
                     record.last_event = event.recorded_at;
                 }
