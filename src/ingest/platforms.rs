@@ -10,7 +10,7 @@
 //! and their shapes drift, so every field read goes through `Value` probing
 //! rather than a rigid struct.
 
-use miette::{Context, Result, bail};
+use miette::{Context, Result, bail, miette};
 use serde_json::Value;
 use url::Url;
 
@@ -43,6 +43,9 @@ pub struct ApiExtraction {
     pub company: Option<String>,
     pub req_id: Option<String>,
     pub location: Option<String>,
+    /// Structured remote signal, when the API provides one (Ashby's
+    /// `isRemote`/`workplaceType`). `None` = derive from text.
+    pub remote: Option<bool>,
     pub body_html: String,
 }
 
@@ -71,9 +74,10 @@ pub fn api_url(url: &Url, platform: Platform) -> Option<Url> {
         (Platform::Greenhouse, [board, "jobs", id, ..]) => Some(format!(
             "https://boards-api.greenhouse.io/v1/boards/{board}/jobs/{id}"
         )),
-        // /{board}/{jobId}
-        (Platform::Ashby, [board, job_id, ..]) => Some(format!(
-            "https://api.ashbyhq.com/posting-api/job-board/{board}/{job_id}"
+        // /{board}/{jobId} — the public endpoint returns the whole board's
+        // job list; the job is matched by id in `parse_ashby`.
+        (Platform::Ashby, [board, ..]) => Some(format!(
+            "https://api.ashbyhq.com/posting-api/job-board/{board}?includeCompensation=true"
         )),
         // /{company}/{id}
         (Platform::Lever, [company, id, ..]) => {
@@ -164,6 +168,7 @@ fn parse_greenhouse(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
         company: board_slug(posting_url).map(|s| extract::prettify_slug(&s)),
         req_id: id_field(body, &["id"]),
         location: str_field(body, &["location", "name"]).map(str::to_string),
+        remote: None,
         body_html: str_field(body, &["content"])
             .unwrap_or_default()
             .to_string(),
@@ -171,20 +176,51 @@ fn parse_greenhouse(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
 }
 
 fn parse_ashby(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
-    let title = str_field(body, &["title"]).map(str::to_string);
-    if title.is_none() {
-        bail!("ashby API response missing title (shape changed?)");
-    }
-    let location = str_field(body, &["locationName"])
-        .or_else(|| str_field(body, &["location"]))
+    // The public endpoint returns the whole board's job list; find the job
+    // whose id matches the posting URL's last path segment.
+    let job_id = posting_url
+        .path_segments()
+        .and_then(|mut s| s.rfind(|s| !s.is_empty()))
         .map(str::to_string);
+    let jobs = body
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| miette!("ashby API response missing jobs array (shape changed?)"))?;
+    let job = jobs
+        .iter()
+        .find(|j| {
+            job_id
+                .as_deref()
+                .is_some_and(|id| id_field(j, &["id"]).as_deref() == Some(id))
+        })
+        .or_else(|| jobs.first())
+        .ok_or_else(|| miette!("ashby API returned no jobs"))?;
+
+    let title = str_field(job, &["title"]).map(str::to_string);
+    if title.is_none() {
+        bail!("ashby API job missing title (shape changed?)");
+    }
+    let location = str_field(job, &["location"])
+        .or_else(|| str_field(job, &["locationName"]))
+        .map(str::to_string);
+    let remote = match job.get("isRemote").and_then(Value::as_bool) {
+        Some(true) => Some(true),
+        _ => match job.get("workplaceType").and_then(Value::as_str) {
+            Some(t) if t.eq_ignore_ascii_case("Remote") => Some(true),
+            Some(t) if t.eq_ignore_ascii_case("Hybrid") || t.eq_ignore_ascii_case("OnSite") => {
+                Some(false)
+            }
+            _ => None,
+        },
+    };
     Ok(ApiExtraction {
         source: Platform::Ashby.source_name(),
         title,
         company: board_slug(posting_url).map(|s| extract::prettify_slug(&s)),
-        req_id: id_field(body, &["id"]),
+        req_id: id_field(job, &["id"]),
         location,
-        body_html: str_field(body, &["descriptionHtml"])
+        remote,
+        body_html: str_field(job, &["descriptionHtml"])
             .unwrap_or_default()
             .to_string(),
     })
@@ -238,6 +274,7 @@ fn parse_lever(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
         company: board_slug(posting_url).map(|s| extract::prettify_slug(&s)),
         req_id: id_field(body, &["id"]),
         location: str_field(body, &["categories", "location"]).map(str::to_string),
+        remote: None,
         body_html,
     })
 }
@@ -263,6 +300,7 @@ fn parse_workday(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
         company,
         req_id: str_field(info, &["jobReqId"]).map(str::to_string),
         location: str_field(info, &["location"]).map(str::to_string),
+        remote: None,
         body_html: str_field(info, &["jobDescription"])
             .unwrap_or_default()
             .to_string(),
@@ -285,6 +323,9 @@ pub fn finalize(api: &ApiExtraction) -> (String, ExtractedFields) {
         .req_id
         .clone()
         .or_else(|| extract::extract_req_id(&raw_text));
+    // The structured remote signal is more authoritative than the text
+    // heuristic.
+    fields.remote = api.remote.or(fields.remote);
     (raw_text, fields)
 }
 
@@ -339,7 +380,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             api_url(&url, Platform::Ashby).unwrap().as_str(),
-            "https://api.ashbyhq.com/posting-api/job-board/restate/fe90faab-5417-4034-b915-0770e2477a73"
+            "https://api.ashbyhq.com/posting-api/job-board/restate?includeCompensation=true"
         );
     }
 
@@ -409,15 +450,40 @@ mod tests {
     #[test]
     fn parses_ashby_response() {
         let body = serde_json::json!({
-            "id": "fe90faab-5417-4034-b915-0770e2477a73",
-            "title": "Senior Cloud Infrastructure Engineer",
-            "locationName": "Remote (US)",
-            "descriptionHtml": "<p>Join us.</p>"
+            "jobs": [
+                {
+                    "id": "fe90faab-5417-4034-b915-0770e2477a73",
+                    "title": "Senior Cloud Infrastructure Engineer",
+                    "location": "Remote (US)",
+                    "isRemote": true,
+                    "workplaceType": "Remote",
+                    "descriptionHtml": "<p>Join us.</p>"
+                }
+            ]
         });
-        let url = Url::parse("https://jobs.ashbyhq.com/restate/fe90faab").unwrap();
+        let url =
+            Url::parse("https://jobs.ashbyhq.com/restate/fe90faab-5417-4034-b915-0770e2477a73")
+                .unwrap();
         let api = parse_api_response(Platform::Ashby, &body, &url).unwrap();
         assert_eq!(api.company.as_deref(), Some("Restate"));
         assert_eq!(api.location.as_deref(), Some("Remote (US)"));
+        assert_eq!(api.remote, Some(true));
+    }
+
+    #[test]
+    fn parses_ashby_response_finds_job_by_id() {
+        // The endpoint returns the whole board; the right job is matched by
+        // the posting URL's id, not by position.
+        let body = serde_json::json!({
+            "jobs": [
+                {"id": "aaaa", "title": "Wrong Job", "descriptionHtml": "<p>a</p>"},
+                {"id": "bbbb", "title": "Right Job", "descriptionHtml": "<p>b</p>"}
+            ]
+        });
+        let url = Url::parse("https://jobs.ashbyhq.com/restate/bbbb").unwrap();
+        let api = parse_api_response(Platform::Ashby, &body, &url).unwrap();
+        assert_eq!(api.title.as_deref(), Some("Right Job"));
+        assert_eq!(api.req_id.as_deref(), Some("bbbb"));
     }
 
     #[test]
