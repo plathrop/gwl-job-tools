@@ -57,7 +57,11 @@ queue command is `list`). The spec has been updated to match.
   error. Any other malformed line anywhere is likewise a hard error. A
   batch torn between its events can leave a prefix visible — the §7
   pending-recovery rule (an `apply-automatically` mark with no subsequent
-  `apply_queued` stays pending) is the semantic backstop.
+  `apply_queued` stays pending) is the semantic backstop. Known limit of
+  the batch-prefix policy: if a snapshot event persists but its following
+  `rejected` event does not, the lead presents as gate-passing until the
+  next re-ingest re-evaluates it; the full fix is a pass-marker event,
+  deferred to the scoring increment (`scored` is that marker in practice).
 
 ### Event envelope
 

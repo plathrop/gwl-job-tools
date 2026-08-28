@@ -99,11 +99,17 @@ pub fn evaluate(config: &Config, extracted: &ExtractedFields, raw_text: &str) ->
     }
 
     for red_line in &config.ideological_red_lines {
-        if !red_line.is_empty()
-            && let Some(pos) = raw_text.to_lowercase().find(&red_line.to_lowercase())
-        {
-            let start = raw_text.floor_char_boundary(pos);
-            let end = raw_text.ceil_char_boundary((pos + red_line.len() + 40).min(raw_text.len()));
+        if red_line.is_empty() {
+            continue;
+        }
+        // Case-insensitive match on the ORIGINAL text: lowercasing can
+        // change byte length (e.g. 'İ'), so offsets from a lowercased copy
+        // must never index the original string.
+        let re = regex::Regex::new(&format!("(?i){}", regex::escape(red_line)))
+            .expect("escaped pattern compiles");
+        if let Some(m) = re.find(raw_text) {
+            let start = raw_text.floor_char_boundary(m.start());
+            let end = raw_text.ceil_char_boundary((m.end() + 40).min(raw_text.len()));
             failures.push(GateFailure {
                 gate: Gate::Ideological,
                 reason: format!(

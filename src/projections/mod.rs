@@ -170,25 +170,22 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                 }
             }
             event_type::REJECTED => {
+                // Strict, like the ingest payloads: a mistyped rejection is
+                // source-of-truth corruption, not a None.
+                let payload: crate::domain::events::RejectedPayload =
+                    serde_json::from_value(event.payload.clone())
+                        .into_diagnostic()
+                        .map_err(|e| {
+                            e.wrap_err(format!(
+                                "decoding rejected payload of event {} (seq {})",
+                                event.id, event.seq
+                            ))
+                        })?;
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
                     record.latest_rejection = Some(GateRejection {
-                        gate: event
-                            .payload
-                            .get("gate")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        reason: event
-                            .payload
-                            .get("reason")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        revision: event
-                            .payload
-                            .get("revision")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default(),
+                        gate: payload.gate,
+                        reason: payload.reason,
+                        revision: payload.revision,
                     });
                     record.event_count += 1;
                     record.last_event = event.recorded_at;
