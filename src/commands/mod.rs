@@ -494,6 +494,62 @@ mod tests {
         assert_eq!(rejections[0].gate.as_str(), "blacklist");
     }
 
+    // ── scored wiring (Increment 3) ───────────────────────────────
+
+    #[test]
+    fn scored_event_carries_batch_metadata() {
+        // A passing ingest appends ingested + scored in one batch: same
+        // correlation id, scored caused by the snapshot, revision 1.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut outcome = outcome("body");
+        outcome.url = Some("https://example.com/job/10".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+
+        record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
+
+        let events = store.replay().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, "scored");
+        assert_eq!(events[1].seq, 2);
+        assert_eq!(events[1].correlation_id, events[0].correlation_id);
+        assert_eq!(events[1].causation_id, Some(events[0].id));
+        assert_eq!(events[1].payload["revision"], 1);
+    }
+
+    #[test]
+    fn resume_skills_flow_into_skills_dimension() {
+        // Every other record_ingest test passes an empty skill list; this one
+        // exercises the skills-present path end to end.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut outcome = outcome("We use Kubernetes heavily.");
+        outcome.url = Some("https://example.com/job/11".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+
+        let summary = record_ingest(
+            &mut store,
+            &projection,
+            &Config::default(),
+            &["Kubernetes".to_string()],
+            outcome,
+        )
+        .unwrap();
+
+        let score = summary.score.as_ref().unwrap();
+        let skills = score
+            .dimensions
+            .iter()
+            .find(|d| d.name == "skills")
+            .unwrap();
+        assert_eq!(skills.score, 10);
+        // level 100 + skills 10 + remote 50 (unknown), comp dropped, equal
+        // weights → 160/3 = 53.
+        assert_eq!(score.composite, 53);
+    }
+
     // ── golden round-trip (design doc §10) ───────────────────────
 
     /// Write → replay → projection equality, through the real store.

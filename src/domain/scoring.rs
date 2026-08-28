@@ -262,6 +262,7 @@ fn remote_score(extracted: &ExtractedFields) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ScoringWeights;
 
     fn config() -> Config {
         Config {
@@ -324,6 +325,30 @@ mod tests {
         assert_eq!(level_score(&e, "no years"), 50);
     }
 
+    #[test]
+    fn level_title_keywords_match_on_word_boundaries() {
+        // Regression: substring matching misclassifies unrelated titles —
+        // "International" contains "intern", "Staffing" contains "staff".
+        let mut e = extracted();
+        for title in [
+            "International Software Engineer",
+            "Staffing Engineer",
+            "Entryway Designer",
+        ] {
+            e.title = Some(title.into());
+            assert_eq!(level_score(&e, "no years"), 50, "{title}");
+        }
+        // True positives keep working under boundary matching.
+        for (title, expected) in [
+            ("Staff Engineer", 100),
+            ("Senior Engineer", 70),
+            ("Junior Engineer", 10),
+        ] {
+            e.title = Some(title.into());
+            assert_eq!(level_score(&e, "no years"), expected, "{title}");
+        }
+    }
+
     // ── skills ───────────────────────────────────────────────────
 
     #[test]
@@ -382,6 +407,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn skills_punctuated_keyword_matches() {
+        // Regression: "C++" tokenizes to a single one-character token, which
+        // the len >= 2 filter drops — so the keyword can never match.
+        assert_eq!(
+            skills_score("We use C++ heavily.", &["C++".to_string()], &HashMap::new()),
+            10
+        );
+        // Guard: the boundary fix must not over-match — plain C is not C++.
+        assert_eq!(
+            skills_score("We use C only.", &["C++".to_string()], &HashMap::new()),
+            0
+        );
+    }
+
+    #[test]
+    fn skills_single_character_keyword_matches() {
+        // Regression: single-character tokens are dropped by the len >= 2
+        // filter, so skills like "R" can never match.
+        assert_eq!(
+            skills_score(
+                "Expert in R programming.",
+                &["R".to_string()],
+                &HashMap::new()
+            ),
+            10
+        );
+        // Guard: "R" must not match "Rust".
+        assert_eq!(
+            skills_score("We use Rust.", &["R".to_string()], &HashMap::new()),
+            0
+        );
+    }
+
+    #[test]
+    fn skills_alias_with_punctuation_expands() {
+        // Regression: `\b` cannot hold at the punctuation edges of ".NET" or
+        // "C++", so aliases shaped like these never match.
+        let aliases = HashMap::from([(".NET".to_string(), "DotNet".to_string())]);
+        assert_eq!(
+            skills_score("We use .NET services.", &["DotNet".to_string()], &aliases),
+            10
+        );
+        let aliases = HashMap::from([("C++".to_string(), "Cpp".to_string())]);
+        assert_eq!(
+            skills_score("Heavy C++ workloads.", &["Cpp".to_string()], &aliases),
+            10
+        );
+    }
+
     // ── compensation ─────────────────────────────────────────────
 
     #[test]
@@ -409,6 +484,21 @@ mod tests {
         let mut cfg = config();
         cfg.compensation_ceiling = None;
         assert_eq!(compensation_score(&cfg, &extracted()), None);
+    }
+
+    #[test]
+    fn compensation_falls_back_to_min_when_max_absent() {
+        // Mirrors the gate: a single-figure posting (max absent) scores
+        // against min. (240k−180k)/(300k−180k) = 50.
+        let mut e = extracted();
+        e.comp = Some(CompRange {
+            min: Some(240_000),
+            max: None,
+            currency: "USD".into(),
+            period: "year".into(),
+            raw: "$240,000".into(),
+        });
+        assert_eq!(compensation_score(&config(), &e), Some(50));
     }
 
     // ── remote ───────────────────────────────────────────────────
@@ -463,5 +553,32 @@ mod tests {
         assert_eq!(fmt_weight(0.5), "0.5");
         assert_eq!(fmt_weight(1.0), "1");
         assert_eq!(fmt_weight(0.333), "0.333");
+    }
+
+    #[test]
+    fn degenerate_weights_do_not_break_the_contract() {
+        // Regression: all-zero weights divide by zero — the breakdown prints
+        // NaN and the composite silently leaves the documented 0–100 range.
+        let cfg = Config {
+            scoring_weights: ScoringWeights {
+                level: 0.0,
+                skills: 0.0,
+                compensation: 0.0,
+                remote: 0.0,
+            },
+            ..Default::default()
+        };
+        let result = score(
+            &cfg,
+            &extracted(),
+            "Kubernetes experience",
+            &["Kubernetes".to_string()],
+        );
+        assert!(
+            !result.breakdown.contains("NaN"),
+            "breakdown: {}",
+            result.breakdown
+        );
+        assert!(result.composite <= 100, "composite: {}", result.composite);
     }
 }

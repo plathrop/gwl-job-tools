@@ -238,6 +238,36 @@ mod tests {
         }
     }
 
+    fn score_result() -> ScoreResult {
+        ScoreResult {
+            composite: 50,
+            dimensions: vec![],
+            breakdown: "50".into(),
+        }
+    }
+
+    fn ingested_envelope() -> EventEnvelope {
+        EventEnvelope {
+            envelope_version: 1,
+            id: Uuid::now_v7(),
+            stream: "lead/x".into(),
+            seq: 1,
+            event_type: event_type::INGESTED.into(),
+            schema_version: 1,
+            occurred_at: jiff::Timestamp::now(),
+            recorded_at: jiff::Timestamp::now(),
+            causation_id: None,
+            correlation_id: Uuid::now_v7(),
+            payload: serde_json::json!({
+                "dedupe_key": "tc:abc",
+                "identifiers": {"tc": "tc:abc"},
+                "source": "drop-in",
+                "raw_text": "body",
+                "extracted": {"title": "Engineer", "company": "Acme"}
+            }),
+        }
+    }
+
     // ── decide_ingest ────────────────────────────────────────────
 
     #[test]
@@ -341,6 +371,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(events[1].payload["revision"], 2);
+    }
+
+    #[test]
+    fn scored_revision_increments_across_evaluations() {
+        // Scored analog of revision_increments_across_evaluations: a lead
+        // previously evaluated once scores at revision 2 on re-evaluation.
+        let state = LeadState {
+            exists: true,
+            seq: 2,
+            eval_revision: 1,
+            ..Default::default()
+        };
+        let (_, events) = decide_ingest(
+            &state,
+            &identity(),
+            "drop-in",
+            Some("https://example.com/j".into()),
+            "body2".into(),
+            extracted("Engineer"),
+            vec![],
+            Some(score_result()),
+        )
+        .unwrap();
+        let scored = events.last().unwrap();
+        assert_eq!(scored.event_type, event_type::SCORED);
+        assert_eq!(scored.payload["revision"], 2);
+    }
+
+    #[test]
+    fn evaluation_cannot_be_both_rejected_and_scored() {
+        // Pass-marker invariant (decision 0006): one evaluation emits
+        // `rejected` XOR `scored`. Today decide_ingest happily emits both —
+        // the invariant is a call-site convention only. (The suppressed
+        // path's empty-failures + no-score combination stays legal.)
+        let failure = GateFailure {
+            gate: crate::domain::gates::Gate::RemoteOnly,
+            reason: "on-site".into(),
+        };
+        let result = decide_ingest(
+            &LeadState::default(),
+            &identity(),
+            "drop-in",
+            Some("https://example.com/j".into()),
+            "body".into(),
+            extracted("Engineer"),
+            vec![failure],
+            Some(score_result()),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -567,6 +646,68 @@ mod tests {
         evolve(&mut state, &unknown);
         assert_eq!(state.seq, 7);
         assert!(!state.exists);
+    }
+
+    #[test]
+    fn evolve_scored_sets_latest_score() {
+        let mut state = LeadState::default();
+        let ingested = ingested_envelope();
+        evolve(&mut state, &ingested);
+
+        let scored = EventEnvelope {
+            event_type: event_type::SCORED.into(),
+            seq: 2,
+            payload: serde_json::json!({
+                "composite": 75,
+                "revision": 1,
+                "dimensions": [],
+                "breakdown": "75"
+            }),
+            ..ingested
+        };
+        evolve(&mut state, &scored);
+
+        let score = state.latest_score.as_ref().unwrap();
+        assert_eq!(score.composite, 75);
+        assert_eq!(score.revision, 1);
+    }
+
+    #[test]
+    fn evolve_snapshot_invalidates_stale_score() {
+        // Decision 0006: `scored` is the pass-marker. A snapshot without its
+        // scored event (torn batch) must not keep an old score current.
+        let mut state = LeadState::default();
+        let ingested = ingested_envelope();
+        evolve(&mut state, &ingested);
+
+        let scored = EventEnvelope {
+            event_type: event_type::SCORED.into(),
+            seq: 2,
+            payload: serde_json::json!({
+                "composite": 75,
+                "revision": 1,
+                "dimensions": [],
+                "breakdown": "75"
+            }),
+            ..ingested.clone()
+        };
+        evolve(&mut state, &scored);
+
+        let updated = EventEnvelope {
+            event_type: event_type::UPDATED.into(),
+            seq: 3,
+            payload: serde_json::json!({
+                "dedupe_key": "tc:abc",
+                "identifiers": {"tc": "tc:abc"},
+                "source": "drop-in",
+                "raw_text": "body v2",
+                "extracted": {"title": "Senior Engineer", "company": "Acme"}
+            }),
+            ..ingested
+        };
+        evolve(&mut state, &updated);
+
+        assert!(state.latest_score.is_none());
     }
 
     #[test]
