@@ -1,5 +1,6 @@
 //! Command implementations. Thin: I/O wiring around the domain.
 
+use jiff::Timestamp;
 use miette::{Context, IntoDiagnostic, Result, miette};
 use serde::Serialize;
 use serde_with::skip_serializing_none;
@@ -8,10 +9,13 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    cli::{IngestArgs, ShowArgs},
+    cli::{
+        AppliedArgs, EventsArgs, IngestArgs, InterviewedArgs, OfferedArgs, OutcomeArgs,
+        ScreenedArgs, ShowArgs,
+    },
     config::{AppPaths, Config},
     domain::{
-        events::ExtractedFields,
+        events::{ExtractedFields, OutcomePayload, PendingEvent, event_type},
         gates::{self, GateFailure},
         identity::{self, compute_identity},
         lead::{self, IngestKind, LeadState},
@@ -219,6 +223,155 @@ pub fn select_lead<'a>(projection: &'a Projection, prefix: &str) -> Result<&'a L
                 .join(", ")
         )),
     }
+}
+
+/// Parse the `--at` flag: an RFC 3339 timestamp (e.g. 2026-08-15T00:00:00Z).
+fn parse_occurred_at(s: &str) -> Result<Timestamp> {
+    s.parse::<Timestamp>().into_diagnostic().wrap_err_with(|| {
+        format!("parsing --at '{s}' (expected RFC 3339, e.g. 2026-08-15T00:00:00Z)")
+    })
+}
+
+/// Resolve a lead by prefix and append one user-recorded outcome event to its
+/// stream. Returns the lead id.
+fn record_outcome(
+    store: &mut impl EventStore,
+    projection: &Projection,
+    prefix: &str,
+    event_type: &'static str,
+    payload: OutcomePayload,
+    occurred_at: Option<Timestamp>,
+) -> Result<Uuid> {
+    let lead_id = select_lead(projection, prefix)?.lead_id;
+    let stream = LeadState::stream_id(lead_id);
+    let mut state = LeadState::default();
+    for event in store.load(&stream)? {
+        lead::evolve(&mut state, &event);
+    }
+    let mut pending = PendingEvent::new(event_type, None, &payload)?;
+    pending.occurred_at = occurred_at;
+    store.append(&stream, state.seq, &[pending], Uuid::now_v7())?;
+    info!(%lead_id, event_type, "outcome recorded");
+    Ok(lead_id)
+}
+
+#[instrument(skip_all)]
+pub async fn execute_applied(args: AppliedArgs, paths: &AppPaths) -> Result<()> {
+    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let projection = projections::rebuild(&store.replay()?)?;
+    let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
+    let lead_id = record_outcome(
+        &mut store,
+        &projection,
+        &args.lead,
+        event_type::APPLIED,
+        OutcomePayload {
+            method: args.method.map(|m| m.as_str().to_string()),
+            ..Default::default()
+        },
+        occurred_at,
+    )?;
+    println!("{lead_id}");
+    Ok(())
+}
+
+#[instrument(skip_all)]
+pub async fn execute_screened(args: ScreenedArgs, paths: &AppPaths) -> Result<()> {
+    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let projection = projections::rebuild(&store.replay()?)?;
+    let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
+    let lead_id = record_outcome(
+        &mut store,
+        &projection,
+        &args.lead,
+        event_type::SCREENED,
+        OutcomePayload {
+            contact: args.contact,
+            ..Default::default()
+        },
+        occurred_at,
+    )?;
+    println!("{lead_id}");
+    Ok(())
+}
+
+#[instrument(skip_all)]
+pub async fn execute_interviewed(args: InterviewedArgs, paths: &AppPaths) -> Result<()> {
+    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let projection = projections::rebuild(&store.replay()?)?;
+    let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
+    let lead_id = record_outcome(
+        &mut store,
+        &projection,
+        &args.lead,
+        event_type::INTERVIEWED,
+        OutcomePayload {
+            stage: args.stage,
+            ..Default::default()
+        },
+        occurred_at,
+    )?;
+    println!("{lead_id}");
+    Ok(())
+}
+
+#[instrument(skip_all)]
+pub async fn execute_offered(args: OfferedArgs, paths: &AppPaths) -> Result<()> {
+    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let projection = projections::rebuild(&store.replay()?)?;
+    let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
+    let lead_id = record_outcome(
+        &mut store,
+        &projection,
+        &args.lead,
+        event_type::OFFERED,
+        OutcomePayload::default(),
+        occurred_at,
+    )?;
+    println!("{lead_id}");
+    Ok(())
+}
+
+#[instrument(skip_all)]
+pub async fn execute_outcome(args: OutcomeArgs, paths: &AppPaths) -> Result<()> {
+    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let projection = projections::rebuild(&store.replay()?)?;
+    let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
+    let lead_id = record_outcome(
+        &mut store,
+        &projection,
+        &args.lead,
+        args.outcome.as_str(),
+        OutcomePayload {
+            note: args.note,
+            ..Default::default()
+        },
+        occurred_at,
+    )?;
+    println!("{lead_id}");
+    Ok(())
+}
+
+#[instrument(skip_all)]
+pub async fn execute_events(args: EventsArgs, paths: &AppPaths) -> Result<()> {
+    let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let events = store.replay()?;
+    for event in events.iter().filter(|e| {
+        let lead_ok = match &args.lead {
+            Some(prefix) => lead::stream_lead_id(&e.stream)
+                .map(|id| id.to_string().starts_with(prefix))
+                .unwrap_or(false),
+            None => true,
+        };
+        let type_ok = match &args.event_type {
+            Some(t) => e.event_type == *t,
+            None => true,
+        };
+        lead_ok && type_ok
+    }) {
+        println!("{}", serde_json::to_string(event).into_diagnostic()?);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -587,5 +740,77 @@ mod tests {
         // remote 50, equal weights → 75).
         let score = record.latest_score.as_ref().unwrap();
         assert_eq!(score.composite, 75);
+    }
+
+    // ── outcome recording (state machine) ─────────────────────────
+
+    #[test]
+    fn record_outcome_appends_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut outcome = outcome("body");
+        outcome.url = Some("https://example.com/job/12".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+        let summary =
+            record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
+
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let lead_id = record_outcome(
+            &mut store,
+            &projection,
+            &summary.lead_id.to_string(),
+            event_type::APPLIED,
+            OutcomePayload {
+                method: Some("manual".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(lead_id, summary.lead_id);
+
+        let events = store.replay().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].event_type, "applied");
+        assert_eq!(events[2].payload["method"], "manual");
+    }
+
+    #[test]
+    fn record_outcome_retro_dates_occurred_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut outcome = outcome("body");
+        outcome.url = Some("https://example.com/job/13".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+        let summary =
+            record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
+
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let at = "2026-08-15T00:00:00Z".parse::<Timestamp>().unwrap();
+        record_outcome(
+            &mut store,
+            &projection,
+            &summary.lead_id.to_string(),
+            event_type::APPLIED,
+            OutcomePayload::default(),
+            Some(at),
+        )
+        .unwrap();
+
+        let events = store.replay().unwrap();
+        assert_eq!(events[2].occurred_at, at);
+    }
+
+    #[test]
+    fn parse_occurred_at_parses_rfc3339() {
+        let ts = parse_occurred_at("2026-08-15T00:00:00Z").unwrap();
+        assert_eq!(ts, "2026-08-15T00:00:00Z".parse::<Timestamp>().unwrap());
+    }
+
+    #[test]
+    fn parse_occurred_at_rejects_garbage() {
+        assert!(parse_occurred_at("not a timestamp").is_err());
     }
 }

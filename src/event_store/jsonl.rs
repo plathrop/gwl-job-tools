@@ -190,7 +190,7 @@ impl EventStore for JsonlEventStore {
                 seq: expected_seq + 1 + i as u64,
                 event_type: pending.event_type.to_string(),
                 schema_version: pending.schema_version,
-                occurred_at: now,
+                occurred_at: pending.occurred_at.unwrap_or(now),
                 recorded_at: now,
                 causation_id,
                 correlation_id,
@@ -248,6 +248,7 @@ mod tests {
             event_type: event_type::INGESTED,
             schema_version: 1,
             causation_id: None,
+            occurred_at: None,
             payload,
         }
     }

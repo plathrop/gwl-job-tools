@@ -12,7 +12,9 @@ use serde_with::skip_serializing_none;
 use uuid::Uuid;
 
 use crate::domain::{
-    events::{EventEnvelope, ExtractedFields, Identifiers, ScoredPayload, event_type},
+    events::{
+        EventEnvelope, ExtractedFields, Identifiers, OutcomePayload, ScoredPayload, event_type,
+    },
     identity::LeadIdentity,
     lead::stream_lead_id,
 };
@@ -33,6 +35,9 @@ pub struct LeadRecord {
     pub latest_rejection: Option<GateRejection>,
     /// The latest `scored` payload, if the lead has ever passed gates.
     pub latest_score: Option<ScoredPayload>,
+    /// The latest user-recorded outcome (applied/screened/…/accepted/…), if
+    /// any. Drives the review queue's "no outcome event" membership rule.
+    pub latest_outcome: Option<OutcomeView>,
     pub event_count: u64,
     pub first_seen: Timestamp,
     pub last_event: Timestamp,
@@ -43,6 +48,14 @@ pub struct GateRejection {
     pub gate: String,
     pub reason: String,
     pub revision: u64,
+}
+
+/// A user-recorded outcome event's projected state (design doc 0001 §3).
+#[derive(Clone, Debug, Serialize)]
+pub struct OutcomeView {
+    pub event_type: String,
+    pub note: Option<String>,
+    pub occurred_at: Timestamp,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -145,6 +158,7 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                         latest_mark: None,
                         latest_rejection: None,
                         latest_score: None,
+                        latest_outcome: None,
                         event_count: 0,
                         first_seen: event.recorded_at,
                         last_event: event.recorded_at,
@@ -230,6 +244,34 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                     })?;
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
                     record.latest_score = Some(payload);
+                    record.event_count += 1;
+                    record.last_event = event.recorded_at;
+                }
+            }
+            event_type::APPLIED
+            | event_type::SCREENED
+            | event_type::INTERVIEWED
+            | event_type::OFFERED
+            | event_type::ACCEPTED
+            | event_type::REJECTED_BY_EMPLOYER
+            | event_type::WITHDRAWN
+            | event_type::DECLINED
+            | event_type::UNRESPONSIVE
+            | event_type::ARCHIVED => {
+                let payload: OutcomePayload = serde_json::from_value(event.payload.clone())
+                    .into_diagnostic()
+                    .map_err(|e| {
+                        e.wrap_err(format!(
+                            "decoding outcome payload of event {} (seq {})",
+                            event.id, event.seq
+                        ))
+                    })?;
+                if let Some(record) = projection.leads.get_mut(&lead_id) {
+                    record.latest_outcome = Some(OutcomeView {
+                        event_type: event.event_type.clone(),
+                        note: payload.note,
+                        occurred_at: event.occurred_at,
+                    });
                     record.event_count += 1;
                     record.last_event = event.recorded_at;
                 }
@@ -464,6 +506,52 @@ mod tests {
             ),
         ];
         assert!(rebuild(&events).is_err());
+    }
+
+    #[test]
+    fn outcome_event_sets_latest_outcome() {
+        let lead_id = Uuid::now_v7();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(
+                lead_id,
+                2,
+                event_type::APPLIED,
+                serde_json::json!({"method": "manual", "note": "applied via portal"}),
+            ),
+        ];
+        let projection = rebuild(&events).unwrap();
+        let record = projection.leads.get(&lead_id).unwrap();
+        let outcome = record.latest_outcome.as_ref().unwrap();
+        assert_eq!(outcome.event_type, "applied");
+        assert_eq!(outcome.note.as_deref(), Some("applied via portal"));
+    }
+
+    #[test]
+    fn later_outcome_wins() {
+        // Latest-wins: a subsequent outcome replaces the previous one.
+        let lead_id = Uuid::now_v7();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(lead_id, 2, event_type::APPLIED, serde_json::json!({})),
+            envelope(lead_id, 3, event_type::ACCEPTED, serde_json::json!({})),
+        ];
+        let projection = rebuild(&events).unwrap();
+        let record = projection.leads.get(&lead_id).unwrap();
+        assert_eq!(
+            record.latest_outcome.as_ref().unwrap().event_type,
+            "accepted"
+        );
     }
 
     // ── lookup precedence (design doc §2) ────────────────────────
