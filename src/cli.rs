@@ -46,7 +46,7 @@ impl ApplyMethod {
 }
 
 /// Terminal outcome types (`gwl-jobs outcome`, design doc 0001 §3).
-#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum OutcomeType {
     #[value(name = "accepted")]
     Accepted,
@@ -82,7 +82,10 @@ pub struct AppliedArgs {
     /// How the application was submitted
     #[arg(long, value_enum)]
     pub method: Option<ApplyMethod>,
-    /// When it happened (RFC 3339, e.g. 2026-08-15T00:00:00Z)
+    /// Free-form note
+    #[arg(long)]
+    pub note: Option<String>,
+    /// When it happened (RFC 3339 or YYYY-MM-DD, e.g. 2026-08-15)
     #[arg(long)]
     pub at: Option<String>,
 }
@@ -94,7 +97,10 @@ pub struct ScreenedArgs {
     /// Who screened (recruiter name, etc.)
     #[arg(long)]
     pub contact: Option<String>,
-    /// When it happened (RFC 3339)
+    /// Free-form note
+    #[arg(long)]
+    pub note: Option<String>,
+    /// When it happened (RFC 3339 or YYYY-MM-DD)
     #[arg(long)]
     pub at: Option<String>,
 }
@@ -106,7 +112,10 @@ pub struct InterviewedArgs {
     /// Interview stage (phone, onsite, panel, …)
     #[arg(long)]
     pub stage: Option<String>,
-    /// When it happened (RFC 3339)
+    /// Free-form note
+    #[arg(long)]
+    pub note: Option<String>,
+    /// When it happened (RFC 3339 or YYYY-MM-DD)
     #[arg(long)]
     pub at: Option<String>,
 }
@@ -115,7 +124,10 @@ pub struct InterviewedArgs {
 pub struct OfferedArgs {
     /// Unambiguous UUID prefix of the lead
     pub lead: String,
-    /// When it happened (RFC 3339)
+    /// Free-form note
+    #[arg(long)]
+    pub note: Option<String>,
+    /// When it happened (RFC 3339 or YYYY-MM-DD)
     #[arg(long)]
     pub at: Option<String>,
 }
@@ -129,7 +141,13 @@ pub struct OutcomeArgs {
     /// Free-form note
     #[arg(long)]
     pub note: Option<String>,
-    /// When it happened (RFC 3339)
+    /// Start date (only valid for `accepted`)
+    #[arg(long)]
+    pub start_date: Option<String>,
+    /// Archive reason (only valid for `archived`)
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// When it happened (RFC 3339 or YYYY-MM-DD)
     #[arg(long)]
     pub at: Option<String>,
 }
