@@ -41,7 +41,7 @@ pub async fn execute_ingest(args: IngestArgs, config: &Config, paths: &AppPaths)
 
     // Fetch/extract *before* acquiring the single-writer lock: network waits
     // must not hold the lock (durability contract, design doc 0001 §1).
-    let outcome = match (&args.url, &args.file) {
+    let mut outcome = match (&args.url, &args.file) {
         (Some(url), None) => {
             let http = ingest::default_client()?;
             ingest::ingest_url(url, &http).await?
@@ -54,6 +54,9 @@ pub async fn execute_ingest(args: IngestArgs, config: &Config, paths: &AppPaths)
         }
         _ => return Err(miette!("exactly one of <url> or --file <path> is required")),
     };
+    // The lead source is user-supplied (how the job was found); the adapter
+    // is always known (derived from the URL). Default to `unknown`.
+    outcome.source = args.source.unwrap_or_default().as_str().to_string();
 
     // Acquire the lock only for the fast read → decide → append cycle.
     let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
@@ -138,6 +141,7 @@ pub fn record_ingest(
     let (kind, pending) = lead::decide_ingest(
         &state,
         &identity,
+        &outcome.adapter,
         &outcome.source,
         canonical_url.clone(),
         outcome.raw_text,
@@ -173,6 +177,7 @@ pub fn record_ingest(
         },
         score,
         dedupe_key: identity.dedupe_key,
+        adapter: outcome.adapter,
         source: outcome.source,
         url: canonical_url,
         extracted: outcome.extracted,
@@ -188,6 +193,7 @@ pub struct IngestSummary {
     pub rejected: Option<Vec<GateFailure>>,
     pub score: Option<ScoreResult>,
     pub dedupe_key: String,
+    pub adapter: String,
     pub source: String,
     pub url: Option<String>,
     pub extracted: ExtractedFields,
@@ -423,7 +429,8 @@ mod tests {
 
     fn outcome(raw_text: &str) -> IngestOutcome {
         IngestOutcome {
-            source: "drop-in".into(),
+            adapter: "drop-in".into(),
+            source: "unknown".into(),
             url: None,
             raw_text: raw_text.into(),
             extracted: ExtractedFields::default(),
@@ -719,6 +726,25 @@ mod tests {
         assert_eq!(events[1].correlation_id, events[0].correlation_id);
         assert_eq!(events[1].causation_id, Some(events[0].id));
         assert_eq!(events[1].payload["revision"], 1);
+    }
+
+    #[test]
+    fn lead_source_flows_into_ingested_payload() {
+        // The lead source (--source) is user-supplied and distinct from the
+        // extraction adapter. A non-default source must land in the event.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut outcome = outcome("body");
+        outcome.url = Some("https://example.com/job/12".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+        outcome.source = "recruiter".into();
+
+        record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
+
+        let events = store.replay().unwrap();
+        assert_eq!(events[0].payload["adapter"], "drop-in");
+        assert_eq!(events[0].payload["source"], "recruiter");
     }
 
     #[test]

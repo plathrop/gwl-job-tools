@@ -206,7 +206,8 @@ produces them in v0.
     "url": "url:https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/job/…",
     "tc": "tc:9f2c…"
   },
-  "source": "drop-in",
+  "adapter": "drop-in",
+  "source": "search",
   "url": "https://nvidia.wd5.myworkdayjobs.com/…",
   "raw_text": "…full extracted posting text…",
   "extracted": {
@@ -229,14 +230,16 @@ produces them in v0.
 `extracted` fields are best-effort; any may be absent. `raw_text` is stored
 in the log (it is the source of truth; volume is trivial at this scale).
 
-`source` identifies the adapter that produced the event. v0 ships the
-platform-aware **drop-in adapter**: a dropped URL matching a known board
+`adapter` identifies the extraction adapter that produced the event. v0 ships
+the platform-aware **drop-in adapter**: a dropped URL matching a known board
 (Greenhouse, Ashby, Lever, Workday) is fetched via the board's **public JSON
 API first** — structured, ToS-friendly, and robust against anti-scraping
 frontends — falling back to HTML fetch + main-text extraction for unknown
-sites or unrecognized API responses. `source` records the platform
-(`greenhouse`/`ashby`/`lever`/`workday`) or `drop-in`. This is extraction
-for URLs already in hand; discovery (watchlist polling) remains vNext.
+sites or unrecognized API responses. `adapter` records the platform
+(`greenhouse`/`ashby`/`lever`/`workday`) or `drop-in`. `source` records how
+the lead was found (`search`/`recruiter`/`referer`/`unknown`), user-supplied
+via `--source` and defaulting to `unknown`. This is extraction for URLs
+already in hand; discovery (watchlist polling) remains vNext.
 
 **`updated`** ● — re-ingest matched an existing, non-ignored lead.
 

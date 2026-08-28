@@ -25,6 +25,8 @@ pub struct LeadRecord {
     pub lead_id: Uuid,
     pub dedupe_key: Option<String>,
     pub identifiers: Identifiers,
+    pub adapter: Option<String>,
+    /// How the lead was found (`search`/`recruiter`/`referer`/`unknown`).
     pub source: Option<String>,
     pub url: Option<String>,
     pub extracted: ExtractedFields,
@@ -115,6 +117,8 @@ struct IngestView {
     dedupe_key: String,
     #[serde(default)]
     identifiers: Identifiers,
+    adapter: String,
+    #[serde(default = "crate::domain::events::default_lead_source")]
     source: String,
     url: Option<String>,
     #[serde(default)]
@@ -152,6 +156,7 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                         lead_id,
                         dedupe_key: None,
                         identifiers: Identifiers::default(),
+                        adapter: None,
                         source: None,
                         url: None,
                         extracted: ExtractedFields::default(),
@@ -165,6 +170,7 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                     });
                 record.dedupe_key = Some(view.dedupe_key);
                 record.identifiers = view.identifiers;
+                record.adapter = Some(view.adapter);
                 record.source = Some(view.source);
                 // Mirror the event snapshot exactly: an `updated` that
                 // drops the URL (e.g. a file re-ingest of a URL-ingested
@@ -345,7 +351,7 @@ mod tests {
         serde_json::json!({
             "dedupe_key": req.or(url).or(tc).unwrap(),
             "identifiers": identifiers,
-            "source": "drop-in",
+            "adapter": "drop-in",
             "raw_text": "body",
             "extracted": {"title": "Engineer", "company": "Acme"}
         })
@@ -415,7 +421,7 @@ mod tests {
                     "dedupe_key": "url:https://example.com/j",
                     "identifiers": {"url": "url:https://example.com/j"},
                     "changed": ["title"],
-                    "source": "drop-in",
+                    "adapter": "drop-in",
                     "raw_text": "body2",
                     "extracted": {"title": "Senior Engineer", "company": "Acme"}
                 }),
@@ -451,7 +457,7 @@ mod tests {
                     "dedupe_key": "url:https://example.com/j",
                     "identifiers": {"url": "url:https://example.com/j"},
                     "changed": ["title"],
-                    "source": "drop-in",
+                    "adapter": "drop-in",
                     "raw_text": "body2",
                     "extracted": {"title": "Senior Engineer", "company": "Acme"}
                 }),
@@ -471,7 +477,7 @@ mod tests {
             "dedupe_key": "url:https://example.com/j",
             "identifiers": {"url": "url:https://example.com/j"},
             "changed": ["title"],
-            "source": "drop-in",
+            "adapter": "drop-in",
             "raw_text": "body2",
             "extracted": {"title": "Senior Engineer", "company": "Acme"}
         });
@@ -752,7 +758,7 @@ mod tests {
             serde_json::json!({
                 "dedupe_key": "raw:abc123",
                 "identifiers": {},
-                "source": "drop-in",
+                "adapter": "drop-in",
                 "raw_text": "unstructured body",
                 "extracted": {}
             }),

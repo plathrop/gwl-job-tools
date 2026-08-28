@@ -38,7 +38,6 @@ impl Platform {
 /// What an API gave us, pre-field-extraction.
 #[derive(Clone, Debug)]
 pub struct ApiExtraction {
-    pub source: &'static str,
     pub title: Option<String>,
     pub company: Option<String>,
     pub req_id: Option<String>,
@@ -163,7 +162,6 @@ fn parse_greenhouse(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
         bail!("greenhouse API response missing title (shape changed?)");
     }
     Ok(ApiExtraction {
-        source: Platform::Greenhouse.source_name(),
         title,
         company: board_slug(posting_url).map(|s| extract::prettify_slug(&s)),
         req_id: id_field(body, &["id"]),
@@ -228,7 +226,6 @@ fn parse_ashby(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
         body_html.push_str(summary);
     }
     Ok(ApiExtraction {
-        source: Platform::Ashby.source_name(),
         title,
         company: board_slug(posting_url).map(|s| extract::prettify_slug(&s)),
         req_id: id_field(job, &["id"]),
@@ -281,7 +278,6 @@ fn parse_lever(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
         html
     };
     Ok(ApiExtraction {
-        source: Platform::Lever.source_name(),
         title,
         company: board_slug(posting_url).map(|s| extract::prettify_slug(&s)),
         req_id: id_field(body, &["id"]),
@@ -307,7 +303,6 @@ fn parse_workday(body: &Value, posting_url: &Url) -> Result<ApiExtraction> {
                 .map(extract::prettify_slug)
         });
     Ok(ApiExtraction {
-        source: Platform::Workday.source_name(),
         title: str_field(info, &["title"]).map(str::to_string),
         company,
         req_id: str_field(info, &["jobReqId"]).map(str::to_string),

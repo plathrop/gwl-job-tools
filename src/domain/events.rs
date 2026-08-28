@@ -163,11 +163,23 @@ impl ExtractedFields {
 #[skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SnapshotFields {
+    /// The extraction adapter that produced this snapshot
+    /// (`greenhouse`/`ashby`/`lever`/`workday`/`drop-in`).
+    pub adapter: String,
+    /// How the lead was found (`search`/`recruiter`/`referer`/`unknown`),
+    /// user-supplied via `--source`; defaults to `unknown`.
+    #[serde(default = "default_lead_source")]
     pub source: String,
     pub url: Option<String>,
     pub raw_text: Option<String>,
     #[serde(default)]
     pub extracted: ExtractedFields,
+}
+
+/// Default lead source when the user doesn't pass `--source` (design doc
+/// 0001 §3): the lead's origin is unknown until the user says otherwise.
+pub fn default_lead_source() -> String {
+    "unknown".into()
 }
 
 #[skip_serializing_none]
@@ -399,7 +411,8 @@ mod tests {
                 tc: Some("tc:9f2c".into()),
             },
             snapshot: SnapshotFields {
-                source: "greenhouse".into(),
+                adapter: "greenhouse".into(),
+                source: "search".into(),
                 url: Some("https://example.com/job".into()),
                 raw_text: Some("body".into()),
                 extracted: ExtractedFields {
@@ -410,7 +423,8 @@ mod tests {
         };
         let v = serde_json::to_value(&payload).unwrap();
         // Flattened: snapshot fields serialize inline (shape unchanged).
-        assert_eq!(v["source"], "greenhouse");
+        assert_eq!(v["adapter"], "greenhouse");
+        assert_eq!(v["source"], "search");
         assert!(v.get("snapshot").is_none());
         let back: IngestedPayload = serde_json::from_value(v).unwrap();
         assert_eq!(back.dedupe_key, "req:nvidia:jr2018233");
