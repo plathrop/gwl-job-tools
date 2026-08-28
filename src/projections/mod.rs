@@ -31,6 +31,11 @@ pub struct LeadRecord {
     pub url: Option<String>,
     pub extracted: ExtractedFields,
     pub latest_mark: Option<String>,
+    /// Number of times the lead was marked `defer` (design doc §5).
+    pub deferral_count: u64,
+    /// Whether an `apply_queued` event followed the latest
+    /// `apply-automatically` mark (pending-recovery rule, design doc §7).
+    pub apply_queued: bool,
     /// The most recent gate failure, if the last gate evaluation rejected
     /// the lead. Cleared by any subsequent `ingested`/`updated` that passed
     /// gates (a `rejected` follows those in the same batch when it fails).
@@ -110,6 +115,33 @@ impl Projection {
         matches.sort_by_key(|r| r.first_seen);
         matches
     }
+
+    /// The pending review queue (design doc §7): leads with a current
+    /// `scored`, no outcome event, and latest mark absent or `defer` — plus
+    /// the pending-recovery rule (an `apply-automatically` mark with no
+    /// `apply_queued` is still pending). Ranked by composite score
+    /// descending.
+    pub fn pending_queue(&self) -> Vec<&LeadRecord> {
+        let mut pending: Vec<&LeadRecord> = self
+            .leads
+            .values()
+            .filter(|r| {
+                r.latest_score.is_some()
+                    && r.latest_outcome.is_none()
+                    && match r.latest_mark.as_deref() {
+                        None | Some("defer") => true,
+                        Some("apply-automatically") => !r.apply_queued,
+                        _ => false,
+                    }
+            })
+            .collect();
+        pending.sort_by(|a, b| {
+            let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
+            let sb = b.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
+            sb.cmp(&sa)
+        });
+        pending
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -161,6 +193,8 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                         url: None,
                         extracted: ExtractedFields::default(),
                         latest_mark: None,
+                        deferral_count: 0,
+                        apply_queued: false,
                         latest_rejection: None,
                         latest_score: None,
                         latest_outcome: None,
@@ -187,11 +221,25 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
             }
             event_type::REVIEWED => {
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
-                    record.latest_mark = event
+                    let mark = event
                         .payload
                         .get("mark")
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    record.latest_mark = mark.clone();
+                    if mark.as_deref() == Some("defer") {
+                        record.deferral_count += 1;
+                    }
+                    // A new mark invalidates any prior apply_queued (the
+                    // package belonged to the previous mark).
+                    record.apply_queued = false;
+                    record.event_count += 1;
+                    record.last_event = event.recorded_at;
+                }
+            }
+            event_type::APPLY_QUEUED => {
+                if let Some(record) = projection.leads.get_mut(&lead_id) {
+                    record.apply_queued = true;
                     record.event_count += 1;
                     record.last_event = event.recorded_at;
                 }
@@ -814,5 +862,132 @@ mod tests {
         let ids: Vec<Uuid> = matches.iter().map(|r| r.lead_id).collect();
         assert!(ids.contains(&a));
         assert!(ids.contains(&b));
+    }
+
+    // ── review queue (Increment 4a) ───────────────────────────────
+
+    fn reviewed_payload(mark: &str) -> Value {
+        serde_json::json!({ "mark": mark })
+    }
+
+    fn apply_queued_payload() -> Value {
+        serde_json::json!({
+            "package": {
+                "cover_letter_path": "/tmp/letter.pdf",
+                "resume_path": "/tmp/resume.pdf",
+                "cheat_sheet": []
+            },
+            "url": "https://example.com/j"
+        })
+    }
+
+    /// A lead that has been ingested and scored (the queue-membership
+    /// prerequisite).
+    fn scored_lead(lead_id: Uuid) -> Vec<EventEnvelope> {
+        vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(lead_id, 2, event_type::SCORED, scored_payload(75, 1)),
+        ]
+    }
+
+    #[test]
+    fn deferral_count_increments_per_defer_mark() {
+        let lead_id = Uuid::now_v7();
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("defer"),
+        ));
+        events.push(envelope(
+            lead_id,
+            4,
+            event_type::REVIEWED,
+            reviewed_payload("defer"),
+        ));
+        let projection = rebuild(&events).unwrap();
+        let record = projection.leads.get(&lead_id).unwrap();
+        assert_eq!(record.deferral_count, 2);
+        assert_eq!(record.latest_mark.as_deref(), Some("defer"));
+    }
+
+    #[test]
+    fn pending_queue_includes_scored_unmarked_leads() {
+        let lead_id = Uuid::now_v7();
+        let projection = rebuild(&scored_lead(lead_id)).unwrap();
+        let pending = projection.pending_queue();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].lead_id, lead_id);
+    }
+
+    #[test]
+    fn pending_queue_excludes_marked_and_outcome_leads() {
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let c = Uuid::now_v7();
+        let mut events = scored_lead(a);
+        // b is marked apply-manual (acted on, not pending).
+        events.extend(scored_lead(b));
+        events.push(envelope(
+            b,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("apply-manual"),
+        ));
+        // c has an outcome (applied).
+        events.extend(scored_lead(c));
+        events.push(envelope(
+            c,
+            3,
+            event_type::APPLIED,
+            serde_json::json!({"method": "manual"}),
+        ));
+        let projection = rebuild(&events).unwrap();
+        let pending = projection.pending_queue();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].lead_id, a);
+    }
+
+    #[test]
+    fn apply_automatically_without_apply_queued_is_still_pending() {
+        // Pending-recovery rule (design doc §7): a crash mid-batch leaves the
+        // reviewed{apply-automatically} without its apply_queued; the lead
+        // must stay pending.
+        let lead_id = Uuid::now_v7();
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("apply-automatically"),
+        ));
+        let projection = rebuild(&events).unwrap();
+        assert_eq!(projection.pending_queue().len(), 1);
+    }
+
+    #[test]
+    fn apply_automatically_with_apply_queued_leaves_the_queue() {
+        let lead_id = Uuid::now_v7();
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("apply-automatically"),
+        ));
+        events.push(envelope(
+            lead_id,
+            4,
+            event_type::APPLY_QUEUED,
+            apply_queued_payload(),
+        ));
+        let projection = rebuild(&events).unwrap();
+        assert!(projection.pending_queue().is_empty());
     }
 }

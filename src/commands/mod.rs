@@ -10,12 +10,15 @@ use uuid::Uuid;
 
 use crate::{
     cli::{
-        AppliedArgs, EventsArgs, IngestArgs, InterviewedArgs, OfferedArgs, OutcomeArgs,
-        OutcomeType, ScreenedArgs, ShowArgs,
+        AppliedArgs, EventsArgs, IngestArgs, InterviewedArgs, ListArgs, Mark, MarkArgs,
+        OfferedArgs, OutcomeArgs, OutcomeType, ScreenedArgs, ShowArgs,
     },
     config::{AppPaths, Config},
     domain::{
-        events::{EventEnvelope, ExtractedFields, OutcomePayload, PendingEvent, event_type},
+        events::{
+            ApplyPackage, ApplyQueuedPayload, CheatSheetEntry, EventEnvelope, ExtractedFields,
+            OutcomePayload, PendingEvent, event_type,
+        },
         gates::{self, GateFailure},
         identity::{self, compute_identity},
         lead::{self, IngestKind, LeadState},
@@ -24,7 +27,7 @@ use crate::{
     event_store::{EventStore, JsonlEventStore},
     ingest::{self, IngestOutcome},
     projections::{self, LeadRecord, Projection},
-    resume,
+    resume::{self, Resume},
 };
 
 const EVENT_LOG_NAME: &str = "events.jsonl";
@@ -229,6 +232,216 @@ pub fn select_lead<'a>(projection: &'a Projection, prefix: &str) -> Result<&'a L
                 .join(", ")
         )),
     }
+}
+
+/// One row of the `list` output (design doc §8).
+#[skip_serializing_none]
+#[derive(Clone, Debug, Serialize)]
+pub struct QueueEntry {
+    pub rank: usize,
+    pub lead_id: Uuid,
+    pub composite: Option<u64>,
+    pub title: Option<String>,
+    pub company: Option<String>,
+    pub deferral_count: u64,
+    pub mark: Option<String>,
+    pub outcome: Option<String>,
+}
+
+fn queue_entry(rank: usize, record: &LeadRecord) -> QueueEntry {
+    QueueEntry {
+        rank,
+        lead_id: record.lead_id,
+        composite: record.latest_score.as_ref().map(|s| s.composite),
+        title: record.extracted.title.clone(),
+        company: record.extracted.company.clone(),
+        deferral_count: record.deferral_count,
+        mark: record.latest_mark.clone(),
+        outcome: record.latest_outcome.as_ref().map(|o| o.event_type.clone()),
+    }
+}
+
+#[instrument(skip_all)]
+pub async fn execute_list(args: ListArgs, paths: &AppPaths) -> Result<()> {
+    let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let events = store.replay()?;
+    let projection = projections::rebuild(&events)?;
+
+    let entries: Vec<QueueEntry> = if args.all {
+        let mut leads: Vec<&LeadRecord> = projection.leads.values().collect();
+        leads.sort_by(|a, b| {
+            let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
+            let sb = b.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
+            sb.cmp(&sa).then_with(|| a.first_seen.cmp(&b.first_seen))
+        });
+        leads
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| queue_entry(i + 1, r))
+            .collect()
+    } else {
+        projection
+            .pending_queue()
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| queue_entry(i + 1, r))
+            .collect()
+    };
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&entries).into_diagnostic()?
+    );
+    Ok(())
+}
+
+#[instrument(skip_all)]
+pub async fn execute_mark(args: MarkArgs, config: &Config, paths: &AppPaths) -> Result<()> {
+    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let events = store.replay()?;
+    let projection = projections::rebuild(&events)?;
+
+    let record = select_lead(&projection, &args.lead)?;
+    let lead_id = record.lead_id;
+
+    // Prepare the apply package for apply-automatically (the mark IS the
+    // approval; the package is assembled before the batch append so a
+    // preparation failure leaves the lead unmarked).
+    let apply = if args.mark == Mark::ApplyAutomatically {
+        Some(prepare_package(config, record)?)
+    } else {
+        None
+    };
+
+    let pending = lead::decide_mark(args.mark.as_str(), args.note, apply)?;
+
+    let stream = LeadState::stream_id(lead_id);
+    let mut state = LeadState::default();
+    for event in store.load(&stream)? {
+        lead::evolve(&mut state, &event);
+    }
+    store.append(&stream, state.seq, &pending, Uuid::now_v7())?;
+
+    // Open the posting URL for apply-automatically (the final click is the
+    // user's; v0 just opens the page).
+    if args.mark == Mark::ApplyAutomatically
+        && let Some(url) = record.url.as_deref()
+    {
+        open_url(url)?;
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "lead_id": lead_id,
+            "mark": args.mark.as_str(),
+        }))
+        .into_diagnostic()?
+    );
+    Ok(())
+}
+
+/// Assemble the apply package for an `apply-automatically` lead (design doc
+/// 0001 §3): cover-letter path, resume PDF path (derived from the JSON
+/// resume path), the ATS cheat sheet, and the posting URL. Fails loudly on a
+/// configured-but-broken resume (decision 0004); a missing resume degrades
+/// to an empty cheat sheet.
+fn prepare_package(config: &Config, record: &LeadRecord) -> Result<ApplyQueuedPayload> {
+    let resume = resume::load(config.resume_path.as_deref())?;
+    let cheat_sheet = resume.as_ref().map(cheat_sheet).unwrap_or_default();
+    let resume_pdf = config
+        .resume_path
+        .as_deref()
+        .map(|p| p.with_extension("pdf").to_string_lossy().into_owned());
+    Ok(ApplyQueuedPayload {
+        package: ApplyPackage {
+            cover_letter_path: config
+                .cover_letter_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            resume_path: resume_pdf,
+            cheat_sheet,
+        },
+        url: record.url.clone(),
+    })
+}
+
+/// The ATS answers cheat sheet (design doc 0001 §3): a static list of common
+/// ATS questions with resume-derived answers. Best-effort — a question whose
+/// answer isn't in the resume is omitted.
+fn cheat_sheet(resume: &Resume) -> Vec<CheatSheetEntry> {
+    let mut entries = Vec::new();
+    if let Some(name) = resume.basics.name.as_deref() {
+        entries.push(CheatSheetEntry {
+            question: "Full name".into(),
+            answer: name.into(),
+        });
+    }
+    if let Some(email) = resume.basics.email.as_deref() {
+        entries.push(CheatSheetEntry {
+            question: "Email address".into(),
+            answer: email.into(),
+        });
+    }
+    if let Some(phone) = resume.basics.phone.as_deref() {
+        entries.push(CheatSheetEntry {
+            question: "Phone number".into(),
+            answer: phone.into(),
+        });
+    }
+    if let Some(loc) = &resume.basics.location {
+        let parts: Vec<&str> = [
+            loc.city.as_deref(),
+            loc.region.as_deref(),
+            loc.country_code.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !parts.is_empty() {
+            entries.push(CheatSheetEntry {
+                question: "Location".into(),
+                answer: parts.join(", "),
+            });
+        }
+    }
+    if let Some(work) = resume.work.first() {
+        if let Some(position) = work.position.as_deref() {
+            entries.push(CheatSheetEntry {
+                question: "Current or most recent title".into(),
+                answer: position.into(),
+            });
+        }
+        if let Some(company) = work.name.as_deref() {
+            entries.push(CheatSheetEntry {
+                question: "Current or most recent employer".into(),
+                answer: company.into(),
+            });
+        }
+    }
+    entries
+}
+
+/// Open a URL in the user's default browser (best-effort; the final click is
+/// the user's).
+fn open_url(url: &str) -> Result<()> {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", url]);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.spawn()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("opening {url}"))?;
+    Ok(())
 }
 
 /// Parse the `--at` flag: an RFC 3339 timestamp (e.g. 2026-08-15T00:00:00Z)
@@ -963,5 +1176,102 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    // ── apply package (Increment 4a) ──────────────────────────────
+
+    fn lead_record(url: Option<&str>) -> LeadRecord {
+        LeadRecord {
+            lead_id: Uuid::now_v7(),
+            dedupe_key: None,
+            identifiers: crate::domain::events::Identifiers::default(),
+            adapter: None,
+            source: None,
+            url: url.map(Into::into),
+            extracted: ExtractedFields::default(),
+            latest_mark: None,
+            deferral_count: 0,
+            apply_queued: false,
+            latest_rejection: None,
+            latest_score: None,
+            latest_outcome: None,
+            event_count: 0,
+            first_seen: Timestamp::now(),
+            last_event: Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn cheat_sheet_derives_answers_from_resume() {
+        let resume = Resume {
+            basics: resume::Basics {
+                name: Some("Grey".into()),
+                email: Some("grey@example.com".into()),
+                phone: None,
+                location: Some(resume::Location {
+                    city: Some("San Francisco".into()),
+                    region: Some("CA".into()),
+                    country_code: Some("US".into()),
+                }),
+            },
+            work: vec![resume::Work {
+                name: Some("Acme".into()),
+                position: Some("Staff Engineer".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let sheet = cheat_sheet(&resume);
+        let qa: Vec<(&str, &str)> = sheet
+            .iter()
+            .map(|e| (e.question.as_str(), e.answer.as_str()))
+            .collect();
+        assert!(qa.contains(&("Full name", "Grey")));
+        assert!(qa.contains(&("Email address", "grey@example.com")));
+        assert!(qa.contains(&("Location", "San Francisco, CA, US")));
+        assert!(qa.contains(&("Current or most recent title", "Staff Engineer")));
+        assert!(qa.contains(&("Current or most recent employer", "Acme")));
+        // Phone is absent → omitted.
+        assert!(!qa.iter().any(|(q, _)| *q == "Phone number"));
+    }
+
+    #[test]
+    fn prepare_package_assembles_paths_and_cheat_sheet() {
+        let dir = tempfile::tempdir().unwrap();
+        let resume_path = dir.path().join("resume.json");
+        std::fs::write(
+            &resume_path,
+            r#"{"basics": {"name": "Grey"}, "work": [{"name": "Acme", "position": "Staff Engineer"}]}"#,
+        )
+        .unwrap();
+        let config = Config {
+            resume_path: Some(resume_path.clone()),
+            cover_letter_path: Some(dir.path().join("letter.pdf")),
+            ..Default::default()
+        };
+        let record = lead_record(Some("https://example.com/j"));
+
+        let package = prepare_package(&config, &record).unwrap();
+        assert_eq!(package.url.as_deref(), Some("https://example.com/j"));
+        assert_eq!(
+            package.package.resume_path.as_deref(),
+            Some(resume_path.with_extension("pdf").to_str().unwrap())
+        );
+        assert_eq!(
+            package.package.cover_letter_path.as_deref(),
+            Some(dir.path().join("letter.pdf").to_str().unwrap())
+        );
+        assert!(!package.package.cheat_sheet.is_empty());
+    }
+
+    #[test]
+    fn prepare_package_fails_on_broken_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            resume_path: Some(dir.path().join("missing.json")),
+            ..Default::default()
+        };
+        let record = lead_record(Some("https://example.com/j"));
+        assert!(prepare_package(&config, &record).is_err());
     }
 }
