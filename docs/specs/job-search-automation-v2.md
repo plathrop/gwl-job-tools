@@ -49,7 +49,9 @@ recorded via a `rejected { gate, reason }` event. Gates:
   hybrid/on-site/in-office signals count as confident even when "remote"
   is mentioned somewhere). Unknown/unclear remote status passes to review
   and is flagged there — a false rejection is an invisible loss, a false
-  pass costs one glance at a review card. (Confirmed 2026-08-26; pairs with
+  pass costs one glance at a review card. The location-listed-but-silent
+  case is configurable (`reject_location_only`, default false — start
+  permissive, revisit if it produces too many false leads). (Confirmed 2026-08-26; pairs with
   the `remote` scoring dimension below that bubbles positive signals.)
 - **compensation floor** — reject below the configured floor.
 - **blacklist** — reject blacklisted companies (e.g., Salesforce).
