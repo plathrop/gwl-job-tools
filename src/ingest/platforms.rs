@@ -502,6 +502,31 @@ mod tests {
     }
 
     #[test]
+    fn ashby_compensation_tier_reaches_extracted_fields() {
+        // The API URL requests `includeCompensation=true`, but nothing reads
+        // the structured compensation the response carries: a posting whose
+        // comp lives only in the tier summary degrades to comp-unknown (the
+        // floor gate passes, the comp dimension drops out of the composite)
+        // even though the source provided it.
+        let body = serde_json::json!({
+            "jobs": [{
+                "id": "bbbb",
+                "title": "Engineer",
+                "descriptionHtml": "<p>Join us.</p>",
+                "compensation": {
+                    "compensationTierSummary": "$200,000 - $250,000 USD"
+                }
+            }]
+        });
+        let url = Url::parse("https://jobs.ashbyhq.com/restate/bbbb").unwrap();
+        let api = parse_api_response(Platform::Ashby, &body, &url).unwrap();
+        let (_raw_text, fields) = finalize(&api);
+        let comp = fields.comp.expect("comp tier summary should yield comp");
+        assert_eq!(comp.min, Some(200_000));
+        assert_eq!(comp.max, Some(250_000));
+    }
+
+    #[test]
     fn ashby_onsite_workplace_type_maps_to_non_remote() {
         let body = serde_json::json!({
             "jobs": [
