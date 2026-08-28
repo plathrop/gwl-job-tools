@@ -94,3 +94,4 @@
 {"type":"update","issueId":"GWLJ-7kfu55","timestamp":"2026-08-28T02:29:32.670Z","data":{},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-8vshug","timestamp":"2026-08-28T02:29:59.263Z","data":{"relatedTo":["GWLJ-1hp1r6"]},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-1hp1r6","timestamp":"2026-08-28T02:29:59.263Z","data":{"relatedTo":["GWLJ-8vshug"]},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-2hrdit","timestamp":"2026-08-28T02:40:34.843Z","data":{"text":"PR #5 deepseek unwrap-audit round addressed in 855085c (149 tests): LazyLock regex statics, documented expects, unreachable!->'none' alignment. Increment polished; awaiting merge.","timestamp":"2026-08-28T02:40:34.843Z"},"source":"gwl-job-tools"}
