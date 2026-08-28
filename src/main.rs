@@ -6,7 +6,7 @@ use gwl_job_tools::{
     telemetry::init_telemetry,
 };
 use miette::Result;
-use tracing::{Instrument, info_span};
+use tracing::{Instrument, error, info_span};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,6 +38,12 @@ async fn main() -> Result<()> {
     let result = cli::execute(cli.command, &config, &paths)
         .instrument(info_span!("cli", command = command_name))
         .await;
+
+    // Log the failure to the log file too — miette prints it to stderr, but
+    // the log file is the persistent record (decision 0005).
+    if let Err(err) = &result {
+        error!(error = %err, "command failed");
+    }
 
     telemetry.shutdown()?;
 
