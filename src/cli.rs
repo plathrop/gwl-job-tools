@@ -20,6 +20,36 @@ pub struct IngestArgs {
     /// Local file to ingest (HTML or plain text)
     #[arg(long)]
     pub file: Option<PathBuf>,
+
+    /// How the lead was found (search, recruiter, referer, unknown)
+    #[arg(long, value_enum)]
+    pub source: Option<LeadSource>,
+}
+
+/// How a lead was found (`--source`, design doc 0001 §3). User-supplied;
+/// defaults to `unknown`.
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+pub enum LeadSource {
+    #[value(name = "search")]
+    Search,
+    #[value(name = "recruiter")]
+    Recruiter,
+    #[value(name = "referer")]
+    Referer,
+    #[default]
+    #[value(name = "unknown")]
+    Unknown,
+}
+
+impl LeadSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LeadSource::Search => "search",
+            LeadSource::Recruiter => "recruiter",
+            LeadSource::Referer => "referer",
+            LeadSource::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Args)]

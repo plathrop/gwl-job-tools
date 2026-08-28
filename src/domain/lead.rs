@@ -112,6 +112,7 @@ pub enum IngestKind {
 pub fn decide_ingest(
     state: &LeadState,
     identity: &LeadIdentity,
+    adapter: &str,
     source: &str,
     url: Option<String>,
     raw_text: String,
@@ -138,6 +139,7 @@ pub fn decide_ingest(
             dedupe_key: identity.dedupe_key.clone(),
             identifiers: identity.identifiers.clone(),
             snapshot: SnapshotFields {
+                adapter: adapter.into(),
                 source: source.into(),
                 url,
                 raw_text: Some(raw_text),
@@ -179,6 +181,7 @@ pub fn decide_ingest(
         identifiers: identity.identifiers.clone(),
         changed: changed.clone(),
         snapshot: SnapshotFields {
+            adapter: adapter.into(),
             source: source.into(),
             url,
             raw_text: Some(raw_text),
@@ -280,7 +283,7 @@ mod tests {
             payload: serde_json::json!({
                 "dedupe_key": "tc:abc",
                 "identifiers": {"tc": "tc:abc"},
-                "source": "drop-in",
+                "adapter": "drop-in",
                 "raw_text": "body",
                 "extracted": {"title": "Engineer", "company": "Acme"}
             }),
@@ -295,6 +298,7 @@ mod tests {
             &LeadState::default(),
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
@@ -323,6 +327,7 @@ mod tests {
             &state,
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Senior Engineer"),
@@ -350,6 +355,7 @@ mod tests {
             &LeadState::default(),
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
@@ -382,6 +388,7 @@ mod tests {
             &state,
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body2".into(),
             extracted("Engineer"),
@@ -406,6 +413,7 @@ mod tests {
             &state,
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body2".into(),
             extracted("Engineer"),
@@ -432,6 +440,7 @@ mod tests {
             &LeadState::default(),
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
@@ -452,6 +461,7 @@ mod tests {
             &LeadState::default(),
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
@@ -481,6 +491,7 @@ mod tests {
             &LeadState::default(),
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
@@ -500,7 +511,7 @@ mod tests {
                 serde_json::json!({
                     "dedupe_key": "url:https://example.com/j",
                     "identifiers": {"url": "url:https://example.com/j"},
-                    "source": "drop-in",
+                    "adapter": "drop-in",
                     "raw_text": "body",
                     "extracted": {"title": "Engineer", "company": "Acme"}
                 })
@@ -536,6 +547,7 @@ mod tests {
             &state,
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
@@ -557,6 +569,7 @@ mod tests {
             &state,
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
@@ -582,6 +595,7 @@ mod tests {
             &state,
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),
@@ -607,6 +621,7 @@ mod tests {
             &state,
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/new".into()),
             "body".into(),
             extracted("Engineer"),
@@ -642,7 +657,7 @@ mod tests {
             payload: serde_json::json!({
                 "dedupe_key": "tc:abc",
                 "identifiers": {"tc": "tc:abc"},
-                "source": "drop-in",
+                "adapter": "drop-in",
                 "raw_text": "body",
                 "extracted": {"title": "Engineer", "company": "Acme"}
             }),
@@ -738,7 +753,7 @@ mod tests {
             payload: serde_json::json!({
                 "dedupe_key": "tc:abc",
                 "identifiers": {"tc": "tc:abc"},
-                "source": "drop-in",
+                "adapter": "drop-in",
                 "raw_text": "body v2",
                 "extracted": {"title": "Senior Engineer", "company": "Acme"}
             }),
@@ -770,7 +785,7 @@ mod tests {
             payload: serde_json::json!({
                 "dedupe_key": "tc:abc",
                 "identifiers": {"tc": "tc:abc"},
-                "source": "drop-in",
+                "adapter": "drop-in",
                 "raw_text": "body",
                 "extracted": {"title": "Engineer", "company": "Acme"}
             }),
@@ -788,6 +803,7 @@ mod tests {
             &state,
             &identity(),
             "drop-in",
+            "unknown",
             Some("https://example.com/j".into()),
             "body".into(),
             extracted("Engineer"),

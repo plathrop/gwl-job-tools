@@ -195,9 +195,12 @@ pub fn default_client() -> Result<HttpClient> {
 }
 
 /// The result of fetching and extracting a posting, ready for identity
-/// computation and the `ingested`/`updated` payload.
+/// computation and the `ingested`/`updated` payload. `adapter` is the
+/// extraction adapter (always known); `source` is the lead source
+/// (user-supplied, defaults to `unknown` and is set by the command layer).
 #[derive(Clone, Debug)]
 pub struct IngestOutcome {
+    pub adapter: String,
     pub source: String,
     pub url: Option<String>,
     pub raw_text: String,
@@ -254,7 +257,8 @@ async fn ingest_via_api<F: Fetcher>(
         );
     }
     Ok(IngestOutcome {
-        source: platform.source_name().into(),
+        adapter: platform.source_name().into(),
+        source: "unknown".into(),
         url: Some(url.to_string()),
         raw_text,
         extracted,
@@ -287,7 +291,8 @@ async fn ingest_via_html<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Resul
             // heuristic.
             extracted.comp = job.comp.or(extracted.comp);
             return Ok(IngestOutcome {
-                source: "drop-in".into(),
+                adapter: "drop-in".into(),
+                source: "unknown".into(),
                 url: Some(url.to_string()),
                 raw_text,
                 extracted,
@@ -307,7 +312,8 @@ async fn ingest_via_html<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Resul
         .as_deref()
         .and_then(extract::company_from_title);
     Ok(IngestOutcome {
-        source: "drop-in".into(),
+        adapter: "drop-in".into(),
+        source: "unknown".into(),
         url: Some(url.to_string()),
         raw_text,
         extracted,
@@ -354,7 +360,8 @@ pub fn ingest_file(path: &Path, content: &str) -> Result<IngestOutcome> {
         .as_deref()
         .and_then(extract::company_from_title);
     Ok(IngestOutcome {
-        source: "drop-in".into(),
+        adapter: "drop-in".into(),
+        source: "unknown".into(),
         url: None,
         raw_text,
         extracted,
@@ -510,7 +517,7 @@ mod tests {
 
         let outcome = ingest_url(&posting, &client).await.unwrap();
 
-        assert_eq!(outcome.source, "drop-in");
+        assert_eq!(outcome.adapter, "drop-in");
         let calls = client.fetcher.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(
@@ -619,7 +626,7 @@ mod tests {
             "Staff Engineer at Acme. Remote. Salary: $200,000 - $250,000. Req ID: R-12345.",
         )
         .unwrap();
-        assert_eq!(outcome.source, "drop-in");
+        assert_eq!(outcome.adapter, "drop-in");
         assert_eq!(outcome.url, None);
         assert_eq!(outcome.extracted.req_id.as_deref(), Some("R-12345"));
         assert_eq!(outcome.extracted.comp.unwrap().min, Some(200_000));
