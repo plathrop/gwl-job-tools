@@ -10,6 +10,7 @@ pub mod domain;
 pub mod event_store;
 pub mod ingest;
 pub mod projections;
+pub mod resume;
 pub mod telemetry;
 
 pub const APP_NAME: &str = "gwl-jobs";

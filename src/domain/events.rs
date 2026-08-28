@@ -193,6 +193,25 @@ pub struct RejectedPayload {
     pub revision: u64,
 }
 
+/// One dimension's contribution to a `scored` event (design doc 0001 §3).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DimensionScore {
+    pub name: String,
+    pub score: u64,
+    pub weight: f64,
+    pub confidence: f64,
+}
+
+/// A lead survived all gates and was scored (design doc 0001 §3).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ScoredPayload {
+    pub composite: u64,
+    /// Counts gate/score evaluations of this lead (re-ingests re-evaluate).
+    pub revision: u64,
+    pub dimensions: Vec<DimensionScore>,
+    pub breakdown: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReingestSuppressedPayload {
     pub dedupe_key: String,

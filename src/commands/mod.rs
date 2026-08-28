@@ -15,16 +15,26 @@ use crate::{
         gates::{self, GateFailure},
         identity::{self, compute_identity},
         lead::{self, IngestKind, LeadState},
+        scoring::{self, ScoreResult},
     },
     event_store::{EventStore, JsonlEventStore},
     ingest::{self, IngestOutcome},
     projections::{self, LeadRecord, Projection},
+    resume,
 };
 
 const EVENT_LOG_NAME: &str = "events.jsonl";
 
 #[instrument(skip_all)]
 pub async fn execute_ingest(args: IngestArgs, config: &Config, paths: &AppPaths) -> Result<()> {
+    // Load the resume before fetching: a configured-but-broken resume fails
+    // loudly before any network I/O (decision 0004).
+    let resume = resume::load(config.resume_path.as_deref())?;
+    let resume_skills = resume
+        .as_ref()
+        .map(resume::Resume::keywords)
+        .unwrap_or_default();
+
     // Fetch/extract *before* acquiring the single-writer lock: network waits
     // must not hold the lock (durability contract, design doc 0001 §1).
     let outcome = match (&args.url, &args.file) {
@@ -46,7 +56,7 @@ pub async fn execute_ingest(args: IngestArgs, config: &Config, paths: &AppPaths)
     let events = store.replay()?;
     let projection = projections::rebuild(&events)?;
 
-    let summary = record_ingest(&mut store, &projection, config, outcome)?;
+    let summary = record_ingest(&mut store, &projection, config, &resume_skills, outcome)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&summary).into_diagnostic()?
@@ -61,6 +71,7 @@ pub fn record_ingest(
     store: &mut impl EventStore,
     projection: &Projection,
     config: &Config,
+    resume_skills: &[String],
     outcome: IngestOutcome,
 ) -> Result<IngestSummary> {
     // Store the canonical URL (tracking params stripped) so re-ingests via
@@ -94,11 +105,23 @@ pub fn record_ingest(
 
     // Gates evaluate the new snapshot; failures become `rejected` events in
     // the same batch as the snapshot event (suppressed re-ingests skip
-    // gating entirely, per the durable-ignore rule).
-    let gate_failures = if state.latest_mark.as_deref() == Some("ignore") {
+    // gating entirely, per the durable-ignore rule). A gate-passing
+    // evaluation is scored; `scored` is the pass-marker (decision 0006).
+    let suppressed = state.latest_mark.as_deref() == Some("ignore");
+    let gate_failures = if suppressed {
         Vec::new()
     } else {
         gates::evaluate(config, &outcome.extracted, &outcome.raw_text)
+    };
+    let score = if !suppressed && gate_failures.is_empty() {
+        Some(scoring::score(
+            config,
+            &outcome.extracted,
+            &outcome.raw_text,
+            resume_skills,
+        ))
+    } else {
+        None
     };
 
     let (kind, pending) = lead::decide_ingest(
@@ -109,6 +132,7 @@ pub fn record_ingest(
         outcome.raw_text,
         outcome.extracted.clone(),
         gate_failures.clone(),
+        score.clone(),
     )?;
 
     let stream = LeadState::stream_id(lead_id);
@@ -136,6 +160,7 @@ pub fn record_ingest(
         } else {
             Some(gate_failures)
         },
+        score,
         dedupe_key: identity.dedupe_key,
         source: outcome.source,
         url: canonical_url,
@@ -150,6 +175,7 @@ pub struct IngestSummary {
     pub kind: &'static str,
     pub changed: Option<Vec<String>>,
     pub rejected: Option<Vec<GateFailure>>,
+    pub score: Option<ScoreResult>,
     pub dedupe_key: String,
     pub source: String,
     pub url: Option<String>,
@@ -221,6 +247,7 @@ mod tests {
             &mut store,
             &projection,
             &Config::default(),
+            &[],
             outcome("totally unstructured body"),
         )
         .unwrap();
@@ -232,6 +259,7 @@ mod tests {
             &mut store,
             &projection,
             &Config::default(),
+            &[],
             outcome("totally unstructured body"),
         )
         .unwrap();
@@ -246,12 +274,14 @@ mod tests {
         let (mut store, projection) = store_and_projection(&dir);
         let mut with_url = outcome("body");
         with_url.url = Some("https://example.com/job/1".into());
-        let first = record_ingest(&mut store, &projection, &Config::default(), with_url).unwrap();
+        let first =
+            record_ingest(&mut store, &projection, &Config::default(), &[], with_url).unwrap();
 
         let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let mut tagged = outcome("body");
         tagged.url = Some("https://example.com/job/1?utm_source=newsletter".into());
-        let second = record_ingest(&mut store, &projection, &Config::default(), tagged).unwrap();
+        let second =
+            record_ingest(&mut store, &projection, &Config::default(), &[], tagged).unwrap();
 
         assert_eq!(second.kind, "updated");
         assert_eq!(second.changed, Some(vec![]));
@@ -266,13 +296,26 @@ mod tests {
         let (mut store, projection) = store_and_projection(&dir);
         let mut first_outcome = outcome("body v1");
         first_outcome.url = Some("https://example.com/job/1".into());
-        record_ingest(&mut store, &projection, &Config::default(), first_outcome).unwrap();
+        record_ingest(
+            &mut store,
+            &projection,
+            &Config::default(),
+            &[],
+            first_outcome,
+        )
+        .unwrap();
 
         let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let mut second_outcome = outcome("body v2");
         second_outcome.url = Some("https://example.com/job/1".into());
-        let second =
-            record_ingest(&mut store, &projection, &Config::default(), second_outcome).unwrap();
+        let second = record_ingest(
+            &mut store,
+            &projection,
+            &Config::default(),
+            &[],
+            second_outcome,
+        )
+        .unwrap();
 
         assert_eq!(second.changed, Some(vec!["raw_text".to_string()]));
     }
@@ -285,7 +328,7 @@ mod tests {
         for _ in 0..count {
             let mut outcome = outcome("body");
             outcome.url = Some(format!("https://example.com/{}", Uuid::now_v7()));
-            record_ingest(&mut store, &projection, &Config::default(), outcome).unwrap();
+            record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
             projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         }
         projection
@@ -331,7 +374,7 @@ mod tests {
         outcome.extracted.company = Some("Acme".into());
         outcome.extracted.title = Some("Engineer".into());
 
-        let summary = record_ingest(&mut store, &projection, &config, outcome).unwrap();
+        let summary = record_ingest(&mut store, &projection, &config, &[], outcome).unwrap();
 
         assert_eq!(summary.kind, "ingested");
         let rejections = summary.rejected.unwrap();
@@ -367,7 +410,7 @@ mod tests {
         let mut onsite = outcome("body");
         onsite.url = Some("https://example.com/job/1".into());
         onsite.extracted.remote = Some(false);
-        let first = record_ingest(&mut store, &projection, &config, onsite).unwrap();
+        let first = record_ingest(&mut store, &projection, &config, &[], onsite).unwrap();
         assert!(first.rejected.is_some());
 
         // Repost: same job, now marked remote.
@@ -375,7 +418,7 @@ mod tests {
         let mut repost = outcome("body");
         repost.url = Some("https://example.com/job/1".into());
         repost.extracted.remote = Some(true);
-        let second = record_ingest(&mut store, &projection, &config, repost).unwrap();
+        let second = record_ingest(&mut store, &projection, &config, &[], repost).unwrap();
         assert_eq!(second.kind, "updated");
         assert!(second.rejected.is_none());
 
@@ -397,7 +440,7 @@ mod tests {
         let mut onsite = outcome("body");
         onsite.url = Some("https://example.com/job/1".into());
         onsite.extracted.remote = Some(false);
-        let first = record_ingest(&mut store, &projection, &config, onsite).unwrap();
+        let first = record_ingest(&mut store, &projection, &config, &[], onsite).unwrap();
         assert_eq!(first.rejected.unwrap()[0].gate.as_str(), "remote-only");
 
         // Repost: now remote, but comp below floor — the rejection should
@@ -413,7 +456,7 @@ mod tests {
             period: "year".into(),
             raw: "$120,000 - $140,000".into(),
         });
-        let second = record_ingest(&mut store, &projection, &config, repost).unwrap();
+        let second = record_ingest(&mut store, &projection, &config, &[], repost).unwrap();
         assert_eq!(
             second.rejected.unwrap()[0].gate.as_str(),
             "compensation-floor"
@@ -446,7 +489,7 @@ mod tests {
         let outcome = crate::ingest::ingest_file(std::path::Path::new("jd.html"), html).unwrap();
         assert_eq!(outcome.extracted.company.as_deref(), Some("Salesforce"));
 
-        let summary = record_ingest(&mut store, &projection, &config, outcome).unwrap();
+        let summary = record_ingest(&mut store, &projection, &config, &[], outcome).unwrap();
         let rejections = summary.rejected.unwrap();
         assert_eq!(rejections[0].gate.as_str(), "blacklist");
     }
@@ -464,14 +507,22 @@ mod tests {
         outcome.extracted.title = Some("Staff Engineer".into());
         outcome.extracted.company = Some("Acme".into());
         outcome.extracted.req_id = Some("R-9".into());
-        let summary = record_ingest(&mut store, &projection, &Config::default(), outcome).unwrap();
+        let summary =
+            record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
 
         let replayed = store.replay().unwrap();
-        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed.len(), 2);
         assert_eq!(replayed[0].seq, 1);
+        assert_eq!(replayed[0].event_type, "ingested");
+        assert_eq!(replayed[1].seq, 2);
+        assert_eq!(replayed[1].event_type, "scored");
         let projection = projections::rebuild(&replayed).unwrap();
         let record = projection.leads.get(&summary.lead_id).unwrap();
         assert_eq!(record.extracted.title.as_deref(), Some("Staff Engineer"));
         assert_eq!(record.dedupe_key.as_deref(), Some("req:acme:r-9"));
+        // The scored event is projected as the latest score (level 100 +
+        // remote 50, equal weights → 75).
+        let score = record.latest_score.as_ref().unwrap();
+        assert_eq!(score.composite, 75);
     }
 }
