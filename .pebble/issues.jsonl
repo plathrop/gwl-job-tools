@@ -172,3 +172,4 @@
 {"type":"close","issueId":"GWLJ-e0ysa7","timestamp":"2026-08-28T22:53:33.994Z","data":{"reason":"Merged in PR #9: extract_years prefers experience-adjacent mentions (max), falls back to first."},"source":"gwl-job-tools"}
 {"type":"close","issueId":"GWLJ-mmeajy","timestamp":"2026-08-28T22:53:34.752Z","data":{"reason":"Merged in PR #9: --source lead source added; source→adapter rename (no upcaster, pre-release)."},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-1lxx3e","timestamp":"2026-08-28T22:53:52.378Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-1lxx3e","timestamp":"2026-08-28T23:01:24.619Z","data":{"text":"PR #10: list + mark + reviewed + projection + apply-automatically package core. 250 tests.","timestamp":"2026-08-28T23:01:24.619Z"},"source":"gwl-job-tools"}
