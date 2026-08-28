@@ -10,6 +10,18 @@ use tracing::instrument;
 
 use crate::APP_NAME;
 
+/// Expand a leading `~` to the home directory (the common CLI convention).
+/// Paths without a leading `~` are returned unchanged.
+fn expand_tilde(path: &Path) -> PathBuf {
+    let Ok(rest) = path.strip_prefix("~") else {
+        return path.to_path_buf();
+    };
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.to_path_buf();
+    };
+    PathBuf::from(home).join(rest)
+}
+
 /// Log verbosity. Config key `log_level` (default `error`); the CLI
 /// `--log-level` flag overrides config. Precedence: CLI > config >
 /// `RUST_LOG` > `error` (decision 0005).
@@ -102,7 +114,7 @@ impl Config {
     #[instrument]
     pub fn load(paths: &AppPaths) -> Result<Self> {
         let path = paths.config_dir().join(Self::FILE_NAME);
-        let config = match std::fs::read_to_string(&path) {
+        let mut config = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("parsing {}", path.display()))?,
@@ -113,8 +125,18 @@ impl Config {
                     .wrap_err_with(|| format!("reading {}", path.display()));
             }
         };
+        config.expand_tildes();
         config.validate()?;
         Ok(config)
+    }
+
+    /// Expand a leading `~` in the path-valued fields (resume, cover letter,
+    /// log file) so `resume_path = "~/resume.json"` resolves to the home
+    /// directory.
+    fn expand_tildes(&mut self) {
+        self.resume_path = self.resume_path.as_deref().map(expand_tilde);
+        self.cover_letter_path = self.cover_letter_path.as_deref().map(expand_tilde);
+        self.log_file = self.log_file.as_deref().map(expand_tilde);
     }
 
     /// Reject invalid configurations that would silently corrupt rankings:
@@ -258,16 +280,34 @@ compensation = 0.4
             Some("Kubernetes")
         );
         assert_eq!(config.scoring_weights.compensation, 0.4);
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
         assert_eq!(
-            config.cover_letter_path.as_deref(),
-            Some(Path::new("~/letters/generic.pdf"))
+            config.cover_letter_path,
+            Some(home.join("letters/generic.pdf"))
         );
         assert!(config.target_companies.is_empty());
         assert_eq!(config.log_level, Some(LogLevel::Debug));
-        assert_eq!(
-            config.log_file.as_deref(),
-            Some(Path::new("~/logs/gwl.log"))
-        );
+        assert_eq!(config.log_file, Some(home.join("logs/gwl.log")));
+    }
+
+    #[test]
+    fn tilde_paths_expand_to_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(Config::FILE_NAME),
+            "resume_path = \"~/resume.json\"\n",
+        )
+        .unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
+        assert_eq!(config.resume_path, Some(home.join("resume.json")));
     }
 
     #[test]
