@@ -101,3 +101,4 @@
 {"type":"update","issueId":"GWLJ-gn9b2k","timestamp":"2026-08-28T03:08:30.377Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
 {"type":"comment","issueId":"GWLJ-gn9b2k","timestamp":"2026-08-28T03:13:33.231Z","data":{"text":"PR #6 opened: https://github.com/plathrop/gwl-job-tools/pull/6","timestamp":"2026-08-28T03:13:33.231Z"},"source":"gwl-job-tools"}
 {"type":"close","issueId":"GWLJ-gn9b2k","timestamp":"2026-08-28T03:26:49.891Z","data":{"reason":"Merged in PR #6: file sink + configurable level (default error), CLI --log-level override, RUST_LOG fallback; decision records 0004/0005"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-1hp1r6","timestamp":"2026-08-28T03:27:13.283Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
