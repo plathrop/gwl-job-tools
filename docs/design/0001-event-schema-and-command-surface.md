@@ -483,8 +483,8 @@ Supersedes and removes the placeholder `lead open|list|close`.
 
 `<lead>` addressing: unambiguous UUID prefix of the `lead_id`. The review
 loop needs no addressing. Conventions carried forward: clap subcommands,
-miette errors (unimplemented commands `bail!` loudly), tracing with logs on
-stderr and command output on stdout.
+miette errors (unimplemented commands `bail!` loudly), tracing with logs to
+a file (decision 0005) and command output on stdout.
 
 ## 9. Module layout
 
