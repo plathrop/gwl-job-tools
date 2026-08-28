@@ -53,6 +53,10 @@ static REQ_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
     )
     .expect("static regex compiles")
 });
+static JSON_LD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<script[^>]*type\s*=\s*["']application/ld\+json["'][^>]*>(.*?)</script>"#)
+        .expect("static regex compiles")
+});
 
 /// Convert an HTML fragment (e.g. an API-returned description body) to
 /// plain text for `raw_text` and regex extraction.
@@ -74,6 +78,123 @@ pub fn extract_main_text(html: &str, url: &Url) -> Result<(Option<String>, Strin
         Some(article.title.trim().to_string())
     };
     Ok((title, html_to_text(&article.content)))
+}
+
+/// A structured job posting extracted from JSON-LD (`<script
+/// type="application/ld+json">`). Many boards embed this for SEO even when
+/// the visible page is JS-rendered (Ashby, and others).
+pub struct JsonLdJobPosting {
+    pub title: String,
+    pub description_html: String,
+    pub company: Option<String>,
+    pub location: Option<String>,
+    pub req_id: Option<String>,
+    pub remote: Option<bool>,
+}
+
+/// Extract a `JobPosting` from any JSON-LD script tag in the page. Returns
+/// `None` when no usable posting is found (caller falls back to readability).
+pub fn extract_json_ld(html: &str) -> Option<JsonLdJobPosting> {
+    for caps in JSON_LD_RE.captures_iter(html) {
+        let raw = caps.get(1)?.as_str();
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            continue;
+        };
+        if let Some(job) = find_job_posting(&value) {
+            return Some(job);
+        }
+    }
+    None
+}
+
+fn find_job_posting(value: &serde_json::Value) -> Option<JsonLdJobPosting> {
+    // JSON-LD may be a single object, an array, or a `@graph` array.
+    let candidates: Vec<&serde_json::Value> = match value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(map) => {
+            if let Some(graph) = map.get("@graph").and_then(serde_json::Value::as_array) {
+                graph.iter().collect()
+            } else {
+                vec![value]
+            }
+        }
+        _ => return None,
+    };
+    for candidate in candidates {
+        if !is_job_posting(candidate) {
+            continue;
+        }
+        let title = candidate.get("title").and_then(serde_json::Value::as_str)?;
+        return Some(JsonLdJobPosting {
+            title: title.to_string(),
+            description_html: candidate
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            company: candidate
+                .get("hiringOrganization")
+                .and_then(|o| o.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            location: extract_json_ld_location(candidate),
+            req_id: candidate
+                .get("identifier")
+                .and_then(|i| i.get("value"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            remote: extract_json_ld_remote(candidate),
+        });
+    }
+    None
+}
+
+fn is_job_posting(value: &serde_json::Value) -> bool {
+    match value.get("@type") {
+        Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("JobPosting"),
+        Some(serde_json::Value::Array(items)) => items.iter().any(|i| {
+            i.as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("JobPosting"))
+        }),
+        _ => false,
+    }
+}
+
+fn extract_json_ld_location(job: &serde_json::Value) -> Option<String> {
+    let loc = job.get("jobLocation")?;
+    match loc {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(_) => {
+            let addr = loc.get("address")?;
+            match addr {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(_) => {
+                    let parts: Vec<&str> = ["addressLocality", "addressRegion", "addressCountry"]
+                        .iter()
+                        .filter_map(|k| addr.get(*k).and_then(serde_json::Value::as_str))
+                        .collect();
+                    if parts.is_empty() {
+                        None
+                    } else {
+                        Some(parts.join(", "))
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extract_json_ld_remote(job: &serde_json::Value) -> Option<bool> {
+    let t = job
+        .get("jobLocationType")
+        .and_then(serde_json::Value::as_str)?;
+    match t.to_ascii_uppercase().as_str() {
+        "TELECOMMUTE" => Some(true),
+        "ONSITE" | "HYBRID" => Some(false),
+        _ => None,
+    }
 }
 
 /// Best-effort structured fields from plain text (and optional location
@@ -477,6 +598,37 @@ mod tests {
         assert!(text.contains("Body"));
         assert!(text.contains("text"));
         assert!(!text.contains("<b>"));
+    }
+
+    #[test]
+    fn extract_json_ld_job_posting() {
+        let html = r#"<html><head><title>Shell</title></head><body>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org/","@type":"JobPosting",
+             "title":"Principal Backend Engineer, Hub (US East Coast)",
+             "description":"<p>We are hiring a <strong>Principal Backend Engineer</strong>.</p>",
+             "hiringOrganization":{"@type":"Organization","name":"Docker"},
+             "jobLocation":{"@type":"Place","address":{"@type":"PostalAddress","addressCountry":"United States"}},
+             "identifier":{"@type":"PropertyValue","name":"Docker","value":"9d5c3e18-eaef-4ffb-b4f1-795742fcba98"},
+             "jobLocationType":"TELECOMMUTE"}
+            </script>
+            </body></html>"#;
+        let job = extract_json_ld(html).unwrap();
+        assert_eq!(job.title, "Principal Backend Engineer, Hub (US East Coast)");
+        assert_eq!(job.company.as_deref(), Some("Docker"));
+        assert_eq!(
+            job.req_id.as_deref(),
+            Some("9d5c3e18-eaef-4ffb-b4f1-795742fcba98")
+        );
+        assert_eq!(job.location.as_deref(), Some("United States"));
+        assert_eq!(job.remote, Some(true));
+        assert!(job.description_html.contains("Principal Backend Engineer"));
+    }
+
+    #[test]
+    fn extract_json_ld_returns_none_without_posting() {
+        let html = r#"<html><body><p>No JSON-LD here.</p></body></html>"#;
+        assert!(extract_json_ld(html).is_none());
     }
 
     #[test]
