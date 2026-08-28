@@ -271,6 +271,43 @@ compensation = 0.4
         assert!(Config::load(&paths).is_err());
     }
 
+    #[test]
+    fn ceiling_at_or_below_floor_is_rejected() {
+        // A misconfigured comp range is invalid configuration, not missing
+        // posting data: today the comp dimension silently drops out as
+        // "unknown" and every ranking changes. Fail loudly at load.
+        for (floor, ceiling) in [(300_000u64, 180_000u64), (200_000, 200_000)] {
+            let dir = tempfile::tempdir().unwrap();
+            let config_dir = dir.path().join("config");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(
+                config_dir.join(Config::FILE_NAME),
+                format!("compensation_floor = {floor}\ncompensation_ceiling = {ceiling}\n"),
+            )
+            .unwrap();
+            let paths = AppPaths::new(config_dir, dir.path().join("data"));
+            assert!(
+                Config::load(&paths).is_err(),
+                "floor={floor} ceiling={ceiling} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_scoring_weight_is_rejected() {
+        // Negative weights can push the composite outside the 0–100 contract.
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(Config::FILE_NAME),
+            "[scoring_weights]\nlevel = -0.5\n",
+        )
+        .unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        assert!(Config::load(&paths).is_err());
+    }
+
     // ── LogLevel ────────────────────────────────────────────────
 
     #[test]

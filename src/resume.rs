@@ -119,4 +119,31 @@ mod tests {
         let resume = load(Some(&path)).unwrap().unwrap();
         assert!(resume.keywords().is_empty());
     }
+
+    #[test]
+    fn keywords_are_deduplicated_case_insensitively() {
+        // Regression: a keyword repeated across skill groups is counted once
+        // per copy by the skills dimension, inflating the score. The dedupe
+        // belongs in the flattened keyword list so every consumer sees it.
+        let resume = Resume {
+            skills: vec![
+                Skill {
+                    keywords: vec!["Kubernetes".into()],
+                    ..Default::default()
+                },
+                Skill {
+                    keywords: vec!["kubernetes".into(), "Terraform".into()],
+                    ..Default::default()
+                },
+            ],
+        };
+        let keywords = resume.keywords();
+        assert_eq!(keywords.len(), 2);
+        assert!(
+            keywords
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case("kubernetes"))
+        );
+        assert!(keywords.iter().any(|k| k == "Terraform"));
+    }
 }

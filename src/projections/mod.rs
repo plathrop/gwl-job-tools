@@ -294,6 +294,18 @@ mod tests {
         })
     }
 
+    fn scored_payload(composite: u64, revision: u64) -> Value {
+        serde_json::json!({
+            "composite": composite,
+            "revision": revision,
+            "dimensions": [
+                {"name": "level", "score": 100, "weight": 1.0, "confidence": 1.0},
+                {"name": "remote", "score": 50, "weight": 1.0, "confidence": 1.0}
+            ],
+            "breakdown": format!("{composite} = 0.5·level(100) + 0.5·remote(50)")
+        })
+    }
+
     // ── rebuild ──────────────────────────────────────────────────
 
     #[test]
@@ -356,6 +368,98 @@ mod tests {
         let record = projection.leads.get(&lead_id).unwrap();
         assert_eq!(record.extracted.title.as_deref(), Some("Senior Engineer"));
         assert_eq!(record.event_count, 2);
+    }
+
+    // ── scored projection (decision 0006) ─────────────────────────
+
+    #[test]
+    fn snapshot_invalidates_stale_score() {
+        // `scored` is the pass-marker: a new snapshot whose scored event was
+        // torn off by a crash mid-batch must not present the lead as passing
+        // on an old score. Mirrors the latest_rejection clearing above.
+        let lead_id = Uuid::now_v7();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(lead_id, 2, event_type::SCORED, scored_payload(75, 1)),
+            envelope(
+                lead_id,
+                3,
+                event_type::UPDATED,
+                serde_json::json!({
+                    "dedupe_key": "url:https://example.com/j",
+                    "identifiers": {"url": "url:https://example.com/j"},
+                    "changed": ["title"],
+                    "source": "drop-in",
+                    "raw_text": "body2",
+                    "extracted": {"title": "Senior Engineer", "company": "Acme"}
+                }),
+            ),
+        ];
+        let projection = rebuild(&events).unwrap();
+        let record = projection.leads.get(&lead_id).unwrap();
+        assert!(record.latest_score.is_none());
+    }
+
+    #[test]
+    fn snapshot_then_scored_sets_current_score() {
+        // Intact batch: the scored event after the snapshot restores the
+        // marker; on re-evaluation the latest revision wins.
+        let lead_id = Uuid::now_v7();
+        let updated = serde_json::json!({
+            "dedupe_key": "url:https://example.com/j",
+            "identifiers": {"url": "url:https://example.com/j"},
+            "changed": ["title"],
+            "source": "drop-in",
+            "raw_text": "body2",
+            "extracted": {"title": "Senior Engineer", "company": "Acme"}
+        });
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(lead_id, 2, event_type::SCORED, scored_payload(75, 1)),
+            envelope(lead_id, 3, event_type::UPDATED, updated),
+            envelope(lead_id, 4, event_type::SCORED, scored_payload(80, 2)),
+        ];
+        let projection = rebuild(&events).unwrap();
+        let score = projection
+            .leads
+            .get(&lead_id)
+            .unwrap()
+            .latest_score
+            .as_ref()
+            .unwrap();
+        assert_eq!(score.revision, 2);
+        assert_eq!(score.composite, 80);
+    }
+
+    #[test]
+    fn malformed_scored_payload_is_hard_error() {
+        // Strict, like the ingest payloads: corruption is not a None.
+        let lead_id = Uuid::now_v7();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(
+                lead_id,
+                2,
+                event_type::SCORED,
+                serde_json::json!({"composite": "high"}),
+            ),
+        ];
+        assert!(rebuild(&events).is_err());
     }
 
     // ── lookup precedence (design doc §2) ────────────────────────
