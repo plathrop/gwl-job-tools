@@ -122,3 +122,7 @@
 {"type":"create","issueId":"GWLJ-498xbl","timestamp":"2026-08-28T19:46:59.394Z","data":{"title":"Track recruiter/referer identity","type":"task","priority":4,"description":"Later: track who the recruiter or referer is (name/company), not just the source enum. Design for a source_detail (or recruiter_name/referer_name) field on the ingested event. Depends on the lead source (--source) increment (GWLJ-mmeajy)."},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-mmeajy","timestamp":"2026-08-28T19:47:00.182Z","data":{"relatedTo":["GWLJ-wbpv13"]},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-wbpv13","timestamp":"2026-08-28T19:47:00.182Z","data":{"relatedTo":["GWLJ-mmeajy"]},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-mmeajy","timestamp":"2026-08-28T19:47:19.678Z","data":{"relatedTo":[]},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-wbpv13","timestamp":"2026-08-28T19:47:19.678Z","data":{"relatedTo":[]},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-mmeajy","timestamp":"2026-08-28T19:47:20.430Z","data":{"relatedTo":["GWLJ-498xbl"]},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-498xbl","timestamp":"2026-08-28T19:47:20.430Z","data":{"relatedTo":["GWLJ-mmeajy"]},"source":"gwl-job-tools"}
