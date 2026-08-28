@@ -5,7 +5,11 @@ use miette::Result;
 use tracing::instrument;
 use url::Url;
 
-use crate::{APP_NAME, commands, telemetry::TelemetryStatus};
+use crate::{
+    APP_NAME, commands,
+    config::{AppPaths, Config, LogLevel},
+    telemetry::TelemetryStatus,
+};
 
 #[derive(Clone, Debug, Args)]
 pub struct IngestArgs {
@@ -48,6 +52,10 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "off")]
     pub telemetry: TelemetryStatus,
 
+    /// Override the log level from config (default: error)
+    #[arg(long, value_enum)]
+    pub log_level: Option<LogLevel>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -66,11 +74,11 @@ impl Cli {
     }
 }
 
-#[instrument(skip(command), fields(command = cmd_label(&command)))]
-pub async fn execute(command: Option<Commands>) -> Result<()> {
+#[instrument(skip(command, config, paths), fields(command = cmd_label(&command)))]
+pub async fn execute(command: Option<Commands>, config: &Config, paths: &AppPaths) -> Result<()> {
     match command {
-        Some(Commands::Ingest(args)) => commands::execute_ingest(args).await,
-        Some(Commands::Show(args)) => commands::execute_show(args).await,
+        Some(Commands::Ingest(args)) => commands::execute_ingest(args, config, paths).await,
+        Some(Commands::Show(args)) => commands::execute_show(args, paths).await,
         Some(Commands::Completion) => Err(miette::miette!("completion is not yet implemented")),
         None => Err(miette::miette!(
             "no command provided; run `{APP_NAME} --help`"
@@ -162,8 +170,21 @@ mod tests {
                 color: ColorChoice::Auto,
             },
             telemetry: TelemetryStatus::Off,
+            log_level: None,
             command: None,
         };
         assert_eq!(cli.command_name(), "none");
+    }
+
+    #[test]
+    fn parse_log_level() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "--log-level", "debug", "show", "abc"]).unwrap();
+        assert_eq!(cli.log_level, Some(LogLevel::Debug));
+    }
+
+    #[test]
+    fn parse_log_level_defaults_to_none() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "show", "abc"]).unwrap();
+        assert_eq!(cli.log_level, None);
     }
 }

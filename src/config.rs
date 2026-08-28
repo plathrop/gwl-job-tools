@@ -10,10 +10,37 @@ use tracing::instrument;
 
 use crate::APP_NAME;
 
+/// Log verbosity. Config key `log_level` (default `error`); the CLI
+/// `--log-level` flag overrides config. Precedence: CLI > config >
+/// `RUST_LOG` > `error` (decision 0005).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    #[default]
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    /// The `tracing` directive string for this level (e.g. `"error"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+        }
+    }
+}
+
 /// TOML config (spec: comp floor + ceiling, remote-only flag, blacklist,
-/// alias table, scoring weights, generic-letter path, target-companies).
-/// Gates and scoring consume these from Increment 2 onward; the full key
-/// set parses now.
+/// alias table, scoring weights, generic-letter path, target-companies,
+/// logging). Gates and scoring consume these from Increment 2 onward; the
+/// full key set parses now.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -34,6 +61,12 @@ pub struct Config {
     /// filter list over posting text; the CONTENT is deferred to the later
     /// LLM scorer (ship empty).
     pub ideological_red_lines: Vec<String>,
+    /// Log verbosity (decision 0005). `None` = not configured; the
+    /// effective default is `error` (see `LogLevel`).
+    pub log_level: Option<LogLevel>,
+    /// Log file path (decision 0005). `None` = default to
+    /// `<data_dir>/gwl-jobs.log`.
+    pub log_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -154,6 +187,8 @@ mod tests {
         assert_eq!(config.scoring_weights.skills, 1.0);
         assert_eq!(config.scoring_weights.compensation, 1.0);
         assert_eq!(config.scoring_weights.remote, 1.0);
+        assert!(config.log_level.is_none());
+        assert!(config.log_file.is_none());
     }
 
     #[test]
@@ -170,6 +205,8 @@ remote_only = true
 blacklist = ["salesforce"]
 cover_letter_path = "~/letters/generic.pdf"
 target_companies = []
+log_level = "debug"
+log_file = "~/logs/gwl.log"
 
 [aliases]
 K8s = "Kubernetes"
@@ -197,6 +234,11 @@ compensation = 0.4
             Some(Path::new("~/letters/generic.pdf"))
         );
         assert!(config.target_companies.is_empty());
+        assert_eq!(config.log_level, Some(LogLevel::Debug));
+        assert_eq!(
+            config.log_file.as_deref(),
+            Some(Path::new("~/logs/gwl.log"))
+        );
     }
 
     #[test]
@@ -224,5 +266,43 @@ compensation = 0.4
         .unwrap();
         let paths = AppPaths::new(config_dir, dir.path().join("data"));
         assert!(Config::load(&paths).is_err());
+    }
+
+    // ── LogLevel ────────────────────────────────────────────────
+
+    #[test]
+    fn log_level_parses_lowercase() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        for (text, expected) in [
+            ("error", LogLevel::Error),
+            ("warn", LogLevel::Warn),
+            ("info", LogLevel::Info),
+            ("debug", LogLevel::Debug),
+            ("trace", LogLevel::Trace),
+        ] {
+            std::fs::write(
+                config_dir.join(Config::FILE_NAME),
+                format!("log_level = \"{text}\"\n"),
+            )
+            .unwrap();
+            let paths = AppPaths::new(config_dir.clone(), dir.path().join("data"));
+            assert_eq!(Config::load(&paths).unwrap().log_level, Some(expected));
+        }
+    }
+
+    #[test]
+    fn log_level_as_str_matches_tracing_directives() {
+        assert_eq!(LogLevel::Error.as_str(), "error");
+        assert_eq!(LogLevel::Warn.as_str(), "warn");
+        assert_eq!(LogLevel::Info.as_str(), "info");
+        assert_eq!(LogLevel::Debug.as_str(), "debug");
+        assert_eq!(LogLevel::Trace.as_str(), "trace");
+    }
+
+    #[test]
+    fn log_level_default_is_error() {
+        assert_eq!(LogLevel::default(), LogLevel::Error);
     }
 }

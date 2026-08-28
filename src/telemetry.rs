@@ -1,11 +1,10 @@
+use std::{fs::OpenOptions, path::Path, sync::Mutex};
+
 use clap::ValueEnum;
-use miette::Result;
-#[cfg(any(test, feature = "telemetry"))]
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::{registry, util::SubscriberInitExt};
+use miette::{Context, IntoDiagnostic, Result};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, registry, util::SubscriberInitExt};
 #[cfg(feature = "telemetry")]
 use {
-    miette::IntoDiagnostic,
     opentelemetry::{KeyValue, global, trace::TracerProvider as _},
     opentelemetry_otlp::{SpanExporter, WithExportConfig},
     opentelemetry_sdk::{
@@ -16,8 +15,9 @@ use {
     std::time::Duration,
     tracing::debug,
     tracing_opentelemetry::OpenTelemetryLayer,
-    tracing_subscriber::{fmt, layer::SubscriberExt},
 };
+
+use crate::config::LogLevel;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum TelemetryStatus {
@@ -44,20 +44,51 @@ impl TelemetryGuard {
     }
 }
 
-pub fn init_telemetry(target: TelemetryStatus, name: &str) -> Result<TelemetryGuard> {
+pub fn init_telemetry(
+    target: TelemetryStatus,
+    name: &str,
+    log_level: Option<LogLevel>,
+    log_path: &Path,
+) -> Result<TelemetryGuard> {
+    // Open the log file (append) before building the subscriber. A
+    // configured path that can't be opened is a config error, not a silent
+    // degradation (decision 0005).
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("creating log dir {}", parent.display()))?;
+    }
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("opening log file {}", log_path.display()))?;
+
+    let fmt_layer = fmt::layer()
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(Mutex::new(log_file));
+
     match target {
         TelemetryStatus::Off => {
             let _ = name;
-            registry().init();
+            registry()
+                .with(env_filter(log_level))
+                .with(fmt_layer)
+                .init();
             Ok(TelemetryGuard::NoProvider)
         }
         #[cfg(feature = "telemetry")]
         TelemetryStatus::On => {
             // Install a temporary subscriber so debug! calls in
-            // build_otlp_provider are captured before the real subscriber is up.
+            // build_otlp_provider are captured before the real subscriber is
+            // up. It writes to stderr: a transient debugging aid active only
+            // during provider construction, and only emitting at debug level
+            // (the default error level filters it out).
             let _temp_guard = tracing::subscriber::set_default(
                 registry()
-                    .with(env_filter())
+                    .with(env_filter(log_level))
                     .with(fmt::layer().with_target(false).with_writer(std::io::stderr)),
             );
 
@@ -68,8 +99,8 @@ pub fn init_telemetry(target: TelemetryStatus, name: &str) -> Result<TelemetryGu
             let telemetry_layer: OpenTelemetryLayer<_, SdkTracer> = OpenTelemetryLayer::new(tracer);
 
             registry()
-                .with(env_filter())
-                .with(fmt::layer().with_target(false).with_writer(std::io::stderr))
+                .with(env_filter(log_level))
+                .with(fmt_layer)
                 .with(telemetry_layer)
                 .init();
 
@@ -78,9 +109,13 @@ pub fn init_telemetry(target: TelemetryStatus, name: &str) -> Result<TelemetryGu
     }
 }
 
-#[cfg(any(test, feature = "telemetry"))]
-fn env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+/// Resolve the `tracing` filter: an explicit level (CLI or config) wins;
+/// otherwise honor `RUST_LOG`, falling back to `error` (decision 0005).
+fn env_filter(log_level: Option<LogLevel>) -> EnvFilter {
+    match log_level {
+        Some(level) => EnvFilter::new(level.as_str()),
+        None => EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("error")),
+    }
 }
 
 #[cfg(feature = "telemetry")]
@@ -157,9 +192,23 @@ mod tests {
 
     #[test]
     fn env_filter_returns_a_filter() {
-        // The function always returns an EnvFilter (falls back to "info" if
+        // The function always returns an EnvFilter (falls back to "error" if
         // RUST_LOG is unset). We just verify it doesn't panic.
-        let _filter = env_filter();
+        let _filter = env_filter(None);
+    }
+
+    #[test]
+    fn env_filter_explicit_level_maps_to_level_filter() {
+        use tracing_subscriber::filter::LevelFilter;
+        for (level, expected) in [
+            (LogLevel::Error, LevelFilter::ERROR),
+            (LogLevel::Warn, LevelFilter::WARN),
+            (LogLevel::Info, LevelFilter::INFO),
+            (LogLevel::Debug, LevelFilter::DEBUG),
+            (LogLevel::Trace, LevelFilter::TRACE),
+        ] {
+            assert_eq!(env_filter(Some(level)).max_level_hint(), Some(expected));
+        }
     }
 
     // ── TelemetryStatus (via clap) ────────────────────────────────
