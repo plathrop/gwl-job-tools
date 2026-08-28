@@ -346,6 +346,10 @@ re-marking emits a new event.
 }
 ```
 
+`url` is absent for file drops (no posting URL to open). `resume_path` is
+the resume PDF, derived from the configured JSON resume path (`.json` →
+`.pdf`).
+
 ### Outcome events (○ — schema now, pipeline never emits)
 
 Recorded by the user. Non-terminal transitions have first-class subcommands

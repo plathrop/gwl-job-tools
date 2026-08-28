@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use crate::domain::{
     events::{
-        EventEnvelope, ExtractedFields, IngestedPayload, PendingEvent, ReingestSuppressedPayload,
-        RejectedPayload, ScoredPayload, SnapshotFields, UpdatedPayload, event_type,
+        ApplyQueuedPayload, EventEnvelope, ExtractedFields, IngestedPayload, PendingEvent,
+        ReingestSuppressedPayload, RejectedPayload, ReviewedPayload, ScoredPayload, SnapshotFields,
+        UpdatedPayload, event_type,
     },
     gates::GateFailure,
     identity::LeadIdentity,
@@ -234,6 +235,41 @@ fn rejection_events(
             )
         })
         .collect()
+}
+
+/// Decide the events for a user mark (design doc 0001 §3, §5). Marks are
+/// latest-wins; re-marking emits a new `reviewed` event. `apply-automatically`
+/// also emits `apply_queued` in the same batch (the mark IS the approval; the
+/// package was prepared by the command layer). The pass-marker invariant
+/// (decision 0006) analog: `apply-automatically` requires a prepared package,
+/// and only `apply-automatically` carries one.
+pub fn decide_mark(
+    mark: &str,
+    note: Option<String>,
+    apply: Option<ApplyQueuedPayload>,
+) -> Result<Vec<PendingEvent>> {
+    const MARKS: [&str; 4] = ["apply-automatically", "apply-manual", "defer", "ignore"];
+    if !MARKS.contains(&mark) {
+        bail!("unknown mark '{mark}'");
+    }
+    if (mark == "apply-automatically") != apply.is_some() {
+        bail!(
+            "apply-automatically requires a prepared package, and only apply-automatically carries one"
+        );
+    }
+
+    let mut events = vec![PendingEvent::new(
+        event_type::REVIEWED,
+        None,
+        &ReviewedPayload {
+            mark: mark.into(),
+            note,
+        },
+    )?];
+    if let Some(apply) = apply {
+        events.push(PendingEvent::new(event_type::APPLY_QUEUED, None, &apply)?);
+    }
+    Ok(events)
 }
 
 #[cfg(test)]
@@ -813,5 +849,53 @@ mod tests {
         .unwrap();
         assert_eq!(kind, IngestKind::Suppressed);
         assert_eq!(events[0].event_type, event_type::REINGEST_SUPPRESSED);
+    }
+
+    // ── decide_mark ──────────────────────────────────────────────
+
+    fn apply_payload() -> ApplyQueuedPayload {
+        ApplyQueuedPayload {
+            package: crate::domain::events::ApplyPackage {
+                cover_letter_path: Some("/tmp/letter.pdf".into()),
+                resume_path: Some("/tmp/resume.pdf".into()),
+                cheat_sheet: vec![crate::domain::events::CheatSheetEntry {
+                    question: "Full name".into(),
+                    answer: "Grey".into(),
+                }],
+            },
+            url: Some("https://example.com/j".into()),
+        }
+    }
+
+    #[test]
+    fn mark_emits_reviewed() {
+        let events = decide_mark("defer", None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, event_type::REVIEWED);
+        assert_eq!(events[0].payload["mark"], "defer");
+    }
+
+    #[test]
+    fn apply_automatically_emits_reviewed_and_apply_queued() {
+        let events = decide_mark("apply-automatically", None, Some(apply_payload())).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, event_type::REVIEWED);
+        assert_eq!(events[1].event_type, event_type::APPLY_QUEUED);
+        assert_eq!(events[1].payload["url"], "https://example.com/j");
+    }
+
+    #[test]
+    fn unknown_mark_is_rejected() {
+        assert!(decide_mark("bogus", None, None).is_err());
+    }
+
+    #[test]
+    fn apply_automatically_requires_a_package() {
+        assert!(decide_mark("apply-automatically", None, None).is_err());
+    }
+
+    #[test]
+    fn non_apply_marks_reject_a_package() {
+        assert!(decide_mark("defer", None, Some(apply_payload())).is_err());
     }
 }

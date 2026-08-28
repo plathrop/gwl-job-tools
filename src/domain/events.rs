@@ -258,6 +258,41 @@ pub struct OutcomePayload {
     pub reason: Option<String>,
 }
 
+/// Payload for the `reviewed` event (design doc 0001 §3): the user marked a
+/// lead. Marks are latest-wins; re-marking emits a new event.
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReviewedPayload {
+    pub mark: String,
+    pub note: Option<String>,
+}
+
+/// One ATS question and its resume-derived answer (design doc 0001 §3).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CheatSheetEntry {
+    pub question: String,
+    pub answer: String,
+}
+
+/// The apply package assembled for an `apply-automatically` lead (design doc
+/// 0001 §3). Paths are recorded; nothing is auto-filled in v0.
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ApplyPackage {
+    pub cover_letter_path: Option<String>,
+    pub resume_path: Option<String>,
+    pub cheat_sheet: Vec<CheatSheetEntry>,
+}
+
+/// Payload for the `apply_queued` event (design doc 0001 §3): the apply
+/// package was prepared for an `apply-automatically` lead.
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ApplyQueuedPayload {
+    pub package: ApplyPackage,
+    pub url: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

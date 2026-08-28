@@ -105,6 +105,31 @@ impl OutcomeType {
     }
 }
 
+/// Review marks (`gwl-jobs mark`, design doc 0001 §3, §5). Marks are
+/// latest-wins; re-marking emits a new `reviewed` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Mark {
+    #[value(name = "apply-automatically")]
+    ApplyAutomatically,
+    #[value(name = "apply-manual")]
+    ApplyManual,
+    #[value(name = "defer")]
+    Defer,
+    #[value(name = "ignore")]
+    Ignore,
+}
+
+impl Mark {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mark::ApplyAutomatically => "apply-automatically",
+            Mark::ApplyManual => "apply-manual",
+            Mark::Defer => "defer",
+            Mark::Ignore => "ignore",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Args)]
 pub struct AppliedArgs {
     /// Unambiguous UUID prefix of the lead
@@ -192,6 +217,24 @@ pub struct EventsArgs {
     pub event_type: Option<String>,
 }
 
+#[derive(Clone, Debug, Args)]
+pub struct ListArgs {
+    /// Show all leads, not just the pending queue
+    #[arg(long)]
+    pub all: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct MarkArgs {
+    /// Unambiguous UUID prefix of the lead
+    pub lead: String,
+    /// The mark to apply
+    pub mark: Mark,
+    /// Free-form note
+    #[arg(long)]
+    pub note: Option<String>,
+}
+
 #[derive(Clone, Debug, Subcommand)]
 pub enum Commands {
     /// Fetch and ingest a job posting (URL or local file)
@@ -217,6 +260,12 @@ pub enum Commands {
 
     /// Dump/filter the raw event log
     Events(EventsArgs),
+
+    /// Print the ranked review queue
+    List(ListArgs),
+
+    /// Mark a lead (apply-automatically, apply-manual, defer, ignore)
+    Mark(MarkArgs),
 
     /// Generate shell completions
     Completion,
@@ -253,6 +302,8 @@ impl Cli {
             Some(Commands::Offered(_)) => "offered",
             Some(Commands::Outcome(_)) => "outcome",
             Some(Commands::Events(_)) => "events",
+            Some(Commands::List(_)) => "list",
+            Some(Commands::Mark(_)) => "mark",
             Some(Commands::Completion) => "completion",
             None => "none",
         }
@@ -270,6 +321,8 @@ pub async fn execute(command: Option<Commands>, config: &Config, paths: &AppPath
         Some(Commands::Offered(args)) => commands::execute_offered(args, paths).await,
         Some(Commands::Outcome(args)) => commands::execute_outcome(args, paths).await,
         Some(Commands::Events(args)) => commands::execute_events(args, paths).await,
+        Some(Commands::List(args)) => commands::execute_list(args, paths).await,
+        Some(Commands::Mark(args)) => commands::execute_mark(args, config, paths).await,
         Some(Commands::Completion) => Err(miette::miette!("completion is not yet implemented")),
         None => Err(miette::miette!(
             "no command provided; run `{APP_NAME} --help`"
@@ -287,6 +340,8 @@ fn cmd_label(command: &Option<Commands>) -> &'static str {
         Some(Commands::Offered(_)) => "offered",
         Some(Commands::Outcome(_)) => "outcome",
         Some(Commands::Events(_)) => "events",
+        Some(Commands::List(_)) => "list",
+        Some(Commands::Mark(_)) => "mark",
         Some(Commands::Completion) => "completion",
         None => "none",
     }

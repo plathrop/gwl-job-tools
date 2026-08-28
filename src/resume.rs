@@ -3,8 +3,8 @@
 //! is not used (v0.1.0, unpublished, and too strict to parse Grey's actual
 //! resume.json).
 //!
-//! v0 consumes `skills` (scoring, Increment 3); `basics`/`work` land with
-//! the apply-package cheat sheet (Increment 5).
+//! v0 consumes `skills` (scoring, Increment 3) and `basics`/`work` (the
+//! apply-package cheat sheet, Increment 4a).
 
 use std::path::Path;
 
@@ -18,6 +18,8 @@ use tracing::warn;
 #[serde(default)]
 pub struct Resume {
     pub skills: Vec<Skill>,
+    pub basics: Basics,
+    pub work: Vec<Work>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -26,6 +28,34 @@ pub struct Skill {
     pub name: Option<String>,
     pub level: Option<String>,
     pub keywords: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Basics {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub location: Option<Location>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Location {
+    pub city: Option<String>,
+    pub region: Option<String>,
+    pub country_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct Work {
+    /// Employer name.
+    pub name: Option<String>,
+    pub position: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    pub summary: Option<String>,
 }
 
 impl Resume {
@@ -140,6 +170,7 @@ mod tests {
                     ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         let keywords = resume.keywords();
         assert_eq!(keywords.len(), 2);
