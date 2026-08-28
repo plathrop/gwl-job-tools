@@ -24,10 +24,7 @@ use crate::{
 const EVENT_LOG_NAME: &str = "events.jsonl";
 
 #[instrument(skip_all)]
-pub async fn execute_ingest(args: IngestArgs) -> Result<()> {
-    let paths = AppPaths::discover()?;
-    let config = Config::load(&paths)?;
-
+pub async fn execute_ingest(args: IngestArgs, config: &Config, paths: &AppPaths) -> Result<()> {
     // Fetch/extract *before* acquiring the single-writer lock: network waits
     // must not hold the lock (durability contract, design doc 0001 §1).
     let outcome = match (&args.url, &args.file) {
@@ -49,7 +46,7 @@ pub async fn execute_ingest(args: IngestArgs) -> Result<()> {
     let events = store.replay()?;
     let projection = projections::rebuild(&events)?;
 
-    let summary = record_ingest(&mut store, &projection, &config, outcome)?;
+    let summary = record_ingest(&mut store, &projection, config, outcome)?;
     println!(
         "{}",
         serde_json::to_string_pretty(&summary).into_diagnostic()?
@@ -160,8 +157,7 @@ pub struct IngestSummary {
 }
 
 #[instrument(skip_all)]
-pub async fn execute_show(args: ShowArgs) -> Result<()> {
-    let paths = AppPaths::discover()?;
+pub async fn execute_show(args: ShowArgs, paths: &AppPaths) -> Result<()> {
     let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let events = store.replay()?;
     let projection = projections::rebuild(&events)?;
