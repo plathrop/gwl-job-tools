@@ -81,21 +81,10 @@ pub fn init_telemetry(
         }
         #[cfg(feature = "telemetry")]
         TelemetryStatus::On => {
-            // Install a temporary subscriber so debug! calls in
-            // build_otlp_provider are captured before the real subscriber is
-            // up. It writes to stderr: a transient debugging aid active only
-            // during provider construction, and only emitting at debug level
-            // (the default error level filters it out).
-            let _temp_guard = tracing::subscriber::set_default(
-                registry()
-                    .with(env_filter(log_level))
-                    .with(fmt::layer().with_target(false).with_writer(std::io::stderr)),
-            );
+            let setup = build_otlp_provider(name)?;
+            global::set_tracer_provider(setup.provider.clone());
 
-            let provider = build_otlp_provider(name)?;
-            global::set_tracer_provider(provider.clone());
-
-            let tracer = provider.tracer(name.to_owned());
+            let tracer = setup.provider.tracer(name.to_owned());
             let telemetry_layer: OpenTelemetryLayer<_, SdkTracer> = OpenTelemetryLayer::new(tracer);
 
             registry()
@@ -104,7 +93,16 @@ pub fn init_telemetry(
                 .with(telemetry_layer)
                 .init();
 
-            Ok(TelemetryGuard::Otlp(provider))
+            // Log the endpoint/headers AFTER the real subscriber is installed,
+            // so they go to the file (not stderr) — the "nothing on stderr"
+            // contract (decision 0005) holds even during telemetry bootstrap.
+            debug!("using telemetry endpoint: {:?}", setup.endpoint);
+            debug!(
+                "telemetry endpoint headers: {:?}",
+                setup.headers.as_deref().map(redact_header_values)
+            );
+
+            Ok(TelemetryGuard::Otlp(setup.provider))
         }
     }
 }
@@ -118,20 +116,26 @@ fn env_filter(log_level: Option<LogLevel>) -> EnvFilter {
     }
 }
 
+/// The OTLP provider plus the endpoint/headers it was configured from, so
+/// the caller can log them after the real subscriber is installed. They must
+/// not be logged during construction — that would need a stderr bootstrap
+/// subscriber, violating the file-sink contract (decision 0005).
 #[cfg(feature = "telemetry")]
-fn build_otlp_provider(name: &str) -> Result<SdkTracerProvider> {
+struct OtlpSetup {
+    provider: SdkTracerProvider,
+    endpoint: Option<String>,
+    headers: Option<String>,
+}
+
+#[cfg(feature = "telemetry")]
+fn build_otlp_provider(name: &str) -> Result<OtlpSetup> {
     // Per-signal vars take precedence over the base vars, per the OTel spec.
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
         .ok()
         .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok());
-    debug!("using telemetry endpoint: {endpoint:?}");
     let headers = std::env::var("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
         .ok()
         .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok());
-    debug!(
-        "telemetry endpoint headers: {:?}",
-        headers.as_deref().map(redact_header_values)
-    );
 
     let version = env!("CARGO_PKG_VERSION");
     let resource = Resource::builder()
@@ -158,7 +162,11 @@ fn build_otlp_provider(name: &str) -> Result<SdkTracerProvider> {
         .with_resource(resource)
         .build();
 
-    Ok(provider)
+    Ok(OtlpSetup {
+        provider,
+        endpoint,
+        headers,
+    })
 }
 
 /// Redact the values in an OTEL headers env var (`k1=v1,k2=v2`), keeping the
@@ -209,6 +217,33 @@ mod tests {
         ] {
             assert_eq!(env_filter(Some(level)).max_level_hint(), Some(expected));
         }
+    }
+
+    #[test]
+    fn file_sink_writes_records_to_file() {
+        // The file-sink behavior (record → file, not stderr) is the point of
+        // decision 0005. `init_telemetry` installs a *global* subscriber
+        // (once per process), so it can't be exercised in a unit test; this
+        // locks in the same layer construction via a thread-local default
+        // subscriber instead.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("test.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        let subscriber = registry().with(env_filter(Some(LogLevel::Info))).with(
+            fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(Mutex::new(file)),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("file sink test record");
+        });
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(contents.contains("file sink test record"));
     }
 
     // ── TelemetryStatus (via clap) ────────────────────────────────
