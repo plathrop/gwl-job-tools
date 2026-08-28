@@ -386,10 +386,7 @@ mod tests {
 
     #[test]
     fn remote_negations_are_not_evidence() {
-        assert_eq!(
-            detect_remote(Some("NYC"), "this role is not remote"),
-            None
-        );
+        assert_eq!(detect_remote(Some("NYC"), "this role is not remote"), None);
         assert_eq!(detect_remote(None, "this role is not remote"), None);
         assert_eq!(detect_remote(None, "non-remote position"), None);
         assert_eq!(
