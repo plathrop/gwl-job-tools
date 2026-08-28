@@ -326,6 +326,18 @@ mod tests {
     }
 
     #[test]
+    fn years_range_with_typographic_dashes_uses_lower_bound() {
+        // Regression: the years regex only knows ASCII '-', so an en/em-dash
+        // range skips the range group and the search falls through to the
+        // UPPER bound ("5–10 years" matches "10 years"). The documented
+        // contract is the lower bound — the minimum experience required.
+        let mut e = extracted();
+        e.title = Some("Engineer".into()); // no level signal
+        assert_eq!(level_score(&e, "5–10 years of experience"), 33);
+        assert_eq!(level_score(&e, "5—10 years of experience"), 33);
+    }
+
+    #[test]
     fn level_title_keywords_match_on_word_boundaries() {
         // Regression: substring matching misclassifies unrelated titles —
         // "International" contains "intern", "Staffing" contains "staff".
