@@ -813,4 +813,86 @@ mod tests {
     fn parse_occurred_at_rejects_garbage() {
         assert!(parse_occurred_at("not a timestamp").is_err());
     }
+
+    #[test]
+    fn parse_occurred_at_accepts_date_only_at_noon_utc() {
+        // Retro-recording is a human workflow; humans think in dates.
+        // A bare date means noon UTC (documented default).
+        let ts = parse_occurred_at("2026-08-01").unwrap();
+        assert_eq!(ts, "2026-08-01T12:00:00Z".parse::<Timestamp>().unwrap());
+    }
+
+    #[test]
+    fn record_outcome_terminal_records_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut outcome = outcome("body");
+        outcome.url = Some("https://example.com/job/14".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+        let summary =
+            record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
+
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        record_outcome(
+            &mut store,
+            &projection,
+            &summary.lead_id.to_string(),
+            event_type::ARCHIVED,
+            OutcomePayload {
+                note: Some("dead req".into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let events = store.replay().unwrap();
+        assert_eq!(events[2].event_type, "archived");
+        assert_eq!(events[2].payload["note"], "dead req");
+    }
+
+    #[tokio::test]
+    async fn events_lead_resolves_prefix_with_errors() {
+        // Copilot: `--lead` is documented as an unambiguous UUID prefix;
+        // unlike the other lead-addressed commands the filter silently
+        // emits all matching streams and silently succeeds on no match.
+        // The prefix must resolve once, with the zero/multiple-match errors.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = JsonlEventStore::open(dir.path().join(EVENT_LOG_NAME)).unwrap();
+        let mut projection = projections::rebuild(&[]).unwrap();
+        for _ in 0..2 {
+            let mut o = outcome("body");
+            o.url = Some(format!("https://example.com/{}", Uuid::now_v7()));
+            record_ingest(&mut store, &projection, &Config::default(), &[], o).unwrap();
+            projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        }
+        drop(store); // release the single-writer lock for execute_events
+        let paths = AppPaths::new(dir.path().join("config"), dir.path().to_path_buf());
+
+        // Ambiguous: the empty prefix matches both leads.
+        assert!(
+            execute_events(
+                EventsArgs {
+                    lead: Some("".into()),
+                    event_type: None
+                },
+                &paths,
+            )
+            .await
+            .is_err()
+        );
+        // No match: 'z' cannot prefix any UUID.
+        assert!(
+            execute_events(
+                EventsArgs {
+                    lead: Some("z".into()),
+                    event_type: None
+                },
+                &paths,
+            )
+            .await
+            .is_err()
+        );
+    }
 }

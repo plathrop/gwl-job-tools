@@ -487,6 +487,40 @@ mod tests {
     }
 
     #[test]
+    fn ashby_errors_when_job_not_in_board() {
+        // The endpoint returns the whole board; if the posting's job id
+        // isn't there (deleted or mistyped), falling back to the first job
+        // would silently ingest a different job's content under this URL.
+        // A miss must fail — the caller then degrades to the HTML fallback.
+        let body = serde_json::json!({
+            "jobs": [
+                {"id": "aaaa", "title": "Other Job", "descriptionHtml": "<p>a</p>"}
+            ]
+        });
+        let url = Url::parse("https://jobs.ashbyhq.com/restate/bbbb").unwrap();
+        assert!(parse_api_response(Platform::Ashby, &body, &url).is_err());
+    }
+
+    #[test]
+    fn ashby_onsite_workplace_type_maps_to_non_remote() {
+        let body = serde_json::json!({
+            "jobs": [
+                {
+                    "id": "fe90faab-5417-4034-b915-0770e2477a73",
+                    "title": "Engineer",
+                    "workplaceType": "OnSite",
+                    "descriptionHtml": "<p>Join us.</p>"
+                }
+            ]
+        });
+        let url =
+            Url::parse("https://jobs.ashbyhq.com/restate/fe90faab-5417-4034-b915-0770e2477a73")
+                .unwrap();
+        let api = parse_api_response(Platform::Ashby, &body, &url).unwrap();
+        assert_eq!(api.remote, Some(false));
+    }
+
+    #[test]
     fn parses_lever_response_with_lists() {
         let body = serde_json::json!({
             "id": "abc-123",

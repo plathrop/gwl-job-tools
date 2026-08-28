@@ -554,6 +554,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn older_retro_dated_outcome_does_not_overwrite_newer() {
+        // Copilot: `--at` supports backfilling — a retro outcome recorded
+        // LATER (replay order) but with an EARLIER occurred_at must not
+        // become the projected latest outcome. Latest-wins is chronological,
+        // with replay order only as the tie-breaker.
+        let lead_id = Uuid::now_v7();
+        let mut applied = envelope(
+            lead_id,
+            2,
+            event_type::APPLIED,
+            serde_json::json!({"method": "manual"}),
+        );
+        applied.occurred_at = "2026-08-20T00:00:00Z".parse::<Timestamp>().unwrap();
+        let mut screened = envelope(lead_id, 3, event_type::SCREENED, serde_json::json!({}));
+        screened.occurred_at = "2026-08-01T00:00:00Z".parse::<Timestamp>().unwrap();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            applied,
+            screened,
+        ];
+        let projection = rebuild(&events).unwrap();
+        let record = projection.leads.get(&lead_id).unwrap();
+        assert_eq!(
+            record.latest_outcome.as_ref().unwrap().event_type,
+            "applied"
+        );
+    }
+
+    #[test]
+    fn retro_dated_outcome_surfaces_occurred_at() {
+        let lead_id = Uuid::now_v7();
+        let at = "2026-08-01T00:00:00Z".parse::<Timestamp>().unwrap();
+        let mut applied = envelope(
+            lead_id,
+            2,
+            event_type::APPLIED,
+            serde_json::json!({"method": "manual"}),
+        );
+        applied.occurred_at = at;
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            applied,
+        ];
+        let projection = rebuild(&events).unwrap();
+        let outcome = projection
+            .leads
+            .get(&lead_id)
+            .unwrap()
+            .latest_outcome
+            .as_ref()
+            .unwrap();
+        assert_eq!(outcome.occurred_at, at);
+    }
+
+    #[test]
+    fn malformed_outcome_payload_is_hard_error() {
+        // Strict, like the other source-of-truth payloads.
+        let lead_id = Uuid::now_v7();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(
+                lead_id,
+                2,
+                event_type::APPLIED,
+                serde_json::json!({"note": 5}),
+            ),
+        ];
+        assert!(rebuild(&events).is_err());
+    }
+
     // ── lookup precedence (design doc §2) ────────────────────────
 
     #[test]
