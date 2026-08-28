@@ -301,7 +301,15 @@ pub fn ingest_file(path: &Path, content: &str) -> Result<IngestOutcome> {
         let base = Url::parse("https://localhost/").expect("valid base URL");
         extract::extract_main_text(content, &base)?
     } else {
-        (None, content.to_string())
+        // Plain-text drops have no title element; the first non-empty line
+        // is the title candidate ("Staff Engineer — Acme" covers the
+        // company fallback's needs).
+        let first_line = content
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string);
+        (first_line, content.to_string())
     };
     if raw_text.trim().is_empty() {
         bail!("no text could be extracted from {}", path.display());

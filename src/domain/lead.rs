@@ -51,6 +51,13 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
     match event.event_type.as_str() {
         event_type::INGESTED | event_type::UPDATED => {
             state.exists = true;
+            // Every snapshot event is one gate/score evaluation; rejected
+            // and scored events carry that evaluation's revision. Counting
+            // evaluations here (not on rejected/scored) keeps the counter
+            // correct when an evaluation fails multiple gates (one
+            // revision, several events) and when an evaluation passes
+            // (snapshot event, no rejected/scored events at all).
+            state.eval_revision += 1;
             if let Ok(snapshot) = serde_json::from_value::<SnapshotFields>(event.payload.clone()) {
                 state.snapshot = Some(snapshot.extracted);
                 state.url = snapshot.url;
@@ -65,17 +72,6 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
                 .get("mark")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-        }
-        event_type::REJECTED | event_type::SCORED => {
-            // revision counts *evaluations*, not events: one evaluation can
-            // emit several `rejected` events (one per failed gate), all
-            // stamped with the same revision.
-            let revision = event
-                .payload
-                .get("revision")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            state.eval_revision = state.eval_revision.max(revision);
         }
         _ => {}
     }
