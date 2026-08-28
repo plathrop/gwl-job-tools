@@ -36,6 +36,7 @@ pub mod event_type {
     pub const REJECTED_BY_EMPLOYER: &str = "rejected_by_employer";
     pub const WITHDRAWN: &str = "withdrawn";
     pub const DECLINED: &str = "declined";
+    pub const UNRESPONSIVE: &str = "unresponsive";
     pub const ARCHIVED: &str = "archived";
 }
 
@@ -63,6 +64,9 @@ pub struct PendingEvent {
     pub event_type: &'static str,
     pub schema_version: u32,
     pub causation_id: Option<Uuid>,
+    /// User-supplied `occurred_at` for retro-recorded outcomes; `None` means
+    /// the store stamps `now` (design doc 0001 §1).
+    pub occurred_at: Option<Timestamp>,
     pub payload: serde_json::Value,
 }
 
@@ -76,6 +80,7 @@ impl PendingEvent {
             event_type,
             schema_version: 1,
             causation_id,
+            occurred_at: None,
             payload: serde_json::to_value(payload).into_diagnostic()?,
         })
     }
@@ -224,6 +229,22 @@ pub struct ReingestSuppressedPayload {
     /// ignore, design doc §2).
     #[serde(default)]
     pub identifiers: Identifiers,
+}
+
+/// Payload for user-recorded outcome events (design doc 0001 §3). All fields
+/// are optional; which apply depends on the event type (`applied` carries
+/// `method`, `screened` carries `contact`, `interviewed` carries `stage`,
+/// `accepted` carries `start_date`, `archived` carries `reason`). `note` is
+/// common to all.
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct OutcomePayload {
+    pub note: Option<String>,
+    pub method: Option<String>,
+    pub contact: Option<String>,
+    pub stage: Option<String>,
+    pub start_date: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[cfg(test)]
