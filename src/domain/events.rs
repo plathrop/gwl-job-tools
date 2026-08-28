@@ -198,6 +198,8 @@ pub struct RejectedPayload {
 pub struct DimensionScore {
     pub name: String,
     pub score: u64,
+    /// The *configured* weight (not renormalized). The breakdown shows the
+    /// renormalized weight; Σ(wᵢ·scoreᵢ)/Σwᵢ recomputes from this field.
     pub weight: f64,
     pub confidence: f64,
 }
