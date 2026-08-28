@@ -181,7 +181,10 @@ fn level_score(extracted: &ExtractedFields, raw_text: &str) -> u64 {
 /// take the max of those (the highest requirement is the best level signal).
 /// When no mention is experience-adjacent, we fall back to the first mention
 /// (the bare "5+ years" shorthand). A range ("5–10 years") still yields its
-/// lower bound — the minimum experience required.
+/// lower bound — the minimum experience required. Known limitation: the
+/// fallback can still return a non-experience mention (e.g. a company-age
+/// "we've been in business for 20 years" with no other years mention) — a
+/// false positive accepted for v0 (the level dimension is a fallback anyway).
 fn extract_years(text: &str) -> Option<u64> {
     static YEARS_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)(\d{1,2})\s*(?:\+|\s*[-–—]\s*\d{1,2})?\s*(?:years|yrs)")
