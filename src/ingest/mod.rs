@@ -266,6 +266,27 @@ async fn ingest_via_html<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Resul
         .get_text(url)
         .await
         .wrap_err_with(|| format!("fetching {url}"))?;
+    // Structured JSON-LD (embedded for SEO) beats readability on JS-rendered
+    // boards like Ashby, where the visible page is a shell and readability
+    // finds no article.
+    if let Some(job) = extract::extract_json_ld(&html) {
+        let raw_text = extract::html_to_text(&job.description_html);
+        if !raw_text.trim().is_empty() {
+            let mut extracted = extract::extract_fields(&raw_text, job.location.as_deref());
+            extracted.title = Some(job.title);
+            extracted.company = job.company;
+            extracted.req_id = job.req_id.or_else(|| extract::extract_req_id(&raw_text));
+            // The structured remote signal (jobLocationType) is more
+            // authoritative than the text heuristic.
+            extracted.remote = job.remote.or(extracted.remote);
+            return Ok(IngestOutcome {
+                source: "drop-in".into(),
+                url: Some(url.to_string()),
+                raw_text,
+                extracted,
+            });
+        }
+    }
     let (title, raw_text) = extract::extract_main_text(&html, url)?;
     if raw_text.trim().is_empty() {
         bail!("no text could be extracted from {url}");
