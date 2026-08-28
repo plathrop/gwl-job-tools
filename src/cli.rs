@@ -380,4 +380,46 @@ mod tests {
         let cli = Cli::try_parse_from(["gwl-jobs", "events", "--type", "scored"]).unwrap();
         assert_eq!(cli.command_name(), "events");
     }
+
+    #[test]
+    fn transitions_accept_note() {
+        // The design doc's outcome payload carries a common `note` on every
+        // event; today only the terminal `outcome` command can set it.
+        for command in ["applied", "screened", "interviewed", "offered"] {
+            let parsed = Cli::try_parse_from(["gwl-jobs", command, "abc", "--note", "referral"]);
+            assert!(
+                parsed.is_ok(),
+                "{command} must accept --note: {:?}",
+                parsed.err()
+            );
+        }
+    }
+
+    #[test]
+    fn parse_outcome_accepted_accepts_start_date() {
+        // Design doc 0001 §3: `accepted` carries `start_date?`.
+        assert!(
+            Cli::try_parse_from([
+                "gwl-jobs",
+                "outcome",
+                "abc",
+                "accepted",
+                "--start-date",
+                "2026-09-01"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_outcome_archived_accepts_reason() {
+        // Design doc 0001 §3: `archived` carries `reason` — the only
+        // outcome whose extra is documented as required.
+        assert!(
+            Cli::try_parse_from([
+                "gwl-jobs", "outcome", "abc", "archived", "--reason", "dead req"
+            ])
+            .is_ok()
+        );
+    }
 }

@@ -515,6 +515,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn json_ld_path_keeps_company_fallback() {
+        // The readability path derives the company from the title separator
+        // ("so the blacklist gate holds on the HTML path too"); the JSON-LD
+        // path must carry the same fallback — a missing hiringOrganization
+        // must not silently disable the blacklist gate ("never match
+        // blacklisted companies" is non-negotiable).
+        let html = "<html><head><title>Staff Engineer — Salesforce</title></head><body>\
+                    <script type=\"application/ld+json\">\
+                    {\"@context\":\"https://schema.org/\",\"@type\":\"JobPosting\",\
+                     \"title\":\"Staff Engineer — Salesforce\",\
+                     \"description\":\"<p>Build delightful CRM tooling with a large team of \
+                     experienced engineers across the organization daily.</p>\"}\
+                    </script></body></html>";
+        let posting = Url::parse("https://example.com/job/1").unwrap();
+        let fetcher = ScriptedFetcher::with(vec![response(200, None, html)]);
+        let client = client_with(fetcher);
+
+        let outcome = ingest_url(&posting, &client).await.unwrap();
+
+        assert_eq!(outcome.extracted.company.as_deref(), Some("Salesforce"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn rate_limited_api_does_not_fall_back_to_same_host() {
         // A 429 whose Retry-After exceeds the local cap must propagate —
         // fetching the posting page on the SAME host after the server told

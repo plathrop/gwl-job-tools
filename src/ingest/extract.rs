@@ -632,6 +632,55 @@ mod tests {
     }
 
     #[test]
+    fn json_ld_on_site_location_type_is_confident_non_remote() {
+        // The historically documented jobLocationType vocabulary is
+        // ON_SITE / HYBRID / TELECOMMUTE; a posting emitting ON_SITE is
+        // a confident non-remote and must not degrade to unknown (gates
+        // reject only confident non-remotes).
+        let html = r#"<html><body>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org/","@type":"JobPosting",
+             "title":"Warehouse Associate","description":"<p>On-site role.</p>",
+             "jobLocationType":"ON_SITE"}
+            </script>
+            </body></html>"#;
+        let job = extract_json_ld(html).unwrap();
+        assert_eq!(job.remote, Some(false));
+    }
+
+    #[test]
+    fn json_ld_search_continues_past_untitled_posting() {
+        // A candidate without a title must not abort the search; the next
+        // posting in the graph may be usable.
+        let html = r#"<html><body>
+            <script type="application/ld+json">
+            {"@graph":[
+                {"@type":"JobPosting"},
+                {"@type":"JobPosting","title":"Real Job","description":"<p>Do things.</p>"}
+            ]}
+            </script>
+            </body></html>"#;
+        let job = extract_json_ld(html).unwrap();
+        assert_eq!(job.title, "Real Job");
+    }
+
+    #[test]
+    fn json_ld_graph_container_finds_posting() {
+        // SEO plugins emit a `@graph` array; the JobPosting inside it is
+        // just as structured as a top-level one.
+        let html = r#"<html><body>
+            <script type="application/ld+json">
+            {"@graph":[
+                {"@type":"Organization","name":"Acme"},
+                {"@type":"JobPosting","title":"Staff Engineer","description":"<p>Build platforms.</p>"}
+            ]}
+            </script>
+            </body></html>"#;
+        let job = extract_json_ld(html).unwrap();
+        assert_eq!(job.title, "Staff Engineer");
+    }
+
+    #[test]
     fn readability_extracts_main_content() {
         let html = r#"<!DOCTYPE html><html><head><title>Staff Engineer — Acme</title></head>
         <body><nav>Home | About | Jobs</nav>
