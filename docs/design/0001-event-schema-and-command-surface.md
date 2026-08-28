@@ -345,7 +345,10 @@ re-marking emits a new event.
 
 ### Outcome events (○ — schema now, pipeline never emits)
 
-Recorded by the user via `gwl-jobs outcome`. Each accepts optional `note`;
+Recorded by the user. Non-terminal transitions have first-class subcommands
+(`gwl-jobs applied`, `gwl-jobs screened`, `gwl-jobs interviewed`,
+`gwl-jobs offered`); terminal outcomes are recorded via
+`gwl-jobs outcome <lead> <type>` (§8). Each accepts optional `note`;
 `occurred_at` may be user-supplied for retro recording.
 
 | Type                   | Payload extras                    | Terminal? |
@@ -358,11 +361,16 @@ Recorded by the user via `gwl-jobs outcome`. Each accepts optional `note`;
 | `rejected_by_employer` | —                                 | yes       |
 | `withdrawn`            | —                                 | yes       |
 | `declined`             | — (user declined an offer)        | yes       |
+| `unresponsive`         | — (company/recruiter went silent) | yes       |
 | `archived`             | `reason`                          | yes       |
 
 A lead with any outcome event leaves the review queue (§7). This set is
 deliberately closed-ended rather than a free-form `outcome {kind}` so
 that projections and future analytics can match on concrete types.
+
+`unresponsive` is tracked separately from `rejected_by_employer` and
+`withdrawn` because it reflects negatively on the company/recruiter for
+future interactions (ghosting), not on the application itself.
 
 ## 4. Schema versioning and upcasting
 
@@ -477,7 +485,11 @@ Supersedes and removes the placeholder `lead open|list|close`.
 | `gwl-jobs mark <lead> <mark> [--note]`                | Non-interactive mark (scriptable). `apply-automatically` runs the same prepare → batch-append → open flow as the review loop's `a` key (§5). | `reviewed` (+ `apply_queued`)                                               |
 | `gwl-jobs package <lead>`                             | (Re)build the apply package for a lead marked `apply-automatically`; re-print and re-open the URL. Bails on unmarked leads — mark first.     | `apply_queued`                                                              |
 | `gwl-jobs show <lead>`                                | Full detail: snapshot, score history, marks, events. (Steel-thread scope: snapshot + mark + counts; grows as scores/marks/events land.)      | —                                                                           |
-| `gwl-jobs outcome <lead> <type> [--note] [--at <ts>]` | Record an outcome (§3 table).                                                                                                                | `applied` / `screened` / …                                                  |
+| `gwl-jobs applied <lead> [--method <m>] [--at <ts>]`    | Record the `applied` transition.                                                                                                            | `applied`                                                                   |
+| `gwl-jobs screened <lead> [--contact <c>] [--at <ts>]` | Record the `screened` transition.                                                                                                           | `screened`                                                                  |
+| `gwl-jobs interviewed <lead> [--stage <s>] [--at <ts>]` | Record the `interviewed` transition.                                                                                                        | `interviewed`                                                               |
+| `gwl-jobs offered <lead> [--at <ts>]`                   | Record the `offered` transition.                                                                                                            | `offered`                                                                   |
+| `gwl-jobs outcome <lead> <type> [--note] [--at <ts>]`   | Record a terminal outcome (§3): `accepted` / `rejected_by_employer` / `withdrawn` / `declined` / `unresponsive` / `archived`.                | the terminal event                                                         |
 | `gwl-jobs events [--lead <id>] [--type <t>]`          | Dump/filter the raw log (debugging, golden tests).                                                                                           | —                                                                           |
 | `gwl-jobs completion`                                 | Shell completions (existing).                                                                                                                | —                                                                           |
 
