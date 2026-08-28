@@ -148,3 +148,9 @@
 {"type":"update","issueId":"GWLJ-xltolc","timestamp":"2026-08-28T21:07:16.628Z","data":{},"source":"gwl-job-tools"}
 {"type":"create","issueId":"GWLJ-y9z8zt","timestamp":"2026-08-28T21:07:17.377Z","data":{"title":"Decide the ProjectDirs qualifier (st.ember/gwl)","type":"task","priority":4,"description":"The config/data dirs are namespaced under st.ember/gwl (ProjectDirs::from(\"st.ember\", \"gwl\", APP_NAME)). The Windows convention is to use a domain owned by the author — Grey owns ember.st, and the code isn't going to an org. Worth an eyes-open decision: keep as-is (probably fine) or change. Document the decision.","parent":"GWLJ-xltolc"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-xltolc","timestamp":"2026-08-28T21:07:17.381Z","data":{},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-mxyp63","timestamp":"2026-08-28T21:11:54.899Z","data":{"parent":"GWLJ-32p6d0"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-498xbl","timestamp":"2026-08-28T21:14:00.014Z","data":{"parent":"GWLJ-32p6d0"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-wbpv13","timestamp":"2026-08-28T21:14:00.042Z","data":{"parent":"GWLJ-32p6d0"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-0j7twy","timestamp":"2026-08-28T21:14:00.073Z","data":{"parent":"GWLJ-32p6d0"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-mmeajy","timestamp":"2026-08-28T21:14:59.184Z","data":{"parent":"GWLJ-7kfu55"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-e0ysa7","timestamp":"2026-08-28T21:14:59.216Z","data":{"parent":"GWLJ-7kfu55"},"source":"gwl-job-tools"}
