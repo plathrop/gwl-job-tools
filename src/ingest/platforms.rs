@@ -92,7 +92,10 @@ fn workday_api_url(url: &Url, segments: &[&str]) -> Option<String> {
     let tenant = host.split('.').next()?;
 
     // Drop a locale prefix like `en-US` if present.
-    let locale_re = regex::Regex::new(r"^[a-z]{2}(-[A-Z]{2})?$").expect("locale regex compiles");
+    static LOCALE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^[a-z]{2}(-[A-Z]{2})?$").expect("static regex compiles")
+    });
+    let locale_re = &LOCALE_RE;
     let segments: &[&str] = match segments {
         [first, rest @ ..] if locale_re.is_match(first) && !rest.is_empty() => rest,
         other => other,
