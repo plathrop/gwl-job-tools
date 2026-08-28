@@ -115,3 +115,5 @@
 {"type":"close","issueId":"GWLJ-8vshug","timestamp":"2026-08-28T18:49:32.426Z","data":{"reason":"Resolved by decision 0006: scored is the pass-marker (merged in PR #7)"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-w8bofg","timestamp":"2026-08-28T18:54:17.301Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-i0eqq5","timestamp":"2026-08-28T18:54:17.331Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-w8bofg","timestamp":"2026-08-28T19:00:16.275Z","data":{"text":"PR #8 opened: https://github.com/plathrop/gwl-job-tools/pull/8","timestamp":"2026-08-28T19:00:16.275Z"},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-i0eqq5","timestamp":"2026-08-28T19:00:17.016Z","data":{"text":"PR #8 opened: https://github.com/plathrop/gwl-job-tools/pull/8","timestamp":"2026-08-28T19:00:17.016Z"},"source":"gwl-job-tools"}
