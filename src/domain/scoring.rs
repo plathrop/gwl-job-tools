@@ -171,16 +171,57 @@ fn level_score(extracted: &ExtractedFields, raw_text: &str) -> u64 {
     50
 }
 
-/// First number in a "X years" / "X+ years" / "X-Y years" context (the lower
-/// bound of a range — the minimum experience required).
+/// Estimate required years of experience from "X years" mentions.
+///
+/// A posting can mention years in non-experience contexts ("2 years of
+/// Kubernetes", "we've been in business for 20 years"). The word
+/// "experience" (or "exp") after a "years" mention is the signal that the
+/// years refer to the role's experience requirement, so we prefer the
+/// mention(s) followed by "experience" before the next "years" mention and
+/// take the max of those (the highest requirement is the best level signal).
+/// When no mention is experience-adjacent, we fall back to the first mention
+/// (the bare "5+ years" shorthand). A range ("5–10 years") still yields its
+/// lower bound — the minimum experience required.
 fn extract_years(text: &str) -> Option<u64> {
     static YEARS_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)(\d{1,2})\s*(?:\+|\s*[-–—]\s*\d{1,2})?\s*(?:years|yrs)")
             .expect("static regex compiles")
     });
-    YEARS_RE
-        .captures(text)
-        .and_then(|c| c[1].parse::<u64>().ok())
+    static EXPERIENCE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?i)\b(?:experience|exp)\b").expect("static regex compiles")
+    });
+
+    // (years, start, end) for every "X years" mention, in text order.
+    let mentions: Vec<(u64, usize, usize)> = YEARS_RE
+        .captures_iter(text)
+        .filter_map(|c| {
+            let m = c.get(0)?;
+            let years = c[1].parse::<u64>().ok()?;
+            Some((years, m.start(), m.end()))
+        })
+        .collect();
+
+    let first = mentions.first().map(|(years, _, _)| *years)?;
+
+    // A mention is experience-adjacent when "experience"/"exp" appears after
+    // it but before the next "years" mention (or within a short window when
+    // it is the last mention). This keeps "2 years of Kubernetes" from
+    // borrowing the "experience" that belongs to a later "10+ years overall
+    // experience".
+    const WINDOW: usize = 40;
+    let adjacent: Vec<u64> = mentions
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (years, _, end))| {
+            let limit = mentions
+                .get(i + 1)
+                .map(|(_, next_start, _)| *next_start)
+                .unwrap_or_else(|| text.ceil_char_boundary((*end + WINDOW).min(text.len())));
+            EXPERIENCE_RE.is_match(&text[*end..limit]).then_some(*years)
+        })
+        .collect();
+
+    adjacent.into_iter().max().or(Some(first))
 }
 
 // ── skills ───────────────────────────────────────────────────────
@@ -355,6 +396,53 @@ mod tests {
         e.title = Some("Engineer".into()); // no level signal
         assert_eq!(level_score(&e, "5–10 years of experience"), 33);
         assert_eq!(level_score(&e, "5—10 years of experience"), 33);
+    }
+
+    #[test]
+    fn extract_years_prefers_experience_adjacent_mention() {
+        // k3 review round 2 (PR #7): leftmost-match is arbitrary. "2 years
+        // of Kubernetes" is a technology mention, not the role's experience
+        // requirement; "10+ years overall experience" is.
+        assert_eq!(
+            extract_years("2 years of Kubernetes; 10+ years overall experience"),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn extract_years_ignores_company_age_mentions() {
+        // "20 years in business" is the company's age, not a requirement.
+        assert_eq!(
+            extract_years("5 years of experience; we've been in business for 20 years"),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn extract_years_takes_max_of_experience_mentions() {
+        // Both mentions are experience-adjacent; the higher requirement wins.
+        assert_eq!(
+            extract_years("2 years of Kubernetes experience; 10+ years overall experience"),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn extract_years_falls_back_to_first_mention() {
+        // No "experience" anywhere: the bare "5+ years" shorthand.
+        assert_eq!(extract_years("5+ years"), Some(5));
+    }
+
+    #[test]
+    fn level_prefers_overall_experience_over_tech_years() {
+        // End-to-end: the level dimension must not let a technology-specific
+        // years mention outrank the overall experience requirement.
+        let mut e = extracted();
+        e.title = Some("Engineer".into()); // no level signal
+        assert_eq!(
+            level_score(&e, "2 years of Kubernetes; 10+ years overall experience"),
+            66
+        );
     }
 
     #[test]
