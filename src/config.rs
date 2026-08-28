@@ -256,9 +256,10 @@ compensation = 0.4
 
     #[test]
     fn unknown_scoring_weight_key_is_rejected() {
-        // A typo inside [scoring_weights] currently falls back to the
-        // default weight silently (deny_unknown_fields only applies at the
-        // top level). A misspelled weight would silently change ranking.
+        // Guard: a typo inside [scoring_weights] must fail loading, not
+        // silently fall back to the default weight — a misspelled weight
+        // would silently change every ranking. (deny_unknown_fields on
+        // ScoringWeights is what enforces this; keep it.)
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir).unwrap();

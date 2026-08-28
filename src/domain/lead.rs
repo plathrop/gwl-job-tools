@@ -423,6 +423,26 @@ mod tests {
     }
 
     #[test]
+    fn passing_evaluation_without_a_score_is_rejected() {
+        // Pass-marker invariant, second mode (decision 0006): a gate-passing
+        // evaluation must emit `scored`. Empty failures + no score would
+        // append a markerless snapshot — a lead indistinguishable from the
+        // torn batch the pass-marker exists to reject. (The suppressed path
+        // stays legal: it returns before evaluation events are considered.)
+        let result = decide_ingest(
+            &LeadState::default(),
+            &identity(),
+            "drop-in",
+            Some("https://example.com/j".into()),
+            "body".into(),
+            extracted("Engineer"),
+            vec![],
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn multi_failure_evaluation_stays_one_revision() {
         // Regression: one evaluation failing two gates emits two `rejected`
         // events at the SAME revision, and the next evaluation is revision
