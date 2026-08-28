@@ -3,12 +3,56 @@
 //! Comp coverage is spotty everywhere (APIs and sites alike); these
 //! heuristics take what exists and leave the rest absent.
 
+use std::sync::LazyLock;
+
 use dom_smoothie::Readability;
 use miette::Result;
 use regex::Regex;
 use url::Url;
 
 use crate::domain::events::{CompRange, ExtractedFields};
+
+// Static patterns compile once via LazyLock — the deref cannot fail, which
+// removes the per-call `unwrap()` entirely (and the recompilation).
+static REMOTE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bremote\b").expect("static regex compiles"));
+static NEGATED_REMOTE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(not|no|never|isn't|isnt|aren't|arent)\s+(?:a\s+|an\s+)?remote\b\w*|\bnon-remote\b|\bremote\s+is\s+not\b",
+    )
+    .expect("static regex compiles")
+});
+static ONSITE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bhybrid\b|\bon[- ]site\b|\bin[- ]office\b|\bmust be (located|based) in\b")
+        .expect("static regex compiles")
+});
+static MASKED_ONSITE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(not|no|never|without|instead of|rather than)\s+(?:a\s+|an\s+|any\s+)?(hybrid|on[- ]site|in[- ]office)\b\w*(\s+(requirement|policy|option))?",
+    )
+    .expect("static regex compiles")
+});
+static COMP_RANGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:USD\s*)?\$\s*(\d{2,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(k)?\s*(?:-|–|—|\bto\b)\s*(?:USD\s*)?\$?\s*(\d{2,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(k)?",
+    )
+    .expect("static regex compiles")
+});
+static COMP_SINGLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:USD\s*)?\$\s*(\d{2,3}(?:,\d{3})+)\s*(k)?").expect("static regex compiles")
+});
+static HOURLY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(per\s+hour|hourly|/hr|an\s+hour)\b").expect("static regex compiles")
+});
+static YEARLY_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(annually|yearly|per\s+year|/yr|a\s+year)\b").expect("static regex compiles")
+});
+static REQ_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:req(?:uisition)?(?:\s*id)?|job\s*(?:id|number|requisition)|requisition\s*id)\s*[:#]?\s*([A-Z0-9][A-Z0-9-]{2,})\b",
+    )
+    .expect("static regex compiles")
+});
 
 /// Convert an HTML fragment (e.g. an API-returned description body) to
 /// plain text for `raw_text` and regex extraction.
@@ -49,11 +93,6 @@ pub fn extract_fields(text: &str, location: Option<&str>) -> ExtractedFields {
 /// list a physical location — so the body is consulted before concluding
 /// `Some(false)`.
 fn detect_remote(location: Option<&str>, text: &str) -> Option<bool> {
-    let remote_re = Regex::new(r"(?i)\bremote\b").unwrap();
-    let negated_re = Regex::new(
-        r"(?i)\b(not|no|never|isn't|isnt|aren't|arent)\s+(?:a\s+|an\s+)?remote\b\w*|\bnon-remote\b|\bremote\s+is\s+not\b",
-    )
-    .unwrap();
     // Explicit work-arrangement negatives (confirmed design, 2026-08-26):
     // "hybrid", "on-site in X", "in-office", "must be located/based in"
     // are confident on-site signals and fail the gate even when the word
@@ -61,22 +100,14 @@ fn detect_remote(location: Option<&str>, text: &str) -> Option<bool> {
     // remote posting saying "not hybrid" or "no on-site requirement" is
     // NOT a confident negative (that would be an invisible false
     // rejection — the failure mode the gate policy exists to avoid).
-    let negative_re = Regex::new(
-        r"(?i)\bhybrid\b|\bon[- ]site\b|\bin[- ]office\b|\bmust be (located|based) in\b",
-    )
-    .unwrap();
-    let masked_negative_re = Regex::new(
-        r"(?i)\b(not|no|never|without|instead of|rather than)\s+(?:a\s+|an\s+|any\s+)?(hybrid|on[- ]site|in[- ]office)\b\w*(\s+(requirement|policy|option))?",
-    )
-    .unwrap();
     let head: String = text.chars().take(4000).collect();
-    let head_masked = masked_negative_re.replace_all(&head, "");
+    let head_masked = MASKED_ONSITE_RE.replace_all(&head, "");
     let location_text = location.unwrap_or_default();
-    let location_masked = masked_negative_re.replace_all(location_text, "");
-    if negative_re.is_match(&location_masked) || negative_re.is_match(&head_masked) {
+    let location_masked = MASKED_ONSITE_RE.replace_all(location_text, "");
+    if ONSITE_RE.is_match(&location_masked) || ONSITE_RE.is_match(&head_masked) {
         return Some(false);
     }
-    let body_says_remote = remote_re.is_match(&negated_re.replace_all(&head, ""));
+    let body_says_remote = REMOTE_RE.is_match(&NEGATED_REMOTE_RE.replace_all(&head, ""));
     match location {
         Some(loc) if loc.to_lowercase().contains("remote") => Some(true),
         Some(_) if body_says_remote => Some(true),
@@ -104,12 +135,10 @@ const HOURS_PER_YEAR: u64 = 2080;
 /// `USD 220,000 to 290,000`. Single amounts (`$180,000/yr`) set `min` only.
 /// `min`/`max` are always USD/year (hourly rates are annualized).
 pub fn extract_comp(text: &str) -> Option<CompRange> {
-    let range_re = Regex::new(
-        r"(?i)(?:USD\s*)?\$\s*(\d{2,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(k)?\s*(?:-|–|—|\bto\b)\s*(?:USD\s*)?\$?\s*(\d{2,3}(?:,\d{3})+|\d+(?:\.\d+)?)\s*(k)?",
-    )
-    .unwrap();
-    if let Some(caps) = range_re.captures(text) {
-        let m = caps.get(0).unwrap();
+    if let Some(caps) = COMP_RANGE_RE.captures(text) {
+        let m = caps
+            .get(0)
+            .expect("group 0 is present when captures succeeds");
         let period = detect_period_near(text, m.start(), m.end());
         let min = parse_amount(&caps[1], caps.get(2).map(|m| m.as_str()), &period);
         let max = parse_amount(&caps[3], caps.get(4).map(|m| m.as_str()), &period);
@@ -126,9 +155,10 @@ pub fn extract_comp(text: &str) -> Option<CompRange> {
         }
     }
 
-    let single_re = Regex::new(r"(?i)(?:USD\s*)?\$\s*(\d{2,3}(?:,\d{3})+)\s*(k)?").unwrap();
-    if let Some(caps) = single_re.captures(text) {
-        let m = caps.get(0).unwrap();
+    if let Some(caps) = COMP_SINGLE_RE.captures(text) {
+        let m = caps
+            .get(0)
+            .expect("group 0 is present when captures succeeds");
         let period = detect_period_near(text, m.start(), m.end());
         if let Some(amount) = parse_amount(&caps[1], caps.get(2).map(|m| m.as_str()), &period) {
             let raw = caps[0].trim().to_string();
@@ -183,9 +213,7 @@ fn detect_period_near(text: &str, start: usize, end: usize) -> String {
     let window = &text[window_start..window_end];
     let mid = (start + end) / 2;
 
-    let hourly_re = Regex::new(r"(?i)\b(per\s+hour|hourly|/hr|an\s+hour)\b").unwrap();
-    let yearly_re = Regex::new(r"(?i)\b(annually|yearly|per\s+year|/yr|a\s+year)\b").unwrap();
-    let nearest = |re: &Regex| {
+    let nearest = |re: &LazyLock<Regex>| {
         re.find_iter(window)
             .map(|m| {
                 let pos = window_start + m.start();
@@ -193,7 +221,7 @@ fn detect_period_near(text: &str, start: usize, end: usize) -> String {
             })
             .min()
     };
-    match (nearest(&hourly_re), nearest(&yearly_re)) {
+    match (nearest(&HOURLY_RE), nearest(&YEARLY_RE)) {
         (Some(h), Some(y)) if h < y => "hour".into(),
         (Some(_), None) => "hour".into(),
         _ => "year".into(),
@@ -202,11 +230,8 @@ fn detect_period_near(text: &str, start: usize, end: usize) -> String {
 
 /// Req id patterns in free text: `Req ID: JR2018233`, `Requisition #26-00061`.
 pub fn extract_req_id(text: &str) -> Option<String> {
-    let re = Regex::new(
-        r"(?i)\b(?:req(?:uisition)?(?:\s*id)?|job\s*(?:id|number|requisition)|requisition\s*id)\s*[:#]?\s*([A-Z0-9][A-Z0-9-]{2,})\b",
-    )
-    .unwrap();
-    re.captures(text)
+    REQ_ID_RE
+        .captures(text)
         .map(|caps| caps[1].to_string())
         // Must contain at least one digit (rules out plain words).
         .filter(|candidate| candidate.chars().any(|c| c.is_ascii_digit()))

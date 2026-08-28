@@ -58,7 +58,10 @@ impl Cli {
             Some(Commands::Ingest(_)) => "ingest",
             Some(Commands::Show(_)) => "show",
             Some(Commands::Completion) => "completion",
-            None => unreachable!("clap will print help if a subcommand is not provided"),
+            // `execute` handles the impossible None case gracefully (clap's
+            // arg_required_else_help makes it unreachable); the span label
+            // should agree rather than panic.
+            None => "none",
         }
     }
 }
@@ -153,9 +156,14 @@ mod tests {
     }
 
     #[test]
-    fn command_name_none_panics_only_via_unreachable() {
-        // The None branch is unreachable in practice (clap requires a
-        // subcommand); keep the color/telemetry wiring type-checked.
-        let _ = ColorChoice::Auto;
+    fn command_name_none_is_none_not_panic() {
+        let cli = Cli {
+            color: colorchoice_clap::Color {
+                color: ColorChoice::Auto,
+            },
+            telemetry: TelemetryStatus::Off,
+            command: None,
+        };
+        assert_eq!(cli.command_name(), "none");
     }
 }
