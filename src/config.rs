@@ -4,7 +4,7 @@ use std::{
 };
 
 use directories::ProjectDirs;
-use miette::{Context, IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic, Result, bail};
 use serde::Deserialize;
 use tracing::instrument;
 
@@ -102,15 +102,41 @@ impl Config {
     #[instrument]
     pub fn load(paths: &AppPaths) -> Result<Self> {
         let path = paths.config_dir().join(Self::FILE_NAME);
-        match std::fs::read_to_string(&path) {
+        let config = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .into_diagnostic()
-                .wrap_err_with(|| format!("parsing {}", path.display())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("reading {}", path.display())),
+                .wrap_err_with(|| format!("parsing {}", path.display()))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("reading {}", path.display()));
+            }
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Reject invalid configurations that would silently corrupt rankings:
+    /// non-finite/negative scoring weights, and a compensation ceiling at or
+    /// below the floor.
+    fn validate(&self) -> Result<()> {
+        for (name, weight) in [
+            ("level", self.scoring_weights.level),
+            ("skills", self.scoring_weights.skills),
+            ("compensation", self.scoring_weights.compensation),
+            ("remote", self.scoring_weights.remote),
+        ] {
+            if !weight.is_finite() || weight < 0.0 {
+                bail!("scoring weight '{name}' must be finite and non-negative, got {weight}");
+            }
         }
+        if let (Some(floor), Some(ceiling)) = (self.compensation_floor, self.compensation_ceiling)
+            && ceiling <= floor
+        {
+            bail!("compensation_ceiling ({ceiling}) must be above compensation_floor ({floor})");
+        }
+        Ok(())
     }
 }
 

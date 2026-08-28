@@ -29,11 +29,15 @@ pub struct Skill {
 }
 
 impl Resume {
-    /// Flatten all skills' keywords into one list (the scoring input).
+    /// Flatten all skills' keywords into one list (the scoring input),
+    /// deduplicated case-insensitively so a keyword repeated across skill
+    /// groups is counted once.
     pub fn keywords(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
         self.skills
             .iter()
             .flat_map(|s| s.keywords.iter().cloned())
+            .filter(|k| seen.insert(k.to_lowercase()))
             .collect()
     }
 }

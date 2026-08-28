@@ -5,7 +5,7 @@
 //! understands `reviewed` marks so the durable-ignore suppression rule is in
 //! place before marks exist.
 
-use miette::Result;
+use miette::{Result, bail};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -61,6 +61,11 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
             // revision, several events) and when an evaluation passes
             // (snapshot event, no rejected/scored events at all).
             state.eval_revision += 1;
+            // A new snapshot invalidates the previous score: the new
+            // evaluation's `scored` event (if any) follows in the same batch.
+            // If the batch tears, the lead must not present a stale score
+            // (decision 0006).
+            state.latest_score = None;
             if let Ok(snapshot) = serde_json::from_value::<SnapshotFields>(event.payload.clone()) {
                 state.snapshot = Some(snapshot.extracted);
                 state.url = snapshot.url;
@@ -114,6 +119,20 @@ pub fn decide_ingest(
     gate_failures: Vec<GateFailure>,
     score: Option<ScoreResult>,
 ) -> Result<(IngestKind, Vec<PendingEvent>)> {
+    // Pass-marker invariant (decision 0006): a non-suppressed evaluation
+    // emits exactly one of `rejected` (gate failure) or `scored` (gate pass).
+    // The suppressed path (ignore mark) is exempt — it returns before any
+    // evaluation events are considered.
+    let suppressed = state.exists && state.latest_mark.as_deref() == Some("ignore");
+    if !suppressed {
+        if !gate_failures.is_empty() && score.is_some() {
+            bail!("evaluation cannot be both rejected and scored");
+        }
+        if gate_failures.is_empty() && score.is_none() {
+            bail!("a gate-passing evaluation must carry a score");
+        }
+    }
+
     if !state.exists {
         let payload = IngestedPayload {
             dedupe_key: identity.dedupe_key.clone(),
@@ -280,11 +299,11 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![],
-            None,
+            Some(score_result()),
         )
         .unwrap();
         assert_eq!(kind, IngestKind::New);
-        assert_eq!(events.len(), 1);
+        assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, event_type::INGESTED);
         assert_eq!(events[0].payload["dedupe_key"], "url:https://example.com/j");
     }
@@ -308,7 +327,7 @@ mod tests {
             "body".into(),
             extracted("Senior Engineer"),
             vec![],
-            None,
+            Some(score_result()),
         )
         .unwrap();
         assert_eq!(
@@ -567,7 +586,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![],
-            None,
+            Some(score_result()),
         )
         .unwrap();
         assert!(matches!(kind, IngestKind::Updated { .. }));
@@ -592,7 +611,7 @@ mod tests {
             "body".into(),
             extracted("Engineer"),
             vec![],
-            None,
+            Some(score_result()),
         )
         .unwrap();
         assert_eq!(

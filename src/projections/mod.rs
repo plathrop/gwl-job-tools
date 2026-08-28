@@ -158,6 +158,10 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                 record.url = view.url;
                 record.extracted = view.extracted;
                 record.latest_rejection = None;
+                // A new snapshot invalidates the previous score (decision
+                // 0006): the new evaluation's `scored` event follows in the
+                // same batch, and a torn batch must not present a stale score.
+                record.latest_score = None;
                 record.event_count += 1;
                 record.last_event = event.recorded_at;
             }
