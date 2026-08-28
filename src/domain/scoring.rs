@@ -99,12 +99,14 @@ fn composite_and_breakdown(
     let parts: Vec<String> = dimensions
         .iter()
         .map(|d| {
-            format!(
-                "{}·{}({})",
-                fmt_weight(d.weight / total_weight),
-                d.name,
-                d.score
-            )
+            // Guard against a zero total weight (all-zero config): the
+            // renormalized weight is 0, not NaN.
+            let renormalized = if total_weight > 0.0 {
+                d.weight / total_weight
+            } else {
+                0.0
+            };
+            format!("{}·{}({})", fmt_weight(renormalized), d.name, d.score)
         })
         .collect();
     let mut breakdown = format!("{composite} = {}", parts.join(" + "));
@@ -143,16 +145,16 @@ fn level_score(extracted: &ExtractedFields, raw_text: &str) -> u64 {
     let title = extracted.title.as_deref().unwrap_or("").to_lowercase();
     if ["principal", "staff", "architect"]
         .iter()
-        .any(|k| title.contains(k))
+        .any(|k| token_in(k, &title))
     {
         return 100;
     }
-    if ["senior", "lead"].iter().any(|k| title.contains(k)) {
+    if ["senior", "lead"].iter().any(|k| token_in(k, &title)) {
         return 70;
     }
     if ["junior", "associate", "entry", "intern"]
         .iter()
-        .any(|k| title.contains(k))
+        .any(|k| token_in(k, &title))
     {
         return 10;
     }
@@ -167,7 +169,7 @@ fn level_score(extracted: &ExtractedFields, raw_text: &str) -> u64 {
 /// bound of a range — the minimum experience required).
 fn extract_years(text: &str) -> Option<u64> {
     static YEARS_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)(\d{1,2})\s*(?:\+|\s*-\s*\d{1,2})?\s*(?:years|yrs)")
+        regex::Regex::new(r"(?i)(\d{1,2})\s*(?:\+|\s*[-–—]\s*\d{1,2})?\s*(?:years|yrs)")
             .expect("static regex compiles")
     });
     YEARS_RE
@@ -194,7 +196,7 @@ fn skills_score(
     (matched.min(SKILLS_MATCH_CAP) * 100 / SKILLS_MATCH_CAP) as u64
 }
 
-/// A resume keyword matches the JD if its tokens appear (word-boundary,
+/// A resume keyword matches the JD if its tokens appear (token-boundary,
 /// case-insensitive). Parentheticals (`AWS (EC2, S3, …)`) match when the head
 /// OR any parenthetical item appears. The alias table maps a shorthand to a
 /// canonical keyword, so `K8s` in the JD matches the `Kubernetes` keyword.
@@ -204,25 +206,34 @@ fn keyword_matches(keyword: &str, jd_lower: &str, aliases: &HashMap<String, Stri
         let head = kw[..open].trim();
         let inner = kw[open + 1..].trim_end_matches(')');
         let alternatives: Vec<&str> = inner.split(',').map(str::trim).collect();
-        return word_in(head, jd_lower) || alternatives.iter().any(|a| word_in(a, jd_lower));
+        return token_in(head, jd_lower) || alternatives.iter().any(|a| token_in(a, jd_lower));
     }
-    let tokens: Vec<&str> = kw
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() >= 2)
-        .collect();
-    let token_match = !tokens.is_empty() && tokens.iter().all(|t| word_in(t, jd_lower));
+    // Split on whitespace (not all non-alphanumerics) so punctuated keywords
+    // like `C++` and `.NET` stay whole, and single-character keywords (`R`,
+    // `C`) are preserved.
+    let tokens: Vec<&str> = kw.split_whitespace().collect();
+    let token_match = !tokens.is_empty() && tokens.iter().all(|t| token_in(t, jd_lower));
     let alias_match = aliases.iter().any(|(alias, canonical)| {
-        canonical.eq_ignore_ascii_case(keyword) && word_in(&alias.to_lowercase(), jd_lower)
+        canonical.eq_ignore_ascii_case(keyword) && token_in(&alias.to_lowercase(), jd_lower)
     });
     token_match || alias_match
 }
 
-/// Word-boundary, case-insensitive substring match.
-fn word_in(word: &str, text: &str) -> bool {
-    if word.is_empty() {
+/// Token match with alphanumeric-aware boundaries (case-insensitive). Unlike
+/// `\b`, this holds at punctuation edges, so single-character and punctuated
+/// keywords (`R`, `C++`, `.NET`) match correctly without over-matching (`R`
+/// must not match `Rust`, `C++` must not match `C`).
+fn token_in(token: &str, text: &str) -> bool {
+    if token.is_empty() {
         return false;
     }
-    let pattern = format!(r"(?i)\b{}\b", regex::escape(word));
+    // The regex crate does not support look-around, so the boundaries are an
+    // explicit group: the token must be preceded and followed by a
+    // non-alphanumeric character (or the start/end of the text).
+    let pattern = format!(
+        r"(?i)(?:^|[^[:alnum:]]){}(?:$|[^[:alnum:]])",
+        regex::escape(token)
+    );
     regex::Regex::new(&pattern)
         .map(|re| re.is_match(text))
         .unwrap_or(false)
@@ -556,6 +567,34 @@ mod tests {
         // All four dimensions present, equal weights → 0.25 each.
         assert!(result.breakdown.contains("0.25·level"));
         assert!(result.breakdown.contains("0.25·remote"));
+    }
+
+    #[test]
+    fn non_uniform_weights_renormalize_with_dropped_dimension() {
+        // The non-default weighted-sum path: unequal weights, one dimension
+        // dropped, renormalized breakdown.
+        let mut cfg = config();
+        cfg.scoring_weights = ScoringWeights {
+            level: 0.5,
+            skills: 0.5,
+            compensation: 0.0,
+            remote: 0.0,
+        };
+        let mut e = extracted();
+        e.comp = None;
+        let result = score(
+            &cfg,
+            &e,
+            "Kubernetes experience",
+            &["Kubernetes".to_string()],
+        );
+        // level 100 (staff), skills 10 (1 match), remote 100; comp drops out.
+        // Weights level 0.5, skills 0.5, remote 0.0 → total 1.0 → composite
+        // (0.5·100 + 0.5·10 + 0.0·100) = 55.
+        assert_eq!(result.composite, 55);
+        assert!(result.breakdown.contains("0.5·level(100)"));
+        assert!(result.breakdown.contains("0.5·skills(10)"));
+        assert!(result.breakdown.contains("compensation: unknown"));
     }
 
     #[test]

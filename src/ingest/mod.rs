@@ -303,12 +303,14 @@ pub fn ingest_file(path: &Path, content: &str) -> Result<IngestOutcome> {
     } else {
         // Plain-text drops have no title element; the first non-empty line
         // is the title candidate ("Staff Engineer — Acme" covers the
-        // company fallback's needs).
+        // company fallback's needs). Markdown heading markers (`#`) are
+        // stripped so a markdown drop and a plain-text drop of the same
+        // posting hash to the same `tc:` dedupe key.
         let first_line = content
             .lines()
             .map(str::trim)
             .find(|l| !l.is_empty())
-            .map(str::to_string);
+            .map(|l| l.trim_start_matches('#').trim_start().to_string());
         (first_line, content.to_string())
     };
     if raw_text.trim().is_empty() {
@@ -542,6 +544,22 @@ mod tests {
         assert_eq!(outcome.extracted.req_id.as_deref(), Some("R-12345"));
         assert_eq!(outcome.extracted.comp.unwrap().min, Some(200_000));
         assert_eq!(outcome.extracted.remote, Some(true));
+    }
+
+    #[test]
+    fn file_drop_markdown_strips_heading_markers() {
+        // A markdown drop and a plain-text drop of the same posting must
+        // hash to the same `tc:` dedupe key — the `#` heading marker must
+        // not leak into the title.
+        let outcome = ingest_file(
+            &PathBuf::from("jd.md"),
+            "# Staff Software Engineer, Platform — Acme\n\nRemote. Salary: $200,000 - $250,000.",
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.extracted.title.as_deref(),
+            Some("Staff Software Engineer, Platform — Acme")
+        );
     }
 
     #[test]
