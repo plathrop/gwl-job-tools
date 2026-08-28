@@ -538,6 +538,35 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn json_ld_path_extracts_base_salary() {
+        // schema.org's compensation field is `baseSalary`; the JSON-LD path
+        // ignores it, so a posting with fully structured comp degrades to
+        // comp-unknown (the floor gate passes, the comp dimension drops out
+        // of the composite) even though the source provided it.
+        let html = r#"<html><body>
+            <script type="application/ld+json">
+            {"@context":"https://schema.org/","@type":"JobPosting",
+             "title":"Staff Engineer",
+             "description":"<p>Build platforms with a growing team of engineers.</p>",
+             "baseSalary":{"@type":"MonetaryAmount","currency":"USD",
+               "value":{"@type":"QuantitativeValue","minValue":200000,"maxValue":250000,"unitText":"YEAR"}}}
+            </script>
+            </body></html>"#;
+        let posting = Url::parse("https://example.com/job/2").unwrap();
+        let fetcher = ScriptedFetcher::with(vec![response(200, None, html)]);
+        let client = client_with(fetcher);
+
+        let outcome = ingest_url(&posting, &client).await.unwrap();
+
+        let comp = outcome
+            .extracted
+            .comp
+            .expect("baseSalary should yield comp");
+        assert_eq!(comp.min, Some(200_000));
+        assert_eq!(comp.max, Some(250_000));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn rate_limited_api_does_not_fall_back_to_same_host() {
         // A 429 whose Retry-After exceeds the local cap must propagate —
         // fetching the posting page on the SAME host after the server told
