@@ -14,7 +14,7 @@ use crate::{domain::events::CheatSheetEntry, projections::LeadRecord};
 /// record-derived text before it reaches the terminal. Posting text is
 /// untrusted (remote job boards), so it must not be able to inject terminal
 /// control sequences.
-fn sanitize(s: &str) -> String {
+pub(crate) fn sanitize(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
 
@@ -266,6 +266,31 @@ mod tests {
         assert!(md.contains("| Remote | Yes |"));
         assert!(md.contains("| Source | search |"));
         assert!(md.contains("https://example.com/j"));
+    }
+
+    #[test]
+    fn sanitize_strips_control_characters() {
+        // ESC is stripped (making the sequence inert); the printable
+        // remainder stays. Newlines/tabs are stripped too (single-line
+        // fields).
+        assert_eq!(
+            sanitize("hello\u{1b}[31mworld\u{1b}[0m"),
+            "hello[31mworld[0m"
+        );
+        assert_eq!(sanitize("a\nb\tc"), "abc");
+        assert_eq!(sanitize("plain"), "plain");
+    }
+
+    #[test]
+    fn card_header_omits_company_when_title_ends_with_it() {
+        // Some boards keep the full "Title — Company" string in the title;
+        // the header must not append the company again.
+        let mut record = lead_record();
+        record.extracted.title = Some("Staff SRE — Alpha Co".into());
+        record.extracted.company = Some("Alpha Co".into());
+        let md = card_markdown(&record);
+        assert!(md.contains("# Staff SRE — Alpha Co - "));
+        assert!(!md.contains("Alpha Co - Alpha Co"));
     }
 
     #[test]

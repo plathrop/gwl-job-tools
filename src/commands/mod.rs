@@ -395,7 +395,7 @@ fn mark_lead(
     Ok(apply)
 }
 
-#[instrument(skip_all, fields(color))]
+#[instrument(skip_all, fields(color = %color))]
 pub async fn execute_review(config: &Config, paths: &AppPaths, color: bool) -> Result<()> {
     let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let events = store.replay()?;
@@ -424,7 +424,9 @@ impl RawModeGuard {
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
+        if let Err(err) = disable_raw_mode() {
+            warn!(error = %err, "failed to restore terminal raw mode");
+        }
     }
 }
 
@@ -489,14 +491,20 @@ fn review_loop(
                     break;
                 }
                 'm' => {
-                    // apply-manual: the user takes personal action. Provide
-                    // the cheat sheet + URL (the JD is in `show`/`events`).
-                    let resume = resume::load(config.resume_path.as_deref())?;
-                    let sheet = resume.as_ref().map(cheat_sheet).unwrap_or_default();
+                    // apply-manual: the user takes personal action. Mark
+                    // first, then provide the cheat sheet + URL best-effort
+                    // (a broken resume must not abort the session over an
+                    // accessory cheat sheet).
                     mark_lead(store, config, record, Mark::ApplyManual, None)?;
-                    print!("{}", render::render_cheat_sheet(&sheet));
+                    match resume::load(config.resume_path.as_deref()) {
+                        Ok(resume) => {
+                            let sheet = resume.as_ref().map(cheat_sheet).unwrap_or_default();
+                            print!("{}", render::render_cheat_sheet(&sheet));
+                        }
+                        Err(err) => warn!(error = %err, "could not load resume for cheat sheet"),
+                    }
                     if let Some(url) = record.url.as_deref() {
-                        println!("  URL: {url}");
+                        println!("  URL: {}", render::sanitize(url));
                     }
                     std::io::stdout().flush().into_diagnostic()?;
                     break;
