@@ -237,7 +237,12 @@ pub async fn execute_show(args: ShowArgs, paths: &AppPaths, json: bool, color: b
     let projection = projections::rebuild(&events)?;
 
     let record = select_lead(&projection, &args.id)?;
-    if json {
+    if args.jd {
+        match load_raw_text(&store, record.lead_id)? {
+            Some(text) => println!("{text}"),
+            None => return Err(miette!("no raw text for lead {}", record.lead_id)),
+        }
+    } else if json {
         println!(
             "{}",
             serde_json::to_string_pretty(record).into_diagnostic()?
@@ -246,6 +251,17 @@ pub async fn execute_show(args: ShowArgs, paths: &AppPaths, json: bool, color: b
         render::render_card(record, color)?;
     }
     Ok(())
+}
+
+/// The raw posting text for a lead, from the latest `ingested`/`updated`
+/// snapshot in its stream (the projection doesn't carry it).
+fn load_raw_text(store: &impl EventStore, lead_id: Uuid) -> Result<Option<String>> {
+    let stream = LeadState::stream_id(lead_id);
+    let mut state = LeadState::default();
+    for event in store.load(&stream)? {
+        lead::evolve(&mut state, &event);
+    }
+    Ok(state.raw_text)
 }
 
 /// Resolve a `<lead>` argument (unambiguous UUID prefix, design doc §8) to a
@@ -1506,5 +1522,24 @@ mod tests {
         let last = events.last().unwrap();
         assert_eq!(last.event_type, "reviewed");
         assert_eq!(last.payload["mark"], "defer");
+    }
+
+    #[test]
+    fn load_raw_text_returns_latest_snapshot_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut outcome = outcome("the full JD text");
+        outcome.url = Some("https://example.com/job/14".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+        record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
+
+        let events = store.replay().unwrap();
+        let projection = projections::rebuild(&events).unwrap();
+        let lead_id = projection.leads.values().next().unwrap().lead_id;
+        assert_eq!(
+            load_raw_text(&store, lead_id).unwrap().as_deref(),
+            Some("the full JD text")
+        );
     }
 }

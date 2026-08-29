@@ -56,6 +56,9 @@ impl LeadSource {
 pub struct ShowArgs {
     /// Unambiguous UUID prefix of the lead
     pub id: String,
+    /// Print the raw posting text (the JD) instead of the card
+    #[arg(long)]
+    pub jd: bool,
 }
 
 /// How an application was submitted (`applied` event, design doc 0001 §3).
