@@ -1,0 +1,253 @@
+//! Human-readable output rendering: the lead card (termimad markdown), the
+//! ranked queue (crossterm), and the review prompt.
+
+use crossterm::style::Color;
+use miette::{IntoDiagnostic, Result};
+use termimad::MadSkin;
+
+use crate::{domain::events::CheatSheetEntry, projections::LeadRecord};
+
+/// Linearly interpolate a score (0–100) through red → yellow → green.
+pub fn score_rgb(score: u64) -> (u8, u8, u8) {
+    let s = score.clamp(0, 100) as f32;
+    let (r, g) = if s <= 50.0 {
+        (255.0, s * 255.0 / 50.0)
+    } else {
+        (255.0 - (s - 50.0) * 255.0 / 50.0, 255.0)
+    };
+    (r as u8, g as u8, 0)
+}
+
+/// The crossterm color for a score.
+pub fn score_color(score: u64) -> Color {
+    let (r, g, b) = score_rgb(score);
+    Color::Rgb { r, g, b }
+}
+
+/// The markdown for a lead's card (design doc 0001 §5). The score number is
+/// the only bold text, so the caller can color it via the skin's `bold`
+/// style.
+pub fn card_markdown(record: &LeadRecord) -> String {
+    let mut md = String::new();
+
+    // Header: title - company - lead prefix (8 chars, decision 0008).
+    let title = record.extracted.title.as_deref().unwrap_or("Untitled");
+    let lead_prefix: String = record.lead_id.to_string().chars().take(8).collect();
+    match record.extracted.company.as_deref() {
+        Some(company) => md.push_str(&format!("# {title} - {company} - {lead_prefix}\n\n")),
+        None => md.push_str(&format!("# {title} - {lead_prefix}\n\n")),
+    }
+
+    // Score or rejection.
+    if let Some(score) = &record.latest_score {
+        md.push_str(&format!("**Score: {}**\n", score.composite));
+        md.push_str(&format!("`{}`\n\n", score.breakdown));
+    } else if let Some(rejection) = &record.latest_rejection {
+        md.push_str(&format!("**Rejected: {}**\n", rejection.gate));
+        md.push_str(&format!("`{}`\n\n", rejection.reason));
+    }
+
+    // Table (conditional rows).
+    md.push_str("| Field | Value |\n|---|---|\n");
+    if let Some(location) = record.extracted.location.as_deref() {
+        md.push_str(&format!("| Location | {location} |\n"));
+    }
+    let remote = match record.extracted.remote {
+        Some(true) => "Yes",
+        Some(false) => "No",
+        None => "Unknown",
+    };
+    md.push_str(&format!("| Remote | {remote} |\n"));
+    if let Some(comp) = &record.extracted.comp {
+        md.push_str(&format!("| Compensation | {} |\n", comp.raw));
+    }
+    if record.deferral_count > 0 {
+        md.push_str(&format!("| Deferral Count | {} |\n", record.deferral_count));
+    }
+    if let Some(mark) = record.latest_mark.as_deref() {
+        md.push_str(&format!("| Mark | {mark} |\n"));
+    }
+    if let Some(source) = record.source.as_deref() {
+        md.push_str(&format!("| Source | {source} |\n"));
+    }
+    if let Some(outcome) = &record.latest_outcome {
+        md.push_str(&format!("| Outcome | {} |\n", outcome.event_type));
+    }
+    md.push('\n');
+
+    // URL.
+    if let Some(url) = record.url.as_deref() {
+        md.push_str(url);
+        md.push('\n');
+    }
+
+    md
+}
+
+/// Render a lead's card to stdout.
+pub fn render_card(record: &LeadRecord, color: bool) -> Result<()> {
+    let md = card_markdown(record);
+    let mut skin = if color {
+        MadSkin::default()
+    } else {
+        MadSkin::no_style()
+    };
+    if color && let Some(score) = &record.latest_score {
+        skin.bold.set_fg(score_color(score.composite));
+    }
+    skin.write_text(&md).into_diagnostic()?;
+    Ok(())
+}
+
+/// Render the ranked queue to stdout (rank, colored score, title @ company,
+/// deferral count, mark, outcome).
+pub fn render_list(records: &[&LeadRecord], color: bool) -> Result<()> {
+    for (i, record) in records.iter().enumerate() {
+        let title = record.extracted.title.as_deref().unwrap_or("Untitled");
+        let company = record.extracted.company.as_deref().unwrap_or("");
+
+        let score = match &record.latest_score {
+            Some(score) => colored_score(score.composite, color),
+            None => "  -".to_string(),
+        };
+
+        let mut line = format!("{:>3}  {score}  {title}", i + 1);
+        if !company.is_empty() {
+            line.push_str(&format!(" @ {company}"));
+        }
+        if record.deferral_count > 0 {
+            line.push_str(&format!("  (deferred {}×)", record.deferral_count));
+        }
+        if let Some(mark) = record.latest_mark.as_deref() {
+            line.push_str(&format!("  [{mark}]"));
+        }
+        if let Some(outcome) = &record.latest_outcome {
+            line.push_str(&format!("  [{}]", outcome.event_type));
+        }
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// A score rendered with a 24-bit RGB foreground when color is on.
+fn colored_score(score: u64, color: bool) -> String {
+    if color {
+        let (r, g, b) = score_rgb(score);
+        format!("\x1b[38;2;{r};{g};{b}m{score:>3}\x1b[0m")
+    } else {
+        format!("{score:>3}")
+    }
+}
+
+/// The review prompt line: single-key actions with the key accented (color)
+/// or parenthesized (no color).
+pub fn render_prompt(color: bool) -> String {
+    const ACTIONS: [(&str, &str); 6] = [
+        ("a", "uto"),
+        ("m", "anual"),
+        ("d", "efer"),
+        ("i", "gnore"),
+        ("s", "kip"),
+        ("q", "uit"),
+    ];
+    let parts: Vec<String> = ACTIONS
+        .iter()
+        .map(|(key, rest)| {
+            if color {
+                format!("\x1b[1;36m{key}\x1b[0m{rest}")
+            } else {
+                format!("({key}){rest}")
+            }
+        })
+        .collect();
+    parts.join(" | ")
+}
+
+/// The ATS cheat sheet, shown after an `apply-automatically` mark so the
+/// answers are visible while completing the opened form.
+pub fn render_cheat_sheet(entries: &[CheatSheetEntry]) -> String {
+    let mut s = String::from("Cheat sheet:\n");
+    for entry in entries {
+        s.push_str(&format!("  {}: {}\n", entry.question, entry.answer));
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::Timestamp;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::{
+        domain::events::{CompRange, ExtractedFields, Identifiers, ScoredPayload},
+        projections::LeadRecord,
+    };
+
+    fn lead_record() -> LeadRecord {
+        LeadRecord {
+            lead_id: Uuid::now_v7(),
+            dedupe_key: None,
+            identifiers: Identifiers::default(),
+            adapter: None,
+            source: Some("search".into()),
+            url: Some("https://example.com/j".into()),
+            extracted: ExtractedFields {
+                title: Some("Staff Engineer".into()),
+                company: Some("Acme".into()),
+                location: Some("Remote, US".into()),
+                remote: Some(true),
+                comp: Some(CompRange {
+                    min: Some(200_000),
+                    max: Some(250_000),
+                    currency: "USD".into(),
+                    period: "year".into(),
+                    raw: "$200,000 - $250,000".into(),
+                }),
+                ..Default::default()
+            },
+            latest_mark: None,
+            deferral_count: 0,
+            apply_queued: false,
+            latest_rejection: None,
+            latest_score: Some(ScoredPayload {
+                composite: 75,
+                revision: 1,
+                dimensions: vec![],
+                breakdown: "75 = 0.5·level(80) + 0.5·remote(70)".into(),
+            }),
+            latest_outcome: None,
+            event_count: 0,
+            first_seen: Timestamp::now(),
+            last_event: Timestamp::now(),
+        }
+    }
+
+    #[test]
+    fn score_rgb_gradient() {
+        assert_eq!(score_rgb(0), (255, 0, 0)); // red
+        assert_eq!(score_rgb(50), (255, 255, 0)); // yellow
+        assert_eq!(score_rgb(100), (0, 255, 0)); // green
+        assert_eq!(score_rgb(25), (255, 127, 0)); // orange-ish
+    }
+
+    #[test]
+    fn card_markdown_has_header_score_and_table() {
+        let md = card_markdown(&lead_record());
+        assert!(md.contains("# Staff Engineer - Acme - "));
+        assert!(md.contains("**Score: 75**"));
+        assert!(md.contains("| Location | Remote, US |"));
+        assert!(md.contains("| Remote | Yes |"));
+        assert!(md.contains("| Source | search |"));
+        assert!(md.contains("https://example.com/j"));
+    }
+
+    #[test]
+    fn render_prompt_colors_keys() {
+        let colored = render_prompt(true);
+        assert!(colored.contains("\u{1b}[1;36ma\u{1b}[0muto"));
+        let plain = render_prompt(false);
+        assert!(plain.contains("(a)uto"));
+        assert!(!plain.contains('\u{1b}'));
+    }
+}

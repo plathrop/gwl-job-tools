@@ -1,5 +1,11 @@
 //! Command implementations. Thin: I/O wiring around the domain.
 
+use std::io::Write;
+
+use crossterm::{
+    event::{Event, KeyCode, KeyEvent, KeyModifiers, read},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use jiff::Timestamp;
 use miette::{Context, IntoDiagnostic, Result, bail, miette};
 use serde::Serialize;
@@ -27,13 +33,20 @@ use crate::{
     event_store::{EventStore, JsonlEventStore},
     ingest::{self, IngestOutcome},
     projections::{self, LeadRecord, Projection},
+    render,
     resume::{self, Resume},
 };
 
 const EVENT_LOG_NAME: &str = "events.jsonl";
 
 #[instrument(skip_all)]
-pub async fn execute_ingest(args: IngestArgs, config: &Config, paths: &AppPaths) -> Result<()> {
+pub async fn execute_ingest(
+    args: IngestArgs,
+    config: &Config,
+    paths: &AppPaths,
+    json: bool,
+    color: bool,
+) -> Result<()> {
     // Load the resume before fetching: a configured-but-broken resume fails
     // loudly before any network I/O (decision 0004).
     let resume = resume::load(config.resume_path.as_deref())?;
@@ -67,10 +80,22 @@ pub async fn execute_ingest(args: IngestArgs, config: &Config, paths: &AppPaths)
     let projection = projections::rebuild(&events)?;
 
     let summary = record_ingest(&mut store, &projection, config, &resume_skills, outcome)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&summary).into_diagnostic()?
-    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&summary).into_diagnostic()?
+        );
+    } else {
+        // Rebuild the projection to get the updated lead record, then render
+        // the card.
+        let events = store.replay()?;
+        let projection = projections::rebuild(&events)?;
+        let record = projection
+            .leads
+            .get(&summary.lead_id)
+            .ok_or_else(|| miette!("lead {} not found after ingest", summary.lead_id))?;
+        render::render_card(record, color)?;
+    }
     Ok(())
 }
 
@@ -206,16 +231,20 @@ pub struct IngestSummary {
 }
 
 #[instrument(skip_all)]
-pub async fn execute_show(args: ShowArgs, paths: &AppPaths) -> Result<()> {
+pub async fn execute_show(args: ShowArgs, paths: &AppPaths, json: bool, color: bool) -> Result<()> {
     let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let events = store.replay()?;
     let projection = projections::rebuild(&events)?;
 
     let record = select_lead(&projection, &args.id)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(record).into_diagnostic()?
-    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(record).into_diagnostic()?
+        );
+    } else {
+        render::render_card(record, color)?;
+    }
     Ok(())
 }
 
@@ -265,12 +294,12 @@ fn queue_entry(rank: usize, record: &LeadRecord) -> QueueEntry {
 }
 
 #[instrument(skip_all)]
-pub async fn execute_list(args: ListArgs, paths: &AppPaths) -> Result<()> {
+pub async fn execute_list(args: ListArgs, paths: &AppPaths, json: bool, color: bool) -> Result<()> {
     let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let events = store.replay()?;
     let projection = projections::rebuild(&events)?;
 
-    let entries: Vec<QueueEntry> = if args.all {
+    let records: Vec<&LeadRecord> = if args.all {
         let mut leads: Vec<&LeadRecord> = projection.leads.values().collect();
         leads.sort_by(|a, b| {
             let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
@@ -278,23 +307,23 @@ pub async fn execute_list(args: ListArgs, paths: &AppPaths) -> Result<()> {
             sb.cmp(&sa).then_with(|| a.first_seen.cmp(&b.first_seen))
         });
         leads
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| queue_entry(i + 1, r))
-            .collect()
     } else {
-        projection
-            .pending_queue()
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| queue_entry(i + 1, r))
-            .collect()
+        projection.pending_queue()
     };
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&entries).into_diagnostic()?
-    );
+    if json {
+        let entries: Vec<QueueEntry> = records
+            .iter()
+            .enumerate()
+            .map(|(i, r)| queue_entry(i + 1, r))
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).into_diagnostic()?
+        );
+    } else {
+        render::render_list(&records, color)?;
+    }
     Ok(())
 }
 
@@ -306,34 +335,7 @@ pub async fn execute_mark(args: MarkArgs, config: &Config, paths: &AppPaths) -> 
 
     let record = select_lead(&projection, &args.lead)?;
     let lead_id = record.lead_id;
-
-    // Prepare the apply package for apply-automatically (the mark IS the
-    // approval; the package is assembled before the batch append so a
-    // preparation failure leaves the lead unmarked).
-    let apply = if args.mark == Mark::ApplyAutomatically {
-        Some(prepare_package(config, record)?)
-    } else {
-        None
-    };
-
-    let pending = lead::decide_mark(args.mark.as_str(), args.note, apply.clone())?;
-
-    let stream = LeadState::stream_id(lead_id);
-    let mut state = LeadState::default();
-    for event in store.load(&stream)? {
-        lead::evolve(&mut state, &event);
-    }
-    store.append(&stream, state.seq, &pending, Uuid::now_v7())?;
-
-    // Open the posting URL for apply-automatically (the final click is the
-    // user's; v0 just opens the page). Best-effort: a launch failure must
-    // not report the mark as failed (the events are already durably
-    // appended).
-    if args.mark == Mark::ApplyAutomatically
-        && let Some(url) = record.url.as_deref()
-    {
-        open_url(url);
-    }
+    let apply = mark_lead(&mut store, config, record, args.mark, args.note)?;
 
     let mut output = serde_json::json!({
         "lead_id": lead_id,
@@ -348,6 +350,124 @@ pub async fn execute_mark(args: MarkArgs, config: &Config, paths: &AppPaths) -> 
         "{}",
         serde_json::to_string_pretty(&output).into_diagnostic()?
     );
+    Ok(())
+}
+
+/// Mark a lead: prepare the package (for apply-automatically), decide the
+/// events, append them, and open the URL. Returns the prepared package so the
+/// caller can surface the cheat sheet.
+fn mark_lead(
+    store: &mut impl EventStore,
+    config: &Config,
+    record: &LeadRecord,
+    mark: Mark,
+    note: Option<String>,
+) -> Result<Option<ApplyQueuedPayload>> {
+    let lead_id = record.lead_id;
+    // Prepare the apply package for apply-automatically (the mark IS the
+    // approval; the package is assembled before the batch append so a
+    // preparation failure leaves the lead unmarked).
+    let apply = if mark == Mark::ApplyAutomatically {
+        Some(prepare_package(config, record)?)
+    } else {
+        None
+    };
+
+    let pending = lead::decide_mark(mark.as_str(), note, apply.clone())?;
+
+    let stream = LeadState::stream_id(lead_id);
+    let mut state = LeadState::default();
+    for event in store.load(&stream)? {
+        lead::evolve(&mut state, &event);
+    }
+    store.append(&stream, state.seq, &pending, Uuid::now_v7())?;
+
+    // Open the posting URL for apply-automatically (the final click is the
+    // user's; v0 just opens the page). Best-effort: a launch failure must
+    // not report the mark as failed (the events are already durably
+    // appended).
+    if mark == Mark::ApplyAutomatically
+        && let Some(url) = record.url.as_deref()
+    {
+        open_url(url);
+    }
+    Ok(apply)
+}
+
+#[instrument(skip_all)]
+pub async fn execute_review(config: &Config, paths: &AppPaths, color: bool) -> Result<()> {
+    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let events = store.replay()?;
+    let projection = projections::rebuild(&events)?;
+    let pending = projection.pending_queue();
+
+    if pending.is_empty() {
+        println!("no pending leads");
+        return Ok(());
+    }
+
+    // Raw mode for single-key input; always restore the terminal, even on
+    // error.
+    enable_raw_mode().into_diagnostic()?;
+    let result = review_loop(&mut store, config, &pending, color);
+    disable_raw_mode().into_diagnostic()?;
+    result
+}
+
+/// The interactive review loop (design doc 0001 §5): step through the pending
+/// queue highest-score-first, render each card, and take a single-key mark.
+fn review_loop(
+    store: &mut impl EventStore,
+    config: &Config,
+    pending: &[&LeadRecord],
+    color: bool,
+) -> Result<()> {
+    for record in pending {
+        render::render_card(record, color)?;
+        print!("{} ", render::render_prompt(color));
+        std::io::stdout().flush().into_diagnostic()?;
+
+        let key = loop {
+            match read().into_diagnostic()? {
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char(c),
+                    modifiers,
+                    ..
+                }) => {
+                    if modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                        return Ok(()); // Ctrl-C quits.
+                    }
+                    break c;
+                }
+                _ => continue,
+            }
+        };
+        println!();
+
+        match key {
+            'a' => {
+                let apply = mark_lead(store, config, record, Mark::ApplyAutomatically, None)?;
+                if let Some(package) = &apply {
+                    print!(
+                        "{}",
+                        render::render_cheat_sheet(&package.package.cheat_sheet)
+                    );
+                }
+            }
+            'm' => {
+                mark_lead(store, config, record, Mark::ApplyManual, None)?;
+            }
+            'd' => {
+                mark_lead(store, config, record, Mark::Defer, None)?;
+            }
+            'i' => {
+                mark_lead(store, config, record, Mark::Ignore, None)?;
+            }
+            's' => {} // skip: session-local, no event.
+            'q' => return Ok(()),
+            _ => {} // unknown key: move on.
+        }
+    }
     Ok(())
 }
 
@@ -1303,5 +1423,27 @@ mod tests {
         };
         let record = lead_record(Some("https://example.com/j"));
         assert!(prepare_package(&config, &record).is_err());
+    }
+
+    #[test]
+    fn mark_lead_appends_reviewed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        let mut outcome = outcome("body");
+        outcome.url = Some("https://example.com/job/13".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+        record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
+
+        // Rebuild the projection to get the lead record, then mark it defer.
+        let events = store.replay().unwrap();
+        let projection = projections::rebuild(&events).unwrap();
+        let record = projection.leads.values().next().unwrap();
+        mark_lead(&mut store, &Config::default(), record, Mark::Defer, None).unwrap();
+
+        let events = store.replay().unwrap();
+        let last = events.last().unwrap();
+        assert_eq!(last.event_type, "reviewed");
+        assert_eq!(last.payload["mark"], "defer");
     }
 }

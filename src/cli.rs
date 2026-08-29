@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::IsTerminal, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 use miette::Result;
@@ -267,6 +267,9 @@ pub enum Commands {
     /// Mark a lead (apply-automatically, apply-manual, defer, ignore)
     Mark(MarkArgs),
 
+    /// Interactively review the pending queue
+    Review,
+
     /// Generate shell completions
     Completion,
 }
@@ -287,11 +290,25 @@ pub struct Cli {
     #[arg(long, value_enum)]
     pub log_level: Option<LogLevel>,
 
+    /// Output JSON instead of the human-readable card
+    #[arg(long, global = true)]
+    pub json: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
 
 impl Cli {
+    /// Whether to emit color (the `--color` choice, resolved against the
+    /// terminal for `auto`).
+    pub fn color_enabled(&self) -> bool {
+        match self.color.color {
+            clap::ColorChoice::Never => false,
+            clap::ColorChoice::Always => true,
+            clap::ColorChoice::Auto => std::io::stdout().is_terminal(),
+        }
+    }
+
     pub fn command_name(&self) -> &'static str {
         match self.command.as_ref() {
             Some(Commands::Ingest(_)) => "ingest",
@@ -304,25 +321,35 @@ impl Cli {
             Some(Commands::Events(_)) => "events",
             Some(Commands::List(_)) => "list",
             Some(Commands::Mark(_)) => "mark",
+            Some(Commands::Review) => "review",
             Some(Commands::Completion) => "completion",
             None => "none",
         }
     }
 }
 
-#[instrument(skip(command, config, paths), fields(command = cmd_label(&command)))]
-pub async fn execute(command: Option<Commands>, config: &Config, paths: &AppPaths) -> Result<()> {
+#[instrument(skip(command, config, paths, json, color), fields(command = cmd_label(&command)))]
+pub async fn execute(
+    command: Option<Commands>,
+    config: &Config,
+    paths: &AppPaths,
+    json: bool,
+    color: bool,
+) -> Result<()> {
     match command {
-        Some(Commands::Ingest(args)) => commands::execute_ingest(args, config, paths).await,
-        Some(Commands::Show(args)) => commands::execute_show(args, paths).await,
+        Some(Commands::Ingest(args)) => {
+            commands::execute_ingest(args, config, paths, json, color).await
+        }
+        Some(Commands::Show(args)) => commands::execute_show(args, paths, json, color).await,
         Some(Commands::Applied(args)) => commands::execute_applied(args, paths).await,
         Some(Commands::Screened(args)) => commands::execute_screened(args, paths).await,
         Some(Commands::Interviewed(args)) => commands::execute_interviewed(args, paths).await,
         Some(Commands::Offered(args)) => commands::execute_offered(args, paths).await,
         Some(Commands::Outcome(args)) => commands::execute_outcome(args, paths).await,
         Some(Commands::Events(args)) => commands::execute_events(args, paths).await,
-        Some(Commands::List(args)) => commands::execute_list(args, paths).await,
+        Some(Commands::List(args)) => commands::execute_list(args, paths, json, color).await,
         Some(Commands::Mark(args)) => commands::execute_mark(args, config, paths).await,
+        Some(Commands::Review) => commands::execute_review(config, paths, color).await,
         Some(Commands::Completion) => Err(miette::miette!("completion is not yet implemented")),
         None => Err(miette::miette!(
             "no command provided; run `{APP_NAME} --help`"
@@ -342,6 +369,7 @@ fn cmd_label(command: &Option<Commands>) -> &'static str {
         Some(Commands::Events(_)) => "events",
         Some(Commands::List(_)) => "list",
         Some(Commands::Mark(_)) => "mark",
+        Some(Commands::Review) => "review",
         Some(Commands::Completion) => "completion",
         None => "none",
     }
@@ -423,6 +451,7 @@ mod tests {
             },
             telemetry: TelemetryStatus::Off,
             log_level: None,
+            json: false,
             command: None,
         };
         assert_eq!(cli.command_name(), "none");
