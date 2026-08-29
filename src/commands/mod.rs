@@ -4,7 +4,7 @@ use jiff::Timestamp;
 use miette::{Context, IntoDiagnostic, Result, bail, miette};
 use serde::Serialize;
 use serde_with::skip_serializing_none;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -313,7 +313,7 @@ pub async fn execute_mark(args: MarkArgs, config: &Config, paths: &AppPaths) -> 
         None
     };
 
-    let pending = lead::decide_mark(args.mark.as_str(), args.note, apply)?;
+    let pending = lead::decide_mark(args.mark.as_str(), args.note, apply.clone())?;
 
     let stream = LeadState::stream_id(lead_id);
     let mut state = LeadState::default();
@@ -323,20 +323,27 @@ pub async fn execute_mark(args: MarkArgs, config: &Config, paths: &AppPaths) -> 
     store.append(&stream, state.seq, &pending, Uuid::now_v7())?;
 
     // Open the posting URL for apply-automatically (the final click is the
-    // user's; v0 just opens the page).
+    // user's; v0 just opens the page). Best-effort: a launch failure must
+    // not report the mark as failed (the events are already durably
+    // appended).
     if args.mark == Mark::ApplyAutomatically
         && let Some(url) = record.url.as_deref()
     {
-        open_url(url)?;
+        open_url(url);
     }
 
+    let mut output = serde_json::json!({
+        "lead_id": lead_id,
+        "mark": args.mark.as_str(),
+    });
+    // Surface the prepared package (including the cheat sheet) so the user
+    // can see the answers while completing the opened form.
+    if let Some(package) = &apply {
+        output["package"] = serde_json::to_value(package).into_diagnostic()?;
+    }
     println!(
         "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "lead_id": lead_id,
-            "mark": args.mark.as_str(),
-        }))
-        .into_diagnostic()?
+        serde_json::to_string_pretty(&output).into_diagnostic()?
     );
     Ok(())
 }
@@ -345,21 +352,37 @@ pub async fn execute_mark(args: MarkArgs, config: &Config, paths: &AppPaths) -> 
 /// 0001 §3): cover-letter path, resume PDF path (derived from the JSON
 /// resume path), the ATS cheat sheet, and the posting URL. Fails loudly on a
 /// configured-but-broken resume (decision 0004); a missing resume degrades
-/// to an empty cheat sheet.
+/// to an empty cheat sheet. A configured-but-missing cover letter or derived
+/// resume PDF is a warning, not a failure — the files are attached manually
+/// in v0.
 fn prepare_package(config: &Config, record: &LeadRecord) -> Result<ApplyQueuedPayload> {
     let resume = resume::load(config.resume_path.as_deref())?;
     let cheat_sheet = resume.as_ref().map(cheat_sheet).unwrap_or_default();
+
+    let cover_letter_path = config
+        .cover_letter_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    if let Some(path) = config.cover_letter_path.as_deref()
+        && !path.exists()
+    {
+        warn!(path = %path.display(), "configured cover letter does not exist");
+    }
+
     let resume_pdf = config
         .resume_path
         .as_deref()
-        .map(|p| p.with_extension("pdf").to_string_lossy().into_owned());
+        .map(|p| p.with_extension("pdf"));
+    if let Some(pdf) = resume_pdf.as_deref()
+        && !pdf.exists()
+    {
+        warn!(path = %pdf.display(), "derived resume PDF does not exist");
+    }
+
     Ok(ApplyQueuedPayload {
         package: ApplyPackage {
-            cover_letter_path: config
-                .cover_letter_path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned()),
-            resume_path: resume_pdf,
+            cover_letter_path,
+            resume_path: resume_pdf.map(|p| p.to_string_lossy().into_owned()),
             cheat_sheet,
         },
         url: record.url.clone(),
@@ -423,25 +446,29 @@ fn cheat_sheet(resume: &Resume) -> Vec<CheatSheetEntry> {
 }
 
 /// Open a URL in the user's default browser (best-effort; the final click is
-/// the user's).
-fn open_url(url: &str) -> Result<()> {
+/// the user's). A launch failure is logged and surfaced on stderr, but does
+/// not fail the command — the mark has already been durably recorded.
+fn open_url(url: &str) {
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("open");
         c.arg(url);
         c
     } else if cfg!(target_os = "windows") {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", url]);
+        // `rundll32 url.dll,FileProtocolHandler` opens the URL without a
+        // shell, so metacharacters in the URL are not interpreted (unlike
+        // `cmd /C start`).
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
         c
     } else {
         let mut c = std::process::Command::new("xdg-open");
         c.arg(url);
         c
     };
-    cmd.spawn()
-        .into_diagnostic()
-        .wrap_err_with(|| format!("opening {url}"))?;
-    Ok(())
+    if let Err(err) = cmd.spawn() {
+        warn!(error = %err, "failed to open posting URL in browser");
+        eprintln!("note: could not open {url} in a browser — open it manually");
+    }
 }
 
 /// Parse the `--at` flag: an RFC 3339 timestamp (e.g. 2026-08-15T00:00:00Z)

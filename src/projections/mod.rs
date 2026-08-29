@@ -7,13 +7,13 @@ use std::collections::HashMap;
 use jiff::Timestamp;
 use miette::{IntoDiagnostic, Result};
 use serde::Serialize;
-use serde_json::Value;
 use serde_with::skip_serializing_none;
 use uuid::Uuid;
 
 use crate::domain::{
     events::{
-        EventEnvelope, ExtractedFields, Identifiers, OutcomePayload, ScoredPayload, event_type,
+        ApplyQueuedPayload, EventEnvelope, ExtractedFields, Identifiers, OutcomePayload,
+        ReviewedPayload, ScoredPayload, event_type,
     },
     identity::LeadIdentity,
     lead::stream_lead_id,
@@ -138,7 +138,7 @@ impl Projection {
         pending.sort_by(|a, b| {
             let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
             let sb = b.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
-            sb.cmp(&sa)
+            sb.cmp(&sa).then_with(|| a.first_seen.cmp(&b.first_seen))
         });
         pending
     }
@@ -220,14 +220,20 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                 record.last_event = event.recorded_at;
             }
             event_type::REVIEWED => {
+                // Strict, like the ingest payloads: a mistyped mark is
+                // source-of-truth corruption, not a None (a lenient decode
+                // would silently clear the mark and queue state).
+                let payload: ReviewedPayload = serde_json::from_value(event.payload.clone())
+                    .into_diagnostic()
+                    .map_err(|e| {
+                        e.wrap_err(format!(
+                            "decoding reviewed payload of event {} (seq {})",
+                            event.id, event.seq
+                        ))
+                    })?;
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
-                    let mark = event
-                        .payload
-                        .get("mark")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    record.latest_mark = mark.clone();
-                    if mark.as_deref() == Some("defer") {
+                    record.latest_mark = Some(payload.mark);
+                    if record.latest_mark.as_deref() == Some("defer") {
                         record.deferral_count += 1;
                     }
                     // A new mark invalidates any prior apply_queued (the
@@ -238,6 +244,17 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                 }
             }
             event_type::APPLY_QUEUED => {
+                // Strict decode: a malformed apply_queued is corruption, not
+                // a None — otherwise a syntactically valid but malformed
+                // event would silently drop a lead from the recovery queue.
+                let _: ApplyQueuedPayload = serde_json::from_value(event.payload.clone())
+                    .into_diagnostic()
+                    .map_err(|e| {
+                        e.wrap_err(format!(
+                            "decoding apply_queued payload of event {} (seq {})",
+                            event.id, event.seq
+                        ))
+                    })?;
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
                     record.apply_queued = true;
                     record.event_count += 1;
@@ -366,6 +383,8 @@ fn index_identifiers(projection: &mut Projection, lead_id: Uuid, identifiers: &I
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::*;
     use crate::domain::events::ENVELOPE_VERSION;
 
@@ -388,6 +407,21 @@ mod tests {
             correlation_id: Uuid::now_v7(),
             payload,
         }
+    }
+
+    /// Like `envelope`, but with an explicit `recorded_at`/`occurred_at` so
+    /// tests can control `first_seen` ordering.
+    fn envelope_at(
+        lead_id: Uuid,
+        seq: u64,
+        event_type: &str,
+        payload: serde_json::Value,
+        at: Timestamp,
+    ) -> EventEnvelope {
+        let mut e = envelope(lead_id, seq, event_type, payload);
+        e.occurred_at = at;
+        e.recorded_at = at;
+        e
     }
 
     fn ingested_payload(req: Option<&str>, url: Option<&str>, tc: Option<&str>) -> Value {
@@ -989,5 +1023,74 @@ mod tests {
         ));
         let projection = rebuild(&events).unwrap();
         assert!(projection.pending_queue().is_empty());
+    }
+
+    #[test]
+    fn malformed_reviewed_payload_is_hard_error() {
+        // A lenient decode would silently clear the mark and queue state;
+        // the log is the source of truth, so a mistyped mark is corruption.
+        let lead_id = Uuid::now_v7();
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            serde_json::json!({}),
+        ));
+        assert!(rebuild(&events).is_err());
+    }
+
+    #[test]
+    fn malformed_apply_queued_payload_is_hard_error() {
+        // A malformed apply_queued must not silently drop a lead from the
+        // recovery queue.
+        let lead_id = Uuid::now_v7();
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("apply-automatically"),
+        ));
+        events.push(envelope(
+            lead_id,
+            4,
+            event_type::APPLY_QUEUED,
+            serde_json::json!({}),
+        ));
+        assert!(rebuild(&events).is_err());
+    }
+
+    #[test]
+    fn pending_queue_tie_breaks_on_first_seen() {
+        // Composite is 0–100, so ties are routine; the tie-breaker must be
+        // deterministic (first-seen ascending), not HashMap iteration order.
+        let a = Uuid::now_v7();
+        let b = Uuid::now_v7();
+        let t1 = Timestamp::from_second(1_700_000_000).unwrap();
+        let t2 = Timestamp::from_second(1_700_000_001).unwrap();
+        let events = vec![
+            envelope_at(
+                a,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/a"), None),
+                t1,
+            ),
+            envelope_at(a, 2, event_type::SCORED, scored_payload(75, 1), t1),
+            envelope_at(
+                b,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/b"), None),
+                t2,
+            ),
+            envelope_at(b, 2, event_type::SCORED, scored_payload(75, 1), t2),
+        ];
+        let projection = rebuild(&events).unwrap();
+        let pending = projection.pending_queue();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].lead_id, a);
+        assert_eq!(pending[1].lead_id, b);
     }
 }
