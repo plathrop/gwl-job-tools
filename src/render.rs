@@ -1,14 +1,26 @@
 //! Human-readable output rendering: the lead card (termimad markdown), the
 //! ranked queue (crossterm), and the review prompt.
 
+use std::io::Write;
+
 use crossterm::style::Color;
 use miette::{IntoDiagnostic, Result};
 use termimad::MadSkin;
+use tracing::instrument;
 
 use crate::{domain::events::CheatSheetEntry, projections::LeadRecord};
 
+/// Strip control characters (C0/C1, including ANSI/OSC escape sequences) from
+/// record-derived text before it reaches the terminal. Posting text is
+/// untrusted (remote job boards), so it must not be able to inject terminal
+/// control sequences.
+fn sanitize(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Linearly interpolate a score (0–100) through red → yellow → green.
 pub fn score_rgb(score: u64) -> (u8, u8, u8) {
+    debug_assert!(score <= 100, "score {score} exceeds the 0–100 contract");
     let s = score.clamp(0, 100) as f32;
     let (r, g) = if s <= 50.0 {
         (255.0, s * 255.0 / 50.0)
@@ -24,33 +36,42 @@ pub fn score_color(score: u64) -> Color {
     Color::Rgb { r, g, b }
 }
 
-/// The markdown for a lead's card (design doc 0001 §5). The score number is
+/// The markdown for a lead's card (design doc 0001 §5). The score line is
 /// the only bold text, so the caller can color it via the skin's `bold`
 /// style.
 pub fn card_markdown(record: &LeadRecord) -> String {
     let mut md = String::new();
 
-    // Header: title - company - lead prefix (8 chars, decision 0008).
-    let title = record.extracted.title.as_deref().unwrap_or("Untitled");
+    // Header: title - company - lead prefix (8 chars, decision 0008). The
+    // company is omitted when the title already ends with it (some boards
+    // keep the full "Title — Company" string in the title).
+    let title = sanitize(record.extracted.title.as_deref().unwrap_or("Untitled"));
     let lead_prefix: String = record.lead_id.to_string().chars().take(8).collect();
     match record.extracted.company.as_deref() {
-        Some(company) => md.push_str(&format!("# {title} - {company} - {lead_prefix}\n\n")),
+        Some(company) => {
+            let company = sanitize(company);
+            if title.to_lowercase().ends_with(&company.to_lowercase()) {
+                md.push_str(&format!("# {title} - {lead_prefix}\n\n"));
+            } else {
+                md.push_str(&format!("# {title} - {company} - {lead_prefix}\n\n"));
+            }
+        }
         None => md.push_str(&format!("# {title} - {lead_prefix}\n\n")),
     }
 
     // Score or rejection.
     if let Some(score) = &record.latest_score {
         md.push_str(&format!("**Score: {}**\n", score.composite));
-        md.push_str(&format!("`{}`\n\n", score.breakdown));
+        md.push_str(&format!("`{}`\n\n", sanitize(&score.breakdown)));
     } else if let Some(rejection) = &record.latest_rejection {
-        md.push_str(&format!("**Rejected: {}**\n", rejection.gate));
-        md.push_str(&format!("`{}`\n\n", rejection.reason));
+        md.push_str(&format!("**Rejected: {}**\n", sanitize(&rejection.gate)));
+        md.push_str(&format!("`{}`\n\n", sanitize(&rejection.reason)));
     }
 
     // Table (conditional rows).
     md.push_str("| Field | Value |\n|---|---|\n");
     if let Some(location) = record.extracted.location.as_deref() {
-        md.push_str(&format!("| Location | {location} |\n"));
+        md.push_str(&format!("| Location | {} |\n", sanitize(location)));
     }
     let remote = match record.extracted.remote {
         Some(true) => "Yes",
@@ -59,25 +80,28 @@ pub fn card_markdown(record: &LeadRecord) -> String {
     };
     md.push_str(&format!("| Remote | {remote} |\n"));
     if let Some(comp) = &record.extracted.comp {
-        md.push_str(&format!("| Compensation | {} |\n", comp.raw));
+        md.push_str(&format!("| Compensation | {} |\n", sanitize(&comp.raw)));
     }
     if record.deferral_count > 0 {
         md.push_str(&format!("| Deferral Count | {} |\n", record.deferral_count));
     }
     if let Some(mark) = record.latest_mark.as_deref() {
-        md.push_str(&format!("| Mark | {mark} |\n"));
+        md.push_str(&format!("| Mark | {} |\n", sanitize(mark)));
     }
     if let Some(source) = record.source.as_deref() {
-        md.push_str(&format!("| Source | {source} |\n"));
+        md.push_str(&format!("| Source | {} |\n", sanitize(source)));
     }
     if let Some(outcome) = &record.latest_outcome {
-        md.push_str(&format!("| Outcome | {} |\n", outcome.event_type));
+        md.push_str(&format!(
+            "| Outcome | {} |\n",
+            sanitize(&outcome.event_type)
+        ));
     }
     md.push('\n');
 
     // URL.
     if let Some(url) = record.url.as_deref() {
-        md.push_str(url);
+        md.push_str(&sanitize(url));
         md.push('\n');
     }
 
@@ -85,6 +109,7 @@ pub fn card_markdown(record: &LeadRecord) -> String {
 }
 
 /// Render a lead's card to stdout.
+#[instrument(skip_all, fields(lead_id = %record.lead_id))]
 pub fn render_card(record: &LeadRecord, color: bool) -> Result<()> {
     let md = card_markdown(record);
     let mut skin = if color {
@@ -102,9 +127,10 @@ pub fn render_card(record: &LeadRecord, color: bool) -> Result<()> {
 /// Render the ranked queue to stdout (rank, colored score, title @ company,
 /// deferral count, mark, outcome).
 pub fn render_list(records: &[&LeadRecord], color: bool) -> Result<()> {
+    let mut out = std::io::stdout().lock();
     for (i, record) in records.iter().enumerate() {
-        let title = record.extracted.title.as_deref().unwrap_or("Untitled");
-        let company = record.extracted.company.as_deref().unwrap_or("");
+        let title = sanitize(record.extracted.title.as_deref().unwrap_or("Untitled"));
+        let company = sanitize(record.extracted.company.as_deref().unwrap_or(""));
 
         let score = match &record.latest_score {
             Some(score) => colored_score(score.composite, color),
@@ -119,12 +145,12 @@ pub fn render_list(records: &[&LeadRecord], color: bool) -> Result<()> {
             line.push_str(&format!("  (deferred {}×)", record.deferral_count));
         }
         if let Some(mark) = record.latest_mark.as_deref() {
-            line.push_str(&format!("  [{mark}]"));
+            line.push_str(&format!("  [{}]", sanitize(mark)));
         }
         if let Some(outcome) = &record.latest_outcome {
-            line.push_str(&format!("  [{}]", outcome.event_type));
+            line.push_str(&format!("  [{}]", sanitize(&outcome.event_type)));
         }
-        println!("{line}");
+        writeln!(out, "{line}").into_diagnostic()?;
     }
     Ok(())
 }

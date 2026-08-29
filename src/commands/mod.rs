@@ -381,6 +381,7 @@ fn mark_lead(
         lead::evolve(&mut state, &event);
     }
     store.append(&stream, state.seq, &pending, Uuid::now_v7())?;
+    info!(%lead_id, mark = %mark.as_str(), "lead marked");
 
     // Open the posting URL for apply-automatically (the final click is the
     // user's; v0 just opens the page). Best-effort: a launch failure must
@@ -394,78 +395,130 @@ fn mark_lead(
     Ok(apply)
 }
 
-#[instrument(skip_all)]
+#[instrument(skip_all, fields(color))]
 pub async fn execute_review(config: &Config, paths: &AppPaths, color: bool) -> Result<()> {
     let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let events = store.replay()?;
     let projection = projections::rebuild(&events)?;
     let pending = projection.pending_queue();
+    debug!(pending = pending.len(), "review session");
 
     if pending.is_empty() {
         println!("no pending leads");
         return Ok(());
     }
 
-    // Raw mode for single-key input; always restore the terminal, even on
-    // error.
-    enable_raw_mode().into_diagnostic()?;
-    let result = review_loop(&mut store, config, &pending, color);
-    disable_raw_mode().into_diagnostic()?;
-    result
+    review_loop(&mut store, config, &pending, color)
 }
 
-/// The interactive review loop (design doc 0001 §5): step through the pending
-/// queue highest-score-first, render each card, and take a single-key mark.
+/// A guard that enables raw mode on construction and restores it on drop
+/// (panic-safe, and a restore failure never masks the loop's own error).
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode().into_diagnostic()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+/// Read a single key, with raw mode scoped to the read (so card/prompt
+/// rendering happens in normal mode, where `\n` returns the cursor to column
+/// 0). Returns `None` for Ctrl-C.
+fn read_review_key() -> Result<Option<char>> {
+    let _guard = RawModeGuard::new()?;
+    loop {
+        match read().into_diagnostic()? {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            }) => {
+                if modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                    return Ok(None);
+                }
+                return Ok(Some(c));
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// The interactive review loop (design doc 0001 §5): print the ranked queue,
+/// then step through pending leads highest-score-first, render each card, and
+/// take a single-key mark. Unknown keys re-prompt (they do not skip).
 fn review_loop(
     store: &mut impl EventStore,
     config: &Config,
     pending: &[&LeadRecord],
     color: bool,
 ) -> Result<()> {
+    // Print the ranked queue first (design doc §5).
+    render::render_list(pending, color)?;
+    println!();
+
     for record in pending {
         render::render_card(record, color)?;
-        print!("{} ", render::render_prompt(color));
-        std::io::stdout().flush().into_diagnostic()?;
 
-        let key = loop {
-            match read().into_diagnostic()? {
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char(c),
-                    modifiers,
-                    ..
-                }) => {
-                    if modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
-                        return Ok(()); // Ctrl-C quits.
+        // Re-prompt until a recognized key (or Ctrl-C) is read.
+        loop {
+            print!("{} ", render::render_prompt(color));
+            std::io::stdout().flush().into_diagnostic()?;
+
+            let Some(key) = read_review_key()? else {
+                return Ok(()); // Ctrl-C quits.
+            };
+            println!();
+
+            match key {
+                'a' => {
+                    let apply = mark_lead(store, config, record, Mark::ApplyAutomatically, None)?;
+                    if let Some(package) = &apply {
+                        print!(
+                            "{}",
+                            render::render_cheat_sheet(&package.package.cheat_sheet)
+                        );
+                        std::io::stdout().flush().into_diagnostic()?;
                     }
-                    break c;
+                    break;
                 }
-                _ => continue,
-            }
-        };
-        println!();
-
-        match key {
-            'a' => {
-                let apply = mark_lead(store, config, record, Mark::ApplyAutomatically, None)?;
-                if let Some(package) = &apply {
-                    print!(
-                        "{}",
-                        render::render_cheat_sheet(&package.package.cheat_sheet)
-                    );
+                'm' => {
+                    // apply-manual: the user takes personal action. Provide
+                    // the cheat sheet + URL (the JD is in `show`/`events`).
+                    let resume = resume::load(config.resume_path.as_deref())?;
+                    let sheet = resume.as_ref().map(cheat_sheet).unwrap_or_default();
+                    mark_lead(store, config, record, Mark::ApplyManual, None)?;
+                    print!("{}", render::render_cheat_sheet(&sheet));
+                    if let Some(url) = record.url.as_deref() {
+                        println!("  URL: {url}");
+                    }
+                    std::io::stdout().flush().into_diagnostic()?;
+                    break;
+                }
+                'd' => {
+                    mark_lead(store, config, record, Mark::Defer, None)?;
+                    break;
+                }
+                'i' => {
+                    mark_lead(store, config, record, Mark::Ignore, None)?;
+                    break;
+                }
+                's' => {
+                    debug!(lead_id = %record.lead_id, "skipped lead (session-local)");
+                    break;
+                }
+                'q' => return Ok(()),
+                _ => {
+                    // Unknown key: re-prompt (do not skip the lead).
+                    debug!(key = %key, lead_id = %record.lead_id, "unrecognized review key");
                 }
             }
-            'm' => {
-                mark_lead(store, config, record, Mark::ApplyManual, None)?;
-            }
-            'd' => {
-                mark_lead(store, config, record, Mark::Defer, None)?;
-            }
-            'i' => {
-                mark_lead(store, config, record, Mark::Ignore, None)?;
-            }
-            's' => {} // skip: session-local, no event.
-            'q' => return Ok(()),
-            _ => {} // unknown key: move on.
         }
     }
     Ok(())
