@@ -408,13 +408,18 @@ reader so the seam exists from day one.
 
 1. Rebuilds the projection, prints the ranked queue (rank, composite,
    title @ company, deferral count).
-2. Steps through pending leads highest-score-first. For each: prints title,
-   company, location, comp, URL, composite score with human-readable
-   breakdown, and deferral count; then prompts:
+2. Steps through pending leads highest-score-first. For each: renders the
+   lead card (title, company, location, remote, comp, URL, composite score
+   with human-readable breakdown, deferral count, mark, source, outcome —
+   termimad markdown, with the score colored red→yellow→green), then
+   prompts:
 
    ```
-   [a] apply-automatically  [m] apply-manual  [d] defer  [i] ignore  [s] skip  [q] quit
+   auto | manual | defer | ignore | skip | quit
    ```
+
+   The first letter of each action is the key, accented in color (or
+   parenthesized — `(a)uto | (m)anual | …` — when color is off).
 
    - `a` — first prepares the package (generic letter + cheat sheet +
      resume PDF); on success, appends `reviewed{apply-automatically}` and
@@ -437,8 +442,9 @@ reader so the seam exists from day one.
 3. Because state is the event log, quitting mid-loop loses nothing; the loop
    is resumable by construction.
 
-Prompt input reads raw keys via `console::Term::read_key` (the lower-level
-crate `dialoguer` itself builds on — small, pure-Rust). `dialoguer::Select`
+Prompt input reads single keys via crossterm's `event::read()` (already a
+dependency via termimad, which renders the card; raw mode is enabled around
+the loop, and Ctrl-C quits cleanly). `dialoguer::Select`
 was considered and rejected: it navigates with arrows + Enter and cannot
 deliver the single-key `a`/`m`/`d`/`i`/`s`/`q` hotkeys above, which are the
 point — the review loop is the screen the user touches most, and one-key
@@ -506,6 +512,10 @@ Supersedes and removes the placeholder `lead open|list|close`.
 loop needs no addressing. Conventions carried forward: clap subcommands,
 miette errors (unimplemented commands `bail!` loudly), tracing with logs to
 a file (decision 0005) and command output on stdout.
+
+Human-facing commands (`ingest`, `list`, `show`) render a termimad card by
+default; the global `--json` flag switches to JSON. `events` stays JSON
+(debugging).
 
 ## 9. Module layout
 

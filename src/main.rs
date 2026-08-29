@@ -35,7 +35,8 @@ async fn main() -> Result<()> {
     // the .await (an entered guard is thread-local and would mis-attribute
     // unrelated executor work to this span).
     let command_name = cli.command_name();
-    let result = cli::execute(cli.command, &config, &paths)
+    let color = cli.color_enabled();
+    let result = cli::execute(cli.command, &config, &paths, cli.json, color)
         .instrument(info_span!("cli", command = command_name))
         .await;
 
