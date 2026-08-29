@@ -513,9 +513,10 @@ loop needs no addressing. Conventions carried forward: clap subcommands,
 miette errors (unimplemented commands `bail!` loudly), tracing with logs to
 a file (decision 0005) and command output on stdout.
 
-Human-facing commands (`ingest`, `list`, `show`) render a termimad card by
-default; the global `--json` flag switches to JSON. `events` stays JSON
-(debugging).
+Human-facing commands render human-readable output by default; the global
+`--json` flag switches to JSON. `ingest` and `show` render a termimad card;
+`list` renders the ranked queue directly (per-row score colors). `events`
+stays JSON (debugging).
 
 ## 9. Module layout
 
