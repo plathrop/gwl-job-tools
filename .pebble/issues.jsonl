@@ -189,3 +189,4 @@
 {"type":"update","issueId":"GWLJ-7kfu55","timestamp":"2026-08-29T22:28:10.800Z","data":{},"source":"gwl-job-tools"}
 {"type":"create","issueId":"GWLJ-do8pqx","timestamp":"2026-08-29T22:28:20.743Z","data":{"title":"Hint show --jd after apply-manual mark","type":"task","priority":4,"description":"The review loop's `m` key (apply-manual) prints the cheat sheet + URL but doesn't mention `gwl-jobs show <lead-prefix> --jd`, which is the command for the JD text the user needs at that moment. Add a one-line hint after marking. Flagged in PR #13 review (glm-5.3 non-blocking).","parent":"GWLJ-7kfu55"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-7kfu55","timestamp":"2026-08-29T22:28:20.747Z","data":{},"source":"gwl-job-tools"}
+{"type":"close","issueId":"GWLJ-jv40uh","timestamp":"2026-08-29T22:31:09.548Z","data":{"reason":"Merged in PR #13: show --jd renders the raw posting text."},"source":"gwl-job-tools"}
