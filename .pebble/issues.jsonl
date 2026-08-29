@@ -184,3 +184,4 @@
 {"type":"update","issueId":"GWLJ-7kfu55","timestamp":"2026-08-29T19:55:29.233Z","data":{},"source":"gwl-job-tools"}
 {"type":"close","issueId":"GWLJ-1qb2wc","timestamp":"2026-08-29T21:05:14.533Z","data":{"reason":"Merged in PR #12: review loop + card renderer + global --json."},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-jv40uh","timestamp":"2026-08-29T22:07:47.606Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-jv40uh","timestamp":"2026-08-29T22:11:07.572Z","data":{"text":"PR #13: show --jd renders the raw posting text. 260 tests.","timestamp":"2026-08-29T22:11:07.572Z"},"source":"gwl-job-tools"}
