@@ -125,34 +125,42 @@ pub fn render_card(record: &LeadRecord, color: bool) -> Result<()> {
 }
 
 /// Render the ranked queue to stdout (rank, colored score, title @ company,
-/// deferral count, mark, outcome).
+/// deferral count, mark, outcome, lead prefix).
 pub fn render_list(records: &[&LeadRecord], color: bool) -> Result<()> {
     let mut out = std::io::stdout().lock();
     for (i, record) in records.iter().enumerate() {
-        let title = sanitize(record.extracted.title.as_deref().unwrap_or("Untitled"));
-        let company = sanitize(record.extracted.company.as_deref().unwrap_or(""));
-
-        let score = match &record.latest_score {
-            Some(score) => colored_score(score.composite, color),
-            None => "  -".to_string(),
-        };
-
-        let mut line = format!("{:>3}  {score}  {title}", i + 1);
-        if !company.is_empty() {
-            line.push_str(&format!(" @ {company}"));
-        }
-        if record.deferral_count > 0 {
-            line.push_str(&format!("  (deferred {}×)", record.deferral_count));
-        }
-        if let Some(mark) = record.latest_mark.as_deref() {
-            line.push_str(&format!("  [{}]", sanitize(mark)));
-        }
-        if let Some(outcome) = &record.latest_outcome {
-            line.push_str(&format!("  [{}]", sanitize(&outcome.event_type)));
-        }
-        writeln!(out, "{line}").into_diagnostic()?;
+        writeln!(out, "{}", list_line(i + 1, record, color)).into_diagnostic()?;
     }
     Ok(())
+}
+
+/// One line of the ranked queue.
+fn list_line(rank: usize, record: &LeadRecord, color: bool) -> String {
+    let title = sanitize(record.extracted.title.as_deref().unwrap_or("Untitled"));
+    let company = sanitize(record.extracted.company.as_deref().unwrap_or(""));
+
+    let score = match &record.latest_score {
+        Some(score) => colored_score(score.composite, color),
+        None => "  -".to_string(),
+    };
+
+    let mut line = format!("{rank:>3}  {score}  {title}");
+    if !company.is_empty() {
+        line.push_str(&format!(" @ {company}"));
+    }
+    if record.deferral_count > 0 {
+        line.push_str(&format!("  (deferred {}×)", record.deferral_count));
+    }
+    if let Some(mark) = record.latest_mark.as_deref() {
+        line.push_str(&format!("  [{}]", sanitize(mark)));
+    }
+    if let Some(outcome) = &record.latest_outcome {
+        line.push_str(&format!("  [{}]", sanitize(&outcome.event_type)));
+    }
+    // The 8-char lead prefix is the addressing handle for `mark`/`show`.
+    let lead_prefix: String = record.lead_id.to_string().chars().take(8).collect();
+    line.push_str(&format!("  [{lead_prefix}]"));
+    line
 }
 
 /// A score rendered with a 24-bit RGB foreground when color is on.
@@ -291,6 +299,15 @@ mod tests {
         let md = card_markdown(&record);
         assert!(md.contains("# Staff SRE — Alpha Co - "));
         assert!(!md.contains("Alpha Co - Alpha Co"));
+    }
+
+    #[test]
+    fn list_line_includes_lead_prefix() {
+        // The 8-char prefix is the addressing handle for `mark`/`show`.
+        let record = lead_record();
+        let prefix: String = record.lead_id.to_string().chars().take(8).collect();
+        let line = list_line(1, &record, false);
+        assert!(line.contains(&format!("[{prefix}]")), "line: {line}");
     }
 
     #[test]
