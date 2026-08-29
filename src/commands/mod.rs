@@ -1528,18 +1528,26 @@ mod tests {
     fn load_raw_text_returns_latest_snapshot_text() {
         let dir = tempfile::tempdir().unwrap();
         let (mut store, projection) = store_and_projection(&dir);
-        let mut outcome = outcome("the full JD text");
-        outcome.url = Some("https://example.com/job/14".into());
-        outcome.extracted.title = Some("Staff Engineer".into());
-        outcome.extracted.company = Some("Acme".into());
-        record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
+        let mut first = outcome("the full JD text v1");
+        first.url = Some("https://example.com/job/14".into());
+        first.extracted.title = Some("Staff Engineer".into());
+        first.extracted.company = Some("Acme".into());
+        record_ingest(&mut store, &projection, &Config::default(), &[], first).unwrap();
 
+        // Re-ingest the same lead with different text (the `updated` path);
+        // the latest snapshot must win, not the first.
         let events = store.replay().unwrap();
         let projection = projections::rebuild(&events).unwrap();
         let lead_id = projection.leads.values().next().unwrap().lead_id;
+        let mut second = outcome("the full JD text v2");
+        second.url = Some("https://example.com/job/14".into());
+        second.extracted.title = Some("Staff Engineer".into());
+        second.extracted.company = Some("Acme".into());
+        record_ingest(&mut store, &projection, &Config::default(), &[], second).unwrap();
+
         assert_eq!(
             load_raw_text(&store, lead_id).unwrap().as_deref(),
-            Some("the full JD text")
+            Some("the full JD text v2")
         );
     }
 }
