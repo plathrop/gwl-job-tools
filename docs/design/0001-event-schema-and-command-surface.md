@@ -499,7 +499,7 @@ Supersedes and removes the placeholder `lead open|list|close`.
 | `gwl-jobs review`                                     | Interactive prompt loop (§5).                                                                                                                | `reviewed`, `apply_queued`                                                  |
 | `gwl-jobs mark <lead> <mark> [--note]`                | Non-interactive mark (scriptable). `apply-automatically` runs the same prepare → batch-append → open flow as the review loop's `a` key (§5). | `reviewed` (+ `apply_queued`)                                               |
 | `gwl-jobs package <lead>`                             | (Re)build the apply package for a lead marked `apply-automatically`; re-print and re-open the URL. Bails on unmarked leads — mark first.     | `apply_queued`                                                              |
-| `gwl-jobs show <lead>`                                | Full detail: snapshot, score history, marks, events. (Steel-thread scope: snapshot + mark + counts; grows as scores/marks/events land.)      | —                                                                           |
+| `gwl-jobs show <lead> [--jd]`                         | Full detail: snapshot, score history, marks, events. (Steel-thread scope: snapshot + mark + counts; grows as scores/marks/events land.) `--jd` prints the raw posting text. | —                                                                           |
 | `gwl-jobs applied <lead> [--method <m>] [--at <ts>]`    | Record the `applied` transition.                                                                                                            | `applied`                                                                   |
 | `gwl-jobs screened <lead> [--contact <c>] [--at <ts>]` | Record the `screened` transition.                                                                                                           | `screened`                                                                  |
 | `gwl-jobs interviewed <lead> [--stage <s>] [--at <ts>]` | Record the `interviewed` transition.                                                                                                        | `interviewed`                                                               |
@@ -516,7 +516,8 @@ a file (decision 0005) and command output on stdout.
 Human-facing commands render human-readable output by default; the global
 `--json` flag switches to JSON. `ingest` and `show` render a termimad card;
 `list` renders the ranked queue directly (per-row score colors). `events`
-stays JSON (debugging).
+stays JSON (debugging). `show --jd` prints the raw posting text and takes
+precedence over both the card and `--json`.
 
 ## 9. Module layout
 
