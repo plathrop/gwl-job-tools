@@ -182,3 +182,4 @@
 {"type":"update","issueId":"GWLJ-7kfu55","timestamp":"2026-08-29T19:55:21.852Z","data":{},"source":"gwl-job-tools"}
 {"type":"create","issueId":"GWLJ-u0lsyp","timestamp":"2026-08-29T19:55:29.230Z","data":{"title":"Fold ingest's card-render projection update","type":"task","priority":3,"description":"When !json (the default), ingest does a second full store.replay() + projections::rebuild() just to get the record for the card. Fold the update into the first projection (or update in-place) to avoid the double replay. Flagged in PR #12 review (qwen T8).","parent":"GWLJ-7kfu55"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-7kfu55","timestamp":"2026-08-29T19:55:29.233Z","data":{},"source":"gwl-job-tools"}
+{"type":"close","issueId":"GWLJ-1qb2wc","timestamp":"2026-08-29T21:05:14.533Z","data":{"reason":"Merged in PR #12: review loop + card renderer + global --json."},"source":"gwl-job-tools"}
