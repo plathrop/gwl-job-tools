@@ -104,9 +104,11 @@ for pipeline events they are near-identical.
 
 A lead has two identities:
 
-- **`lead_id`** — a UUIDv7 minted at first ingest. This is the durable
-  internal identity and the stream ID. It survives reposts, URL changes, and
-  edited postings.
+- **`lead_id`** — a UUIDv4 minted at first ingest (decision 0008). This is
+  the durable internal identity and the stream ID. It survives reposts, URL
+  changes, and edited postings. v4 (not v7) because leads are addressed by
+  short prefix, and v7's time-shaped prefix would make same-session leads
+  share their first characters by construction.
 - **Dedupe key** — a deterministic, derived matcher computed at every
   ingest, used to decide whether an incoming posting is new or a re-ingest
   of an existing lead.

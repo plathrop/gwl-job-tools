@@ -110,7 +110,10 @@ pub fn record_ingest(
             }
             (lead_id, state)
         }
-        None => (Uuid::now_v7(), LeadState::default()),
+        // Lead IDs are UUIDv4 (decision 0008): random, so short prefixes
+        // stay unambiguous for `<lead>` addressing. Event IDs stay v7
+        // (time-ordered for the append-only log).
+        None => (Uuid::new_v4(), LeadState::default()),
     };
 
     // Gates evaluate the new snapshot; failures become `rejected` events in
