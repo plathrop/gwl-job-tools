@@ -39,7 +39,7 @@ computes the single application-stage dimension from the facts:
 | mark `defer`                                    | `deferred`                        |
 | mark `ignore`                                   | `ignored`                         |
 | no mark, standing score                         | `pending`                         |
-| no mark, standing rejection                     | `rejected`                        |
+| no mark, standing rejection                     | `rejected (gate)`                 |
 | neither (torn-batch edge)                       | `ingested`                        |
 
 Rules:

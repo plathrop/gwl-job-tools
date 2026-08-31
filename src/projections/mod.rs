@@ -95,13 +95,16 @@ impl LeadRecord {
             Some("defer") => "deferred".into(),
             Some("ignore") => "ignored".into(),
             // Unmarked: the queue state names the stage — scored means
-            // pending review; a standing rejection means it never reached
-            // the queue at the latest evaluation.
+            // pending review; a standing gate rejection means it never
+            // reached the queue at the latest evaluation. The `(gate)`
+            // qualifier keeps the machine's content filter visually
+            // distinct from the user-recorded `rejected_by_employer`
+            // terminal outcome (they are different facts; PR #16).
             _ => {
                 if self.latest_score.is_some() {
                     "pending".into()
                 } else if self.latest_rejection.is_some() {
-                    "rejected".into()
+                    "rejected (gate)".into()
                 } else {
                     "ingested".into()
                 }
@@ -239,8 +242,10 @@ impl Projection {
     /// are excluded because the ignore mark exists to bury leads
     /// permanently (`--all` reveals them). Gate-rejected leads ARE
     /// included: a machine rejection is not a terminal state, the leads
-    /// sort to the bottom with a `[rejected]` tag, and they are `edit`-
-    /// revivable (decision record 0010).
+    /// sort to the bottom with a `[rejected (gate)]` tag, and they are
+    /// `edit`-revivable (decision record 0010). The `(gate)` qualifier
+    /// distinguishes the machine's content filter from the
+    /// user-recorded `rejected_by_employer` terminal outcome.
     pub fn active_leads(&self) -> Vec<&LeadRecord> {
         let mut active = self.ranked_leads();
         active.retain(|r| !r.is_terminal() && !r.is_buried());
@@ -1230,7 +1235,7 @@ mod tests {
         ];
         assert_eq!(
             rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
-            "rejected"
+            "rejected (gate)"
         );
 
         // Decisions without recorded outcomes.
@@ -1398,6 +1403,45 @@ mod tests {
             record.latest_outcome.as_ref().unwrap().method.as_deref(),
             Some("auto-assisted")
         );
+    }
+
+    #[test]
+    fn lifecycle_status_employer_rejection_wins_over_standing_gate_rejection() {
+        // A gate-rejected lead the user applied to anyway, later declined
+        // by the employer: two different "rejections" — the machine's
+        // content filter and the employer's decision. The outcome is the
+        // later stage and must win (PR #16: Grey's rejected-vs-
+        // rejected_by_employer question).
+        let lead_id = Uuid::now_v7();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(
+                lead_id,
+                2,
+                event_type::REJECTED,
+                serde_json::json!({"gate": "compensation-floor", "reason": "x", "revision": 1}),
+            ),
+            envelope(
+                lead_id,
+                3,
+                event_type::APPLIED,
+                serde_json::json!({"method": "manual"}),
+            ),
+            envelope(
+                lead_id,
+                4,
+                event_type::REJECTED_BY_EMPLOYER,
+                serde_json::json!({}),
+            ),
+        ];
+        let record = &rebuild(&events).unwrap().leads[&lead_id];
+        assert_eq!(record.lifecycle_status(), "rejected_by_employer");
+        assert!(record.is_terminal());
     }
 
     #[test]

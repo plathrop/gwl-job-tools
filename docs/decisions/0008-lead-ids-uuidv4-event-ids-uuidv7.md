@@ -6,7 +6,7 @@ Status: accepted 2026-08-29
 
 `lead_id` was minted with `Uuid::now_v7()`, the same scheme as event IDs.
 UUIDv7's first 48 bits are a millisecond timestamp, so leads ingested in the
-same session share their first ~8–12 hex characters *by construction*. The
+same session share their first ~8–12 hex characters _by construction_. The
 `<lead>` addressing scheme (design doc 0001 §8) is "unambiguous UUID prefix",
 so batch ingest — the tool's core workflow — routinely makes short prefixes
 ambiguous: `mark 01a04d4b defer` fails with "matches 2 leads" when two leads

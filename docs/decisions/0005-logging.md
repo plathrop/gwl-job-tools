@@ -13,7 +13,7 @@ with `--telemetry on`, a `fmt` layer writing to stderr at `info`.
 
 - **Sink**: a `tracing` `fmt` layer writes to a log file (append mode, no
   rotation). Nothing on stdout/stderr. miette errors still go to stderr —
-  that is error *reporting*, not logging, and is unchanged.
+  that is error _reporting_, not logging, and is unchanged.
 - **Level**: configurable. Config key `log_level` (default `error`); CLI
   `--log-level` overrides config.
 - **Precedence**: CLI arg > config > `RUST_LOG` > default `error`.

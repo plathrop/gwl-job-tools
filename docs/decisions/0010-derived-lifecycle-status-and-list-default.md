@@ -33,10 +33,14 @@ alternative "statuses" rather than a decision and a fact.
   terminal and ignored leads back. The pending queue is unchanged and
   remains what `review` steps through. **Gate-rejected leads are
   included by design**: a machine rejection is not a terminal state,
-  they sort to the bottom with a `[rejected]` tag, and they are
-  `edit`-revivable (correcting a mis-extracted remote signal, or a comp
-  that now passes the floor, restores them to the queue). If that
-  proves noisy in practice, excluding them is a one-line change.
+  they sort to the bottom with a `[rejected (gate)]` tag — the `(gate)`
+  qualifier keeps the machine's content filter distinct from the
+  user-recorded `rejected_by_employer` terminal outcome, which is a
+  different fact entirely (post-application, terminal, not revivable) —
+  and they are `edit`-revivable (correcting a mis-extracted remote
+  signal, or a comp that now passes the floor, restores them to the
+  queue). If that proves noisy in practice, excluding them is a
+  one-line change.
 - **Ignored leads are excluded from the default view** (settled with
   Grey, 2026-08-31): the ignore mark exists to bury leads permanently —
   durable-ignore means out of sight, and `--all` is the only view that
