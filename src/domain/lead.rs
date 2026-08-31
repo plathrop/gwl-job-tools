@@ -11,9 +11,9 @@ use uuid::Uuid;
 
 use crate::domain::{
     events::{
-        ApplyQueuedPayload, EventEnvelope, ExtractedFields, IngestedPayload, PendingEvent,
-        ReingestSuppressedPayload, RejectedPayload, ReviewedPayload, ScoredPayload, SnapshotFields,
-        UpdatedPayload, event_type,
+        ApplyQueuedPayload, EditedPayload, EventEnvelope, ExtractedFields, Identifiers,
+        IngestedPayload, PendingEvent, ReingestSuppressedPayload, RejectedPayload, ReviewedPayload,
+        ScoredPayload, SnapshotFields, UpdatedPayload, event_type,
     },
     gates::GateFailure,
     identity::LeadIdentity,
@@ -37,6 +37,9 @@ pub struct LeadState {
     pub latest_mark: Option<String>,
     pub snapshot: Option<ExtractedFields>,
     pub url: Option<String>,
+    /// How the lead was found, from the latest snapshot (`search`/
+    /// `recruiter`/`referrer`/`unknown`).
+    pub source: Option<String>,
     pub raw_text: Option<String>,
     /// Count of gate/score evaluations (rejected + scored events).
     pub eval_revision: u64,
@@ -53,7 +56,7 @@ impl LeadState {
 pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
     state.seq = event.seq;
     match event.event_type.as_str() {
-        event_type::INGESTED | event_type::UPDATED => {
+        event_type::INGESTED | event_type::UPDATED | event_type::EDITED => {
             state.exists = true;
             // Every snapshot event is one gate/score evaluation; rejected
             // and scored events carry that evaluation's revision. Counting
@@ -70,6 +73,7 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
             if let Ok(snapshot) = serde_json::from_value::<SnapshotFields>(event.payload.clone()) {
                 state.snapshot = Some(snapshot.extracted);
                 state.url = snapshot.url;
+                state.source = Some(snapshot.source);
                 state.raw_text = snapshot.raw_text;
             }
         }
@@ -172,11 +176,14 @@ pub fn decide_ingest(
     }
 
     let old = state.snapshot.clone().unwrap_or_default();
-    let changed = old.diff(
+    let mut changed = old.diff(
         &extracted,
         state.raw_text.as_deref() != Some(raw_text.as_str()),
         state.url != url,
     );
+    if state.source.as_deref() != Some(source) {
+        changed.push("source".into());
+    }
     let payload = UpdatedPayload {
         dedupe_key: identity.dedupe_key.clone(),
         identifiers: identity.identifiers.clone(),
@@ -195,6 +202,72 @@ pub fn decide_ingest(
         events.push(scored_event(state, score)?);
     }
     Ok((IngestKind::Updated { changed }, events))
+}
+
+/// Decide the events for a user edit of an existing lead (`gwl-jobs edit`,
+/// decision record 0009). The lead's `dedupe_key` is immutable — the
+/// caller passes the existing key plus the identifiers recomputed from the
+/// corrected fields (additively indexed by the projection). Like a
+/// re-ingest snapshot, an edit re-runs gates and scoring: `edited` is
+/// followed by `rejected` XOR `scored` in the same batch. Edits bypass
+/// durable-ignore suppression: the command is explicit user action, and
+/// the mark itself stays latest-wins (the lead still won't re-enter the
+/// queue while ignored).
+#[allow(clippy::too_many_arguments)]
+pub fn decide_edit(
+    state: &LeadState,
+    dedupe_key: &str,
+    identifiers: &Identifiers,
+    note: Option<String>,
+    source: &str,
+    url: Option<String>,
+    raw_text: Option<String>,
+    extracted: ExtractedFields,
+    gate_failures: Vec<GateFailure>,
+    score: Option<ScoreResult>,
+) -> Result<(Vec<String>, Vec<PendingEvent>)> {
+    if !state.exists {
+        bail!("cannot edit a lead that does not exist");
+    }
+    // Pass-marker invariant (decision 0006), as on the ingest path.
+    if !gate_failures.is_empty() && score.is_some() {
+        bail!("evaluation cannot be both rejected and scored");
+    }
+    if gate_failures.is_empty() && score.is_none() {
+        bail!("a gate-passing evaluation must carry a score");
+    }
+
+    let old = state.snapshot.clone().unwrap_or_default();
+    let mut changed = old.diff(&extracted, false, state.url != url);
+    if state.source.as_deref() != Some(source) {
+        changed.push("source".into());
+    }
+    if changed.is_empty() {
+        bail!("nothing to edit: no fields changed");
+    }
+
+    let payload = EditedPayload {
+        dedupe_key: dedupe_key.into(),
+        identifiers: identifiers.clone(),
+        changed: changed.clone(),
+        // Provenance: why the user corrected the record.
+        note,
+        snapshot: SnapshotFields {
+            adapter: "user".into(),
+            source: source.into(),
+            url,
+            // The edit never touches the posting text; carry it forward so
+            // the snapshot stays complete (`show --jd` keeps working).
+            raw_text,
+            extracted,
+        },
+    };
+    let mut events = vec![PendingEvent::new(event_type::EDITED, None, &payload)?];
+    events.extend(rejection_events(state, gate_failures)?);
+    if let Some(score) = score {
+        events.push(scored_event(state, score)?);
+    }
+    Ok((changed, events))
 }
 
 /// The `scored` event for a gate-passing evaluation, sharing the evaluation's
@@ -358,6 +431,7 @@ mod tests {
         state.snapshot = Some(extracted("Engineer"));
         state.url = Some("https://example.com/j".into());
         state.raw_text = Some("body".into());
+        state.source = Some("unknown".into());
 
         let (kind, events) = decide_ingest(
             &state,
@@ -652,6 +726,7 @@ mod tests {
         state.snapshot = Some(extracted("Engineer"));
         state.url = Some("https://example.com/old".into());
         state.raw_text = Some("body".into());
+        state.source = Some("unknown".into());
 
         let (kind, events) = decide_ingest(
             &state,
@@ -672,6 +747,274 @@ mod tests {
             }
         );
         assert_eq!(events[0].payload["changed"][0], "url");
+    }
+
+    // ── decide_edit ──────────────────────────────────────────────
+
+    fn existing_state() -> LeadState {
+        let mut state = LeadState {
+            exists: true,
+            seq: 1,
+            // One prior evaluation (the `ingested` event at seq 1).
+            eval_revision: 1,
+            ..Default::default()
+        };
+        state.snapshot = Some(extracted("Engineer"));
+        state.url = Some("https://example.com/j".into());
+        state.raw_text = Some("body".into());
+        state.source = Some("unknown".into());
+        state
+    }
+
+    #[test]
+    fn ingest_reports_source_change_in_changed() {
+        // A re-ingest with a different --source records it in `changed`
+        // (the field is part of the snapshot, so it belongs in the list).
+        let state = existing_state();
+        let (kind, events) = decide_ingest(
+            &state,
+            &identity(),
+            "drop-in",
+            "search",
+            Some("https://example.com/j".into()),
+            "body".into(),
+            extracted("Engineer"),
+            vec![],
+            Some(score_result()),
+        )
+        .unwrap();
+        assert_eq!(
+            kind,
+            IngestKind::Updated {
+                changed: vec!["source".into()]
+            }
+        );
+        assert_eq!(events[0].payload["changed"], serde_json::json!(["source"]));
+    }
+
+    #[test]
+    fn edit_emits_edited_then_scored() {
+        let state = existing_state();
+        let (changed, events) = decide_edit(
+            &state,
+            "url:https://example.com/j",
+            &identity().identifiers,
+            Some("recruiter told me the band".into()),
+            "unknown",
+            Some("https://example.com/j".into()),
+            Some("body".into()),
+            extracted("Senior Engineer"),
+            vec![],
+            Some(score_result()),
+        )
+        .unwrap();
+        assert_eq!(changed, vec!["title"]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, event_type::EDITED);
+        assert_eq!(events[0].payload["changed"], serde_json::json!(["title"]));
+        assert_eq!(events[0].payload["adapter"], "user");
+        assert_eq!(events[0].payload["note"], "recruiter told me the band");
+        // The dedupe key is immutable (decision record 0009): the caller's
+        // key is stored verbatim, not recomputed.
+        assert_eq!(events[0].payload["dedupe_key"], "url:https://example.com/j");
+        // The raw posting text is carried forward, not replaced.
+        assert_eq!(events[0].payload["raw_text"], "body");
+        assert_eq!(events[1].event_type, event_type::SCORED);
+        // One prior evaluation (seq 1 was the ingested event) → revision 2.
+        assert_eq!(events[1].payload["revision"], 2);
+    }
+
+    #[test]
+    fn edit_nonexistent_lead_bails() {
+        let result = decide_edit(
+            &LeadState::default(),
+            "tc:abc",
+            &identity().identifiers,
+            None,
+            "unknown",
+            None,
+            None,
+            extracted("Engineer"),
+            vec![],
+            Some(score_result()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn edit_gate_failure_emits_rejected() {
+        let state = existing_state();
+        let failure = GateFailure {
+            gate: crate::domain::gates::Gate::RemoteOnly,
+            reason: "on-site".into(),
+        };
+        let (_, events) = decide_edit(
+            &state,
+            "url:https://example.com/j",
+            &identity().identifiers,
+            None,
+            "unknown",
+            Some("https://example.com/j".into()),
+            Some("body".into()),
+            extracted("Senior Engineer"),
+            vec![failure],
+            None,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].event_type, event_type::REJECTED);
+        assert_eq!(events[1].payload["revision"], 2);
+    }
+
+    #[test]
+    fn edit_with_no_changes_bails() {
+        // An edit that reproduces the current snapshot must not append an
+        // evaluation event (that would burn a revision and imply a content
+        // change that never happened).
+        let state = existing_state();
+        let result = decide_edit(
+            &state,
+            "url:https://example.com/j",
+            &identity().identifiers,
+            None,
+            "unknown",
+            Some("https://example.com/j".into()),
+            Some("body".into()),
+            extracted("Engineer"),
+            vec![],
+            Some(score_result()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn edit_reports_source_and_url_changes() {
+        let state = existing_state();
+        let (changed, _) = decide_edit(
+            &state,
+            "url:https://example.com/j",
+            &identity().identifiers,
+            None,
+            "recruiter",
+            Some("https://example.com/j2".into()),
+            Some("body".into()),
+            extracted("Engineer"),
+            vec![],
+            Some(score_result()),
+        )
+        .unwrap();
+        assert!(changed.contains(&"source".into()));
+        assert!(changed.contains(&"url".into()));
+    }
+
+    #[test]
+    fn edit_bypasses_durable_ignore() {
+        // Edits are explicit user action: an ignored lead can be corrected
+        // (the mark itself stays latest-wins — the lead just won't
+        // re-enter the queue).
+        let mut state = existing_state();
+        state.latest_mark = Some("ignore".into());
+        let (changed, events) = decide_edit(
+            &state,
+            "url:https://example.com/j",
+            &identity().identifiers,
+            None,
+            "unknown",
+            Some("https://example.com/j".into()),
+            Some("body".into()),
+            extracted("Senior Engineer"),
+            vec![],
+            Some(score_result()),
+        )
+        .unwrap();
+        assert_eq!(changed, vec!["title"]);
+        assert_eq!(events[0].event_type, event_type::EDITED);
+    }
+
+    #[test]
+    fn edited_evaluation_cannot_be_both_rejected_and_scored() {
+        // The pass-marker invariant holds on the edit path too.
+        let failure = GateFailure {
+            gate: crate::domain::gates::Gate::RemoteOnly,
+            reason: "on-site".into(),
+        };
+        let result = decide_edit(
+            &existing_state(),
+            "url:https://example.com/j",
+            &identity().identifiers,
+            None,
+            "unknown",
+            Some("https://example.com/j".into()),
+            Some("body".into()),
+            extracted("Senior Engineer"),
+            vec![failure],
+            Some(score_result()),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn edited_passing_evaluation_requires_a_score() {
+        let result = decide_edit(
+            &existing_state(),
+            "url:https://example.com/j",
+            &identity().identifiers,
+            None,
+            "unknown",
+            Some("https://example.com/j".into()),
+            Some("body".into()),
+            extracted("Senior Engineer"),
+            vec![],
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn evolve_treats_edited_as_a_snapshot_event() {
+        // `edited` joins the snapshot-event family: it refreshes the
+        // snapshot, counts as an evaluation, and invalidates the prior
+        // score (decision 0006).
+        let mut state = LeadState::default();
+        let ingested = ingested_envelope();
+        evolve(&mut state, &ingested);
+        assert_eq!(state.eval_revision, 1);
+
+        let edited = EventEnvelope {
+            event_type: event_type::EDITED.into(),
+            seq: 2,
+            payload: serde_json::json!({
+                "dedupe_key": "tc:abc",
+                "identifiers": {"tc": "tc:abc"},
+                "changed": ["title"],
+                "adapter": "user",
+                "source": "unknown",
+                "raw_text": "body",
+                "extracted": {"title": "Senior Engineer", "company": "Acme"}
+            }),
+            ..ingested
+        };
+        evolve(&mut state, &edited);
+        assert_eq!(state.eval_revision, 2);
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().title.as_deref(),
+            Some("Senior Engineer")
+        );
+        assert_eq!(state.source.as_deref(), Some("unknown"));
+
+        let scored = EventEnvelope {
+            event_type: event_type::SCORED.into(),
+            seq: 3,
+            payload: serde_json::json!({
+                "composite": 75,
+                "revision": 2,
+                "dimensions": [],
+                "breakdown": "75"
+            }),
+            ..edited
+        };
+        evolve(&mut state, &scored);
+        assert_eq!(state.latest_score.as_ref().unwrap().revision, 2);
     }
 
     // ── evolve ───────────────────────────────────────────────────

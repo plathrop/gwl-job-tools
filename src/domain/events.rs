@@ -27,6 +27,10 @@ pub mod event_type {
     pub const REVIEWED: &str = "reviewed";
     pub const APPLY_QUEUED: &str = "apply_queued";
 
+    // User-recorded correction events (design doc 0001 §3; emitted by
+    // `gwl-jobs edit`). The pipeline never emits them.
+    pub const EDITED: &str = "edited";
+
     // Outcome events (design doc 0001 §3; emitted by `gwl-jobs outcome`).
     pub const APPLIED: &str = "applied";
     pub const SCREENED: &str = "screened";
@@ -196,6 +200,24 @@ pub struct UpdatedPayload {
     pub dedupe_key: String,
     pub identifiers: Identifiers,
     pub changed: Vec<String>,
+    #[serde(flatten)]
+    pub snapshot: SnapshotFields,
+}
+
+/// Payload for the `edited` event (design doc 0001 §3): a user-supplied
+/// correction to the latest extraction snapshot. Mirrors `updated` (a full
+/// snapshot + changed-field list) so the aggregate and projection treat it
+/// as a member of the snapshot-event family; `adapter` is `"user"` and the
+/// lead's `dedupe_key` is immutable (decision record 0009). `identifiers`
+/// are recomputed from the corrected fields and indexed additively. `note`
+/// records why the user corrected (provenance).
+#[skip_serializing_none]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct EditedPayload {
+    pub dedupe_key: String,
+    pub identifiers: Identifiers,
+    pub changed: Vec<String>,
+    pub note: Option<String>,
     #[serde(flatten)]
     pub snapshot: SnapshotFields,
 }
