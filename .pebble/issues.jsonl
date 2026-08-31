@@ -216,3 +216,7 @@
 {"type":"update","issueId":"GWLJ-w27khs","timestamp":"2026-08-31T18:24:52.438Z","data":{"parent":"GWLJ-7kfu55"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-w27khs","timestamp":"2026-08-31T18:24:55.599Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-do8pqx","timestamp":"2026-08-31T18:24:56.374Z","data":{"blockedBy":["GWLJ-w27khs"]},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-do8pqx","timestamp":"2026-08-31T18:25:00.855Z","data":{"blockedBy":[]},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-do8pqx","timestamp":"2026-08-31T18:25:01.637Z","data":{"relatedTo":["GWLJ-w27khs"]},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-w27khs","timestamp":"2026-08-31T18:25:01.637Z","data":{"relatedTo":["GWLJ-do8pqx"]},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-do8pqx","timestamp":"2026-08-31T18:25:02.375Z","data":{"text":"Will be closed by GWLJ-w27khs: the post-'m' hint bundle includes the show --jd hint.","timestamp":"2026-08-31T18:25:02.375Z"},"source":"gwl-job-tools"}
