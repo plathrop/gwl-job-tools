@@ -16,8 +16,9 @@ use uuid::Uuid;
 
 use crate::{
     cli::{
-        AppliedArgs, ClearField, EditArgs, EventsArgs, IngestArgs, InterviewedArgs, ListArgs, Mark,
-        MarkArgs, OfferedArgs, OutcomeArgs, OutcomeType, RemoteState, ScreenedArgs, ShowArgs,
+        AppliedArgs, ApplyMethod, ClearField, EditArgs, EventsArgs, IngestArgs, InterviewedArgs,
+        ListArgs, Mark, MarkArgs, OfferedArgs, OutcomeArgs, OutcomeType, RemoteState, ScreenedArgs,
+        ShowArgs,
     },
     config::{AppPaths, Config},
     domain::{
@@ -294,6 +295,9 @@ pub struct QueueEntry {
     pub deferral_count: u64,
     pub mark: Option<String>,
     pub outcome: Option<String>,
+    /// The derived lifecycle status (design doc 0002): the single
+    /// application-stage dimension; mark/outcome above remain the facts.
+    pub status: String,
 }
 
 fn queue_entry(rank: usize, record: &LeadRecord) -> QueueEntry {
@@ -306,6 +310,7 @@ fn queue_entry(rank: usize, record: &LeadRecord) -> QueueEntry {
         deferral_count: record.deferral_count,
         mark: record.latest_mark.clone(),
         outcome: record.latest_outcome.as_ref().map(|o| o.event_type.clone()),
+        status: record.lifecycle_status(),
     }
 }
 
@@ -315,6 +320,11 @@ pub async fn execute_list(args: ListArgs, paths: &AppPaths, json: bool, color: b
     let events = store.replay()?;
     let projection = projections::rebuild(&events)?;
 
+    // The default view is the active pipeline (design doc 0002): every lead
+    // that has not reached a terminal state — pending, deferred, applying,
+    // applied, screened, … — ranked by score. `--all` adds the terminal
+    // leads back in. The pending review queue itself remains what `review`
+    // steps through; `list` no longer duplicates it.
     let records: Vec<&LeadRecord> = if args.all {
         let mut leads: Vec<&LeadRecord> = projection.leads.values().collect();
         leads.sort_by(|a, b| {
@@ -324,7 +334,7 @@ pub async fn execute_list(args: ListArgs, paths: &AppPaths, json: bool, color: b
         });
         leads
     } else {
-        projection.pending_queue()
+        projection.active_leads()
     };
 
     if json {
@@ -821,6 +831,11 @@ fn review_loop(
                         );
                         std::io::stdout().flush().into_diagnostic()?;
                     }
+                    // The final click is the user's (design doc §5); remind
+                    // them to record the fact once it's done (design doc
+                    // 0002).
+                    let prefix: String = record.lead_id.to_string().chars().take(8).collect();
+                    println!("  next: record with `gwl-jobs applied {prefix}` once submitted");
                     break;
                 }
                 'm' => {
@@ -839,6 +854,13 @@ fn review_loop(
                     if let Some(url) = record.url.as_deref() {
                         println!("  URL: {}", render::sanitize(url));
                     }
+                    // Post-mark hints (GWLJ-do8pqx + design doc 0002): the JD
+                    // text for the manual application, and the command that
+                    // records the outcome the flow ends with.
+                    let prefix: String = record.lead_id.to_string().chars().take(8).collect();
+                    println!(
+                        "  next: JD `gwl-jobs show {prefix} --jd`; record `gwl-jobs applied {prefix}` once submitted"
+                    );
                     std::io::stdout().flush().into_diagnostic()?;
                     break;
                 }
@@ -1030,13 +1052,18 @@ pub async fn execute_applied(args: AppliedArgs, paths: &AppPaths) -> Result<()> 
     let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let projection = projections::rebuild(&store.replay()?)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
+    // The method defaults from the lead's apply mark (design doc 0002): the
+    // mark recorded which flow was chosen, so `gwl-jobs applied <lead>` is
+    // enough after a review mark. An explicit --method still wins.
+    let record = select_lead(&projection, &args.lead)?;
+    let method = resolve_apply_method(record, args.method);
     let lead_id = record_outcome(
         &mut store,
         &projection,
         &args.lead,
         event_type::APPLIED,
         OutcomePayload {
-            method: args.method.map(|m| m.as_str().to_string()),
+            method,
             note: args.note,
             ..Default::default()
         },
@@ -1044,6 +1071,18 @@ pub async fn execute_applied(args: AppliedArgs, paths: &AppPaths) -> Result<()> 
     )?;
     println!("{lead_id}");
     Ok(())
+}
+
+/// The `applied` submission method, resolved as `--method` if given, else
+/// the method the lead's apply mark implies (design doc 0002).
+fn resolve_apply_method(record: &LeadRecord, method: Option<ApplyMethod>) -> Option<String> {
+    method
+        .map(|m| m.as_str().to_string())
+        .or_else(|| match record.latest_mark.as_deref() {
+            Some("apply-automatically") => Some("auto-assisted".into()),
+            Some("apply-manual") => Some("manual".into()),
+            _ => None,
+        })
 }
 
 #[instrument(skip_all)]
@@ -1643,6 +1682,96 @@ mod tests {
         // A bare date means noon UTC (documented default).
         let ts = parse_occurred_at("2026-08-01").unwrap();
         assert_eq!(ts, "2026-08-01T12:00:00Z".parse::<Timestamp>().unwrap());
+    }
+
+    // ── applied-method defaulting (design doc 0002) ───────────
+
+    #[test]
+    fn resolve_apply_method_prefers_explicit_flag() {
+        let mut record = lead_record(None);
+        record.latest_mark = Some("apply-manual".into());
+        // Explicit --method wins over the mark's implication.
+        let method = resolve_apply_method(&record, Some(ApplyMethod::AutoAssisted));
+        assert_eq!(method.as_deref(), Some("auto-assisted"));
+    }
+
+    #[test]
+    fn resolve_apply_method_derives_from_mark() {
+        let mut record = lead_record(None);
+        record.latest_mark = Some("apply-manual".into());
+        assert_eq!(
+            resolve_apply_method(&record, None).as_deref(),
+            Some("manual")
+        );
+        record.latest_mark = Some("apply-automatically".into());
+        assert_eq!(
+            resolve_apply_method(&record, None).as_deref(),
+            Some("auto-assisted")
+        );
+        record.latest_mark = Some("defer".into());
+        assert_eq!(resolve_apply_method(&record, None), None);
+        record.latest_mark = None;
+        assert_eq!(resolve_apply_method(&record, None), None);
+    }
+
+    #[tokio::test]
+    async fn execute_applied_defaults_method_from_mark() {
+        // The workflow fix (design doc 0002): after review's `m` key,
+        // `gwl-jobs applied <lead>` alone is enough — the apply-manual mark
+        // already recorded the flow.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, record) = ingested_lead(
+            &dir,
+            &Config::default(),
+            ExtractedFields {
+                title: Some("Engineer".into()),
+                company: Some("Acme".into()),
+                ..Default::default()
+            },
+            "body",
+        );
+        mark_lead(
+            &mut store,
+            &Config::default(),
+            &record,
+            Mark::ApplyManual,
+            None,
+        )
+        .unwrap();
+        drop(store); // release the single-writer lock
+
+        let paths = AppPaths::new(dir.path().join("config"), dir.path().to_path_buf());
+        execute_applied(
+            AppliedArgs {
+                lead: record.lead_id.to_string(),
+                method: None,
+                note: None,
+                at: None,
+            },
+            &paths,
+        )
+        .await
+        .unwrap();
+
+        let store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
+        let applied = store
+            .replay()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.event_type == "applied")
+            .unwrap();
+        assert_eq!(applied.payload["method"], "manual");
+
+        // And the derived status reflects the recorded fact.
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        assert_eq!(
+            projection
+                .leads
+                .get(&record.lead_id)
+                .unwrap()
+                .lifecycle_status(),
+            "applied (manual)"
+        );
     }
 
     #[test]

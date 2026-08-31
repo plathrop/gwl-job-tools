@@ -464,7 +464,9 @@ reader so the seam exists from day one.
      appended and the lead stays pending. The mark _is_ the approval; there
      is no second confirmation. The browser click is the user's.
    - `m` — emits `reviewed{apply-manual}`; prints JD + resume context +
-     cheat sheet for the user to act on.
+     cheat sheet for the user to act on, plus a one-line hint to view the
+     JD (`show --jd`) and to record `applied` once submitted (design doc
+     0002).
    - `d` — emits `reviewed{defer}`; deferral count +1; reappears next
      review.
    - `i` — emits `reviewed{ignore}`; durable (§2).
@@ -514,8 +516,15 @@ In-memory, rebuilt by replaying the log at startup:
 subsequent failing `rejected`, no outcome event, not archived, and
 latest mark absent or `defer`. Ranked by composite score descending.
 `apply-automatically`/`apply-manual` leads that have not yet recorded an
-outcome appear in `gwl-jobs list --all` but not in the pending queue —
-they have been acted on; `gwl-jobs outcome` is how they move forward.
+outcome appear in `gwl-jobs list` (the active pipeline) but not in the
+pending queue — they have been acted on; `gwl-jobs outcome` is how they
+move forward.
+
+**Derived lifecycle status (design doc 0002):** the LeadBook also derives
+the single application-stage dimension — pending, applying
+(manual/auto-assisted), applied (…), outcome stages, terminal — from the
+mark+outcome facts, rendered by `list` and the card as one status, with
+the facts preserved for `show --json` and `events`.
 
 **Pending recovery:** a lead whose latest mark is `apply-automatically` but
 which has **no** subsequent `apply_queued` is treated as still-pending. That
@@ -530,13 +539,13 @@ Supersedes and removes the placeholder `lead open|list|close`.
 | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
 | `gwl-jobs ingest <url>`                                 | Fetch, extract, dedupe, gate, score a posting.                                                                                                                                                                                                                                                                   | `ingested` / `updated` / `reingest_suppressed`, then `rejected` or `scored` |
 | `gwl-jobs ingest --file <path>`                         | Same, from a local HTML/PDF/text drop.                                                                                                                                                                                                                                                                           | same                                                                        |
-| `gwl-jobs list [--all]`                                 | Print the ranked review queue.                                                                                                                                                                                                                                                                                   | —                                                                           |
+| `gwl-jobs list [--all]`                                 | Print the active pipeline: every non-terminal, non-ignored lead, ranked by score (design doc 0002). `--all` adds terminal and ignored leads.                                                                                                                                                                     | —                                                                           |
 | `gwl-jobs review`                                       | Interactive prompt loop (§5).                                                                                                                                                                                                                                                                                    | `reviewed`, `apply_queued`                                                  |
 | `gwl-jobs mark <lead> <mark> [--note]`                  | Non-interactive mark (scriptable). `apply-automatically` runs the same prepare → batch-append → open flow as the review loop's `a` key (§5).                                                                                                                                                                     | `reviewed` (+ `apply_queued`)                                               |
 | `gwl-jobs edit <lead> [flags] [--note]`                 | Manually correct/enrich fields extraction missed: `--title`, `--company`, `--req-id`, `--location`, `--remote true\|false\|unknown`, `--comp` (parsed like extraction) or `--comp-min`/`--comp-max`, `--url`, `--source`, `--clear field,…`. Dedupe key immutable; re-evaluates gates + scoring (decision 0009). | `edited` (+ `rejected` or `scored`)                                         |
 | `gwl-jobs package <lead>`                               | (Re)build the apply package for a lead marked `apply-automatically`; re-print and re-open the URL. Bails on unmarked leads — mark first.                                                                                                                                                                         | `apply_queued`                                                              |
 | `gwl-jobs show <lead> [--jd]`                           | Full detail: snapshot, score history, marks, events. (Steel-thread scope: snapshot + mark + counts; grows as scores/marks/events land.) `--jd` prints the raw posting text.                                                                                                                                      | —                                                                           |
-| `gwl-jobs applied <lead> [--method <m>] [--at <ts>]`    | Record the `applied` transition.                                                                                                                                                                                                                                                                                 | `applied`                                                                   |
+| `gwl-jobs applied <lead> [--method <m>] [--at <ts>]`    | Record the `applied` transition. `--method` defaults from the lead's apply mark (design doc 0002).                                                                                                                                                                                                               | `applied`                                                                   |
 | `gwl-jobs screened <lead> [--contact <c>] [--at <ts>]`  | Record the `screened` transition.                                                                                                                                                                                                                                                                                | `screened`                                                                  |
 | `gwl-jobs interviewed <lead> [--stage <s>] [--at <ts>]` | Record the `interviewed` transition.                                                                                                                                                                                                                                                                             | `interviewed`                                                               |
 | `gwl-jobs offered <lead> [--at <ts>]`                   | Record the `offered` transition.                                                                                                                                                                                                                                                                                 | `offered`                                                                   |

@@ -308,7 +308,8 @@ pub struct EventsArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct ListArgs {
-    /// Show all leads, not just the pending queue
+    /// Show all leads, including terminal and ignored ones (default: the
+    /// active pipeline — every non-terminal, non-ignored lead)
     #[arg(long)]
     pub all: bool,
 }
