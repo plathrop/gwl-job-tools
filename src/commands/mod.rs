@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::{
     cli::{
         AppliedArgs, ClearField, EditArgs, EventsArgs, IngestArgs, InterviewedArgs, ListArgs, Mark,
-        MarkArgs, OfferedArgs, OutcomeArgs, OutcomeType, ScreenedArgs, ShowArgs,
+        MarkArgs, OfferedArgs, OutcomeArgs, OutcomeType, RemoteState, ScreenedArgs, ShowArgs,
     },
     config::{AppPaths, Config},
     domain::{
@@ -459,6 +459,22 @@ pub async fn execute_edit(
     Ok(())
 }
 
+/// Thousands-separated digits (`220000` → `220,000`) for the synthesized
+/// comp display string — Rust format strings have no numeric grouping, and
+/// the card should read like the parsed form does.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
 /// The merged result of an edit command's flags: the lead's corrected
 /// snapshot. Built separately from appending so the flag-merge logic is
 /// testable without a store.
@@ -476,7 +492,41 @@ pub struct EditSpec {
 /// absent (explicit, not empty-string sentinels); `--remote` is tri-state
 /// (`true`/`false`/`unknown`). `--comp` parses through the same extractor
 /// the ingest path uses; `--comp-min`/`--comp-max` set exact USD/year bounds.
+/// A field that is both set and cleared is a contradiction and bails —
+/// silently discarding the set value is the footgun this prevents (Remi,
+/// PR #15 review).
 pub fn build_edit_spec(record: &LeadRecord, args: &EditArgs) -> Result<EditSpec> {
+    // Contradiction check first, so `--comp "garbage" --clear comp` reports
+    // the contradiction rather than a parse error for a value that is about
+    // to be discarded anyway.
+    let clears = |field: ClearField| args.clear.contains(&field);
+    let contradiction = |field: &str| {
+        bail!(
+            "{field} is both set and cleared; use one or the other (a clear replaces the value, it does not combine with it)"
+        );
+    };
+    if args.title.is_some() && clears(ClearField::Title) {
+        contradiction("--title vs --clear title")?;
+    }
+    if args.company.is_some() && clears(ClearField::Company) {
+        contradiction("--company vs --clear company")?;
+    }
+    if args.req_id.is_some() && clears(ClearField::ReqId) {
+        contradiction("--req-id vs --clear req_id")?;
+    }
+    if args.location.is_some() && clears(ClearField::Location) {
+        contradiction("--location vs --clear location")?;
+    }
+    if args.remote.is_some_and(|r| r != RemoteState::Unknown) && clears(ClearField::Remote) {
+        // `--remote unknown` agrees with `--clear remote` (both clear the
+        // signal); a confident value contradicts it.
+        contradiction("--remote vs --clear remote")?;
+    }
+    let comp_set = args.comp.is_some() || args.comp_min.is_some() || args.comp_max.is_some();
+    if comp_set && clears(ClearField::Comp) {
+        contradiction("--comp vs --clear comp")?;
+    }
+
     let mut extracted = record.extracted.clone();
 
     if let Some(title) = &args.title {
@@ -508,9 +558,9 @@ pub fn build_edit_spec(record: &LeadRecord, args: &EditArgs) -> Result<EditSpec>
             bail!("--comp-min {min} exceeds --comp-max {max}");
         }
         let raw = match (args.comp_min, args.comp_max) {
-            (Some(min), Some(max)) => format!("{min} - {max}"),
-            (Some(min), None) => format!("{min}"),
-            (None, Some(max)) => format!("{max}"),
+            (Some(min), Some(max)) => format!("${} - ${}", thousands(min), thousands(max)),
+            (Some(min), None) => format!("${}", thousands(min)),
+            (None, Some(max)) => format!("${}", thousands(max)),
             (None, None) => {
                 unreachable!("guarded by the is_some check above")
             }
@@ -523,8 +573,8 @@ pub fn build_edit_spec(record: &LeadRecord, args: &EditArgs) -> Result<EditSpec>
             raw,
         });
     }
-    // `--clear` wins over the value flags: an explicit reset is the more
-    // specific intent, and the order is deterministic either way.
+    // `--clear` applies only to fields with no set flag (checked above), so
+    // it can never silently discard a value the user also provided.
     for field in &args.clear {
         match field {
             ClearField::Title => extracted.title = None,
@@ -631,7 +681,7 @@ pub fn record_edit(
         &state,
         &dedupe_key,
         &recomputed.identifiers,
-        spec.note,
+        spec.note.clone(),
         &spec.source,
         spec.url.clone(),
         raw_text,
@@ -657,6 +707,7 @@ pub fn record_edit(
         source: spec.source,
         url: spec.url,
         extracted: spec.extracted,
+        note: spec.note,
     })
 }
 
@@ -672,6 +723,9 @@ pub struct EditSummary {
     pub source: String,
     pub url: Option<String>,
     pub extracted: ExtractedFields,
+    /// The provenance note recorded on the `edited` event (echoed so the
+    /// `--json` summary matches the event it produced).
+    pub note: Option<String>,
 }
 
 #[instrument(skip_all, fields(color = %color))]
@@ -1721,7 +1775,9 @@ mod tests {
             spec.extracted.title.as_deref(),
             Some("Staff DevOps Engineer, API Platform")
         );
-        // `--remote unknown` and `--clear remote` agree: the signal is gone.
+        // `--remote unknown` and `--clear remote` agree: the signal is gone
+        // (a confident `--remote` value plus a clear would bail as a
+        // contradiction — see build_edit_spec_contradictory_flags_bail).
         assert_eq!(spec.extracted.remote, None);
         assert_eq!(spec.source, "recruiter");
     }
@@ -1758,6 +1814,43 @@ mod tests {
     }
 
     #[test]
+    fn build_edit_spec_contradictory_flags_bail() {
+        // Remi (PR #15): a field both set and cleared must not silently
+        // discard the set value — it is a contradiction, and a loud one.
+        let record = lead_record(None);
+
+        let mut args = edit_args();
+        args.title = Some("Engineer".into());
+        args.clear = vec![crate::cli::ClearField::Title];
+        assert!(build_edit_spec(&record, &args).is_err());
+
+        // The comp contradiction fires BEFORE parsing: an unparseable value
+        // that is about to be cleared reports the contradiction, not a
+        // parse error for a discarded string.
+        let mut args = edit_args();
+        args.comp = Some("garbage".into());
+        args.clear = vec![crate::cli::ClearField::Comp];
+        let err = format!("{}", build_edit_spec(&record, &args).unwrap_err());
+        assert!(err.contains("both set and cleared"), "got: {err}");
+
+        let mut args = edit_args();
+        args.comp_min = Some(220_000);
+        args.clear = vec![crate::cli::ClearField::Comp];
+        assert!(build_edit_spec(&record, &args).is_err());
+
+        // A confident remote value contradicts a clear; `--remote unknown`
+        // agrees with it (both clear the signal).
+        let mut args = edit_args();
+        args.remote = Some(RemoteState::True);
+        args.clear = vec![crate::cli::ClearField::Remote];
+        assert!(build_edit_spec(&record, &args).is_err());
+        let mut args = edit_args();
+        args.remote = Some(RemoteState::Unknown);
+        args.clear = vec![crate::cli::ClearField::Remote];
+        assert!(build_edit_spec(&record, &args).is_ok());
+    }
+
+    #[test]
     fn build_edit_spec_exact_comp_bounds() {
         let record = lead_record(None);
         let mut args = edit_args();
@@ -1772,6 +1865,18 @@ mod tests {
         assert_eq!(comp.max, Some(290_000));
         assert_eq!(comp.currency, "USD");
         assert_eq!(comp.period, "year");
+        // The synthesized display string matches the parsed form's style
+        // (PR #15 review nit: no bare "220000 - 290000" on the card).
+        assert_eq!(comp.raw, "$220,000 - $290,000");
+
+        let mut args = edit_args();
+        args.comp_min = Some(220_000);
+        let comp = build_edit_spec(&record, &args)
+            .unwrap()
+            .extracted
+            .comp
+            .unwrap();
+        assert_eq!(comp.raw, "$220,000");
 
         let mut args = edit_args();
         args.comp_min = Some(300_000);
@@ -1814,11 +1919,18 @@ mod tests {
         let mut args = edit_args();
         args.comp = Some("$220,000 - $290,000".into());
         args.remote = Some(RemoteState::True);
+        args.note = Some("recruiter email quoted the band".into());
         let spec = build_edit_spec(&record, &args).unwrap();
         let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let summary = record_edit(&mut store, &projection, &config, &[], &record, spec).unwrap();
 
         assert_eq!(summary.lead_id, record.lead_id);
+        // The --json summary echoes the note it recorded on the event
+        // (PR #15 review nit).
+        assert_eq!(
+            summary.note.as_deref(),
+            Some("recruiter email quoted the band")
+        );
         // Field order follows ExtractedFields::diff: remote before comp.
         assert_eq!(summary.changed, vec!["remote", "comp"]);
         assert!(summary.rejected.is_none());

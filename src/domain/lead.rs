@@ -243,7 +243,9 @@ pub fn decide_edit(
         changed.push("source".into());
     }
     if changed.is_empty() {
-        bail!("nothing to edit: no fields changed");
+        bail!(
+            "nothing to edit: no fields changed (a note alone does not change the snapshot; record it with a field correction)"
+        );
     }
 
     let payload = EditedPayload {
