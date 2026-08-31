@@ -347,6 +347,22 @@ pub fn decide_mark(
     Ok(events)
 }
 
+/// Decide the `apply_queued` event for `gwl-jobs package` (design doc 0001
+/// §8): (re)build the apply package for an already-marked lead — the re-entry
+/// for "I marked apply-automatically and closed the tab". Bails loudly on
+/// unmarked (or differently-marked) leads so the mark — the approval, per
+/// the non-negotiables — happens first. Re-running on an already-queued
+/// lead is legal: the package may genuinely be rebuilt and re-opened.
+pub fn decide_package(state: &LeadState, apply: &ApplyQueuedPayload) -> Result<PendingEvent> {
+    if !state.exists {
+        bail!("cannot package a lead that does not exist");
+    }
+    if state.latest_mark.as_deref() != Some("apply-automatically") {
+        bail!("package requires the apply-automatically mark (the approval); mark the lead first");
+    }
+    PendingEvent::new(event_type::APPLY_QUEUED, None, apply)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1227,6 +1243,49 @@ mod tests {
         assert_eq!(events[0].event_type, event_type::REVIEWED);
         assert_eq!(events[1].event_type, event_type::APPLY_QUEUED);
         assert_eq!(events[1].payload["url"], "https://example.com/j");
+    }
+
+    // ── decide_package ───────────────────────────────────────────
+
+    #[test]
+    fn package_requires_apply_automatically_mark() {
+        // The mark IS the approval (design doc §8): packaging an unmarked
+        // lead would prepare an application the user never approved.
+        let apply = apply_payload();
+        assert!(decide_package(&LeadState::default(), &apply).is_err());
+
+        let mut unmarked = existing_state();
+        unmarked.latest_mark = None;
+        assert!(decide_package(&unmarked, &apply).is_err());
+
+        let mut deferred = existing_state();
+        deferred.latest_mark = Some("defer".into());
+        assert!(decide_package(&deferred, &apply).is_err());
+
+        let mut manual = existing_state();
+        manual.latest_mark = Some("apply-manual".into());
+        assert!(decide_package(&manual, &apply).is_err());
+    }
+
+    #[test]
+    fn package_emits_apply_queued_for_marked_lead() {
+        let mut state = existing_state();
+        state.latest_mark = Some("apply-automatically".into());
+        let apply = apply_payload();
+        let pending = decide_package(&state, &apply).unwrap();
+        assert_eq!(pending.event_type, event_type::APPLY_QUEUED);
+        assert_eq!(pending.payload["url"], "https://example.com/j");
+    }
+
+    #[test]
+    fn package_can_rebuild_an_already_queued_package() {
+        // Re-entry is legal: the user may genuinely need the package and
+        // URL again after closing the tab.
+        let mut state = existing_state();
+        state.latest_mark = Some("apply-automatically".into());
+        state.seq = 3;
+        let apply = apply_payload();
+        assert!(decide_package(&state, &apply).is_ok());
     }
 
     #[test]

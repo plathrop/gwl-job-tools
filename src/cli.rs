@@ -61,6 +61,21 @@ pub struct ShowArgs {
     pub jd: bool,
 }
 
+/// `gwl-jobs package` (design doc 0001 §8): (re)build the apply package for
+/// a lead already marked `apply-automatically`.
+#[derive(Clone, Debug, Args)]
+pub struct PackageArgs {
+    /// Unambiguous UUID prefix of the lead
+    pub lead: String,
+}
+
+/// `gwl-jobs completion` (design doc 0001 §8): shell completions.
+#[derive(Clone, Debug, Args)]
+pub struct CompletionArgs {
+    /// Shell to generate for (bash, zsh, fish; default: infer from $SHELL)
+    pub shell: Option<String>,
+}
+
 /// How an application was submitted (`applied` event, design doc 0001 §3).
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum ApplyMethod {
@@ -360,11 +375,14 @@ pub enum Commands {
     /// Manually correct or enrich a lead's fields
     Edit(EditArgs),
 
+    /// (Re)build and re-open the apply package for an apply-automatically lead
+    Package(PackageArgs),
+
     /// Interactively review the pending queue
     Review,
 
-    /// Generate shell completions
-    Completion,
+    /// Generate shell completions (bash, zsh, fish)
+    Completion(CompletionArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -415,8 +433,9 @@ impl Cli {
             Some(Commands::List(_)) => "list",
             Some(Commands::Mark(_)) => "mark",
             Some(Commands::Edit(_)) => "edit",
+            Some(Commands::Package(_)) => "package",
             Some(Commands::Review) => "review",
-            Some(Commands::Completion) => "completion",
+            Some(Commands::Completion(_)) => "completion",
             None => "none",
         }
     }
@@ -446,8 +465,9 @@ pub async fn execute(
         Some(Commands::Edit(args)) => {
             commands::execute_edit(args, config, paths, json, color).await
         }
+        Some(Commands::Package(args)) => commands::execute_package(args, config, paths, json).await,
         Some(Commands::Review) => commands::execute_review(config, paths, color).await,
-        Some(Commands::Completion) => Err(miette::miette!("completion is not yet implemented")),
+        Some(Commands::Completion(args)) => commands::execute_completion(args),
         None => Err(miette::miette!(
             "no command provided; run `{APP_NAME} --help`"
         )),
@@ -467,8 +487,9 @@ fn cmd_label(command: &Option<Commands>) -> &'static str {
         Some(Commands::List(_)) => "list",
         Some(Commands::Mark(_)) => "mark",
         Some(Commands::Edit(_)) => "edit",
+        Some(Commands::Package(_)) => "package",
         Some(Commands::Review) => "review",
-        Some(Commands::Completion) => "completion",
+        Some(Commands::Completion(_)) => "completion",
         None => "none",
     }
 }
@@ -675,6 +696,20 @@ mod tests {
     fn parse_edit_clear_rejects_unknown_fields() {
         assert!(Cli::try_parse_from(["gwl-jobs", "edit", "abc", "--clear", "source"]).is_err());
         assert!(Cli::try_parse_from(["gwl-jobs", "edit", "abc", "--clear", "url"]).is_err());
+    }
+
+    #[test]
+    fn parse_package() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "package", "0192f8a1"]).unwrap();
+        assert_eq!(cli.command_name(), "package");
+    }
+
+    #[test]
+    fn parse_completion_with_and_without_shell() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "completion", "zsh"]).unwrap();
+        assert_eq!(cli.command_name(), "completion");
+        let cli = Cli::try_parse_from(["gwl-jobs", "completion"]).unwrap();
+        assert_eq!(cli.command_name(), "completion");
     }
 
     #[test]
