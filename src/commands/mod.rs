@@ -838,19 +838,29 @@ fn infer_shell() -> Result<clap_complete::Shell> {
     shell_from_name(basename).wrap_err_with(|| format!("$SHELL is '{shell}'"))
 }
 
-#[instrument(skip_all, fields(color = %color))]
+#[instrument(skip_all, fields(review.run_id))]
 pub async fn execute_review(config: &Config, paths: &AppPaths, color: bool) -> Result<()> {
+    // One id per review invocation (GWLJ-u8psvi): every mark made in the
+    // session inherits the `review.run_id` span field (mark_lead's spans
+    // nest under this one), so "which leads did I action in the session
+    // that crashed at lead 7?" is a log grep away.
+    let run_id = Uuid::now_v7();
+    tracing::Span::current().record("review.run_id", run_id.to_string());
+
     let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
     let events = store.replay()?;
     let projection = projections::rebuild(&events)?;
     let pending = projection.pending_queue();
-    debug!(pending = pending.len(), "review session");
+    debug!(pending = pending.len(), %run_id, "review session");
 
     if pending.is_empty() {
         println!("no pending leads");
         return Ok(());
     }
 
+    // The session line lets the user cross-reference a run in the log file
+    // from the terminal (the span field covers the log side).
+    println!("review session {run_id}");
     review_loop(&mut store, config, &pending, color)
 }
 

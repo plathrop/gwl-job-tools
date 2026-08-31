@@ -19,13 +19,22 @@ use {
 
 use crate::config::LogLevel;
 
-#[derive(Copy, Clone, Debug, ValueEnum)]
+/// The effective telemetry setting (decision 0005's precedence pattern):
+/// CLI > config file > default (off).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TelemetryStatus {
     #[value(name = "off", alias = "false")]
     Off,
     #[cfg(feature = "telemetry")]
     #[value(name = "on", alias = "true")]
     On,
+}
+
+/// Resolve the effective telemetry status: CLI > config file > default
+/// (off). Mirrors the log_level precedence (decision 0005).
+pub fn resolve(cli: Option<TelemetryStatus>, config: Option<TelemetryStatus>) -> TelemetryStatus {
+    cli.or(config).unwrap_or(TelemetryStatus::Off)
 }
 
 pub enum TelemetryGuard {
@@ -194,6 +203,19 @@ mod tests {
     fn no_provider_shutdown_does_not_panic() {
         let guard = TelemetryGuard::NoProvider;
         let _ = guard.shutdown();
+    }
+
+    // ── resolve (CLI > config > default off) ───────────────────────
+
+    #[test]
+    fn resolve_prefers_cli_over_config_over_default() {
+        use crate::telemetry::TelemetryStatus as T;
+        // CLI wins over config.
+        assert!(matches!(resolve(Some(T::Off), Some(T::On)), T::Off));
+        // Config fills in when the CLI flag is absent.
+        assert!(matches!(resolve(None, Some(T::On)), T::On));
+        // Default: off.
+        assert!(matches!(resolve(None, None), T::Off));
     }
 
     // ── env_filter ─────────────────────────────────────────────────
