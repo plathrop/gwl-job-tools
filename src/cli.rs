@@ -351,7 +351,7 @@ pub enum Commands {
     /// Dump/filter the raw event log
     Events(EventsArgs),
 
-    /// Print the ranked review queue
+    /// Print the active pipeline: every lead not terminal or ignored
     List(ListArgs),
 
     /// Mark a lead (apply-automatically, apply-manual, defer, ignore)

@@ -321,18 +321,14 @@ pub async fn execute_list(args: ListArgs, paths: &AppPaths, json: bool, color: b
     let projection = projections::rebuild(&events)?;
 
     // The default view is the active pipeline (design doc 0002): every lead
-    // that has not reached a terminal state — pending, deferred, applying,
-    // applied, screened, … — ranked by score. `--all` adds the terminal
-    // leads back in. The pending review queue itself remains what `review`
-    // steps through; `list` no longer duplicates it.
+    // that is neither terminal nor durably ignored — pending, deferred,
+    // applying, applied, screened, … (and gate-rejected, at the bottom,
+    // `edit`-revivable) — ranked by score. `--all` adds the terminal and
+    // ignored leads back in. The pending review queue itself remains what
+    // `review` steps through; `list` no longer duplicates it. One shared
+    // sort (PR #16 review).
     let records: Vec<&LeadRecord> = if args.all {
-        let mut leads: Vec<&LeadRecord> = projection.leads.values().collect();
-        leads.sort_by(|a, b| {
-            let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
-            let sb = b.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
-            sb.cmp(&sa).then_with(|| a.first_seen.cmp(&b.first_seen))
-        });
-        leads
+        projection.ranked_leads()
     } else {
         projection.active_leads()
     };
@@ -1074,15 +1070,13 @@ pub async fn execute_applied(args: AppliedArgs, paths: &AppPaths) -> Result<()> 
 }
 
 /// The `applied` submission method, resolved as `--method` if given, else
-/// the method the lead's apply mark implies (design doc 0002).
+/// the method the lead's apply mark implies (design doc 0002). Delegates
+/// to `LeadRecord::mark_method` so the mark→method mapping exists in
+/// exactly one place (PR #16 review).
 fn resolve_apply_method(record: &LeadRecord, method: Option<ApplyMethod>) -> Option<String> {
     method
         .map(|m| m.as_str().to_string())
-        .or_else(|| match record.latest_mark.as_deref() {
-            Some("apply-automatically") => Some("auto-assisted".into()),
-            Some("apply-manual") => Some("manual".into()),
-            _ => None,
-        })
+        .or_else(|| record.mark_method().map(str::to_string))
 }
 
 #[instrument(skip_all)]
