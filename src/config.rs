@@ -82,6 +82,9 @@ pub struct Config {
     /// Log file path (decision 0005). `None` = default to
     /// `<data_dir>/gwl-jobs.log`.
     pub log_file: Option<PathBuf>,
+    /// Telemetry on/off (decision 0005's precedence pattern: CLI > config
+    /// > default off). `None` = not configured.
+    pub telemetry: Option<crate::telemetry::TelemetryStatus>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -235,6 +238,7 @@ mod tests {
         assert!(!config.remote_only);
         assert!(config.blacklist.is_empty());
         assert_eq!(config.scoring_weights.level, 1.0);
+        assert_eq!(config.telemetry, None);
         assert_eq!(config.scoring_weights.skills, 1.0);
         assert_eq!(config.scoring_weights.compensation, 1.0);
         assert_eq!(config.scoring_weights.remote, 1.0);
@@ -258,6 +262,7 @@ cover_letter_path = "~/letters/generic.pdf"
 target_companies = []
 log_level = "debug"
 log_file = "~/logs/gwl.log"
+telemetry = "on"
 
 [aliases]
 K8s = "Kubernetes"
@@ -290,6 +295,10 @@ compensation = 0.4
         assert!(config.target_companies.is_empty());
         assert_eq!(config.log_level, Some(LogLevel::Debug));
         assert_eq!(config.log_file, Some(home.join("logs/gwl.log")));
+        assert!(matches!(
+            config.telemetry,
+            Some(crate::telemetry::TelemetryStatus::On)
+        ));
     }
 
     #[test]

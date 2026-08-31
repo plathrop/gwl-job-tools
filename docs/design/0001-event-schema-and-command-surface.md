@@ -441,8 +441,10 @@ reader so the seam exists from day one.
 
 `gwl-jobs review`:
 
-1. Rebuilds the projection, prints the ranked queue (rank, composite,
-   title @ company, deferral count).
+1. Rebuilds the projection, prints a session line (`review session
+<run_id>` — one UUIDv7 per invocation, also recorded as a span field so
+   every mark made in the session is greppable in the log), then the
+   ranked queue (rank, composite, title @ company, deferral count).
 2. Steps through pending leads highest-score-first. For each: renders the
    lead card (title, company, location, remote, comp, URL, composite score
    with human-readable breakdown, deferral count, mark, source, outcome —

@@ -393,9 +393,10 @@ pub struct Cli {
     #[command(flatten)]
     pub color: colorchoice_clap::Color,
 
-    /// Controls whether to send telemetry to an OTLP collector
-    #[arg(long, value_enum, default_value = "off")]
-    pub telemetry: TelemetryStatus,
+    /// Controls whether to send telemetry to an OTLP collector (default:
+    /// off; can also be set in the config file — CLI wins)
+    #[arg(long, value_enum)]
+    pub telemetry: Option<TelemetryStatus>,
 
     /// Override the log level from config (default: error)
     #[arg(long, value_enum)]
@@ -550,16 +551,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_telemetry_default_is_off() {
+    fn parse_telemetry_defaults_to_none() {
+        // Absent flag means "not specified": the effective status resolves
+        // from config, else off (decision 0005's precedence pattern).
         let cli = Cli::try_parse_from(["gwl-jobs", "show", "abc"]).unwrap();
-        assert!(matches!(cli.telemetry, TelemetryStatus::Off));
+        assert!(cli.telemetry.is_none());
     }
 
     #[cfg(feature = "telemetry")]
     #[test]
     fn parse_telemetry_on() {
         let cli = Cli::try_parse_from(["gwl-jobs", "--telemetry", "on", "show", "abc"]).unwrap();
-        assert!(matches!(cli.telemetry, TelemetryStatus::On));
+        assert!(matches!(cli.telemetry, Some(TelemetryStatus::On)));
     }
 
     #[test]
@@ -568,7 +571,7 @@ mod tests {
             color: colorchoice_clap::Color {
                 color: ColorChoice::Auto,
             },
-            telemetry: TelemetryStatus::Off,
+            telemetry: None,
             log_level: None,
             json: false,
             command: None,

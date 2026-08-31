@@ -3,6 +3,7 @@ use gwl_job_tools::{
     APP_NAME,
     cli::{self, Cli},
     config::{AppPaths, Config},
+    telemetry,
     telemetry::init_telemetry,
 };
 use miette::Result;
@@ -25,7 +26,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(|| paths.data_dir().join("gwl-jobs.log"));
     let telemetry = init_telemetry(
-        cli.telemetry,
+        telemetry::resolve(cli.telemetry, config.telemetry),
         APP_NAME,
         cli.log_level.or(config.log_level),
         &log_path,
