@@ -244,3 +244,5 @@
 {"type":"update","issueId":"GWLJ-x39zmv","timestamp":"2026-08-31T19:43:04.597Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-ha1zfm","timestamp":"2026-08-31T19:43:04.629Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-n5vvhz","timestamp":"2026-08-31T19:43:11.306Z","data":{"description":"The --telemetry on|off flag has no config-file counterpart (unlike log_level, decision 0005). Add a telemetry = on|off key to the TOML config; precedence CLI > config > default (off), mirroring log_level. Requested by Grey 2026-08-31; bundles with GWLJ-u8psvi (session run_id) in the same increment."},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-u8psvi","timestamp":"2026-08-31T19:52:13.134Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-n5vvhz","timestamp":"2026-08-31T19:52:13.164Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
