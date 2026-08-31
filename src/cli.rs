@@ -133,6 +133,92 @@ impl Mark {
     }
 }
 
+/// Tri-state `--remote` for `edit`: `true`/`false` (confident) or `unknown`
+/// (clear the signal). Matches the `Option<bool>` in `ExtractedFields`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum RemoteState {
+    True,
+    False,
+    Unknown,
+}
+
+impl RemoteState {
+    pub fn apply(self, remote: &mut Option<bool>) {
+        match self {
+            RemoteState::True => *remote = Some(true),
+            RemoteState::False => *remote = Some(false),
+            RemoteState::Unknown => *remote = None,
+        }
+    }
+}
+
+/// Editable fields that `edit --clear` can reset to absent (decision record
+/// 0009). `url` and `source` are set, never cleared — a lead without a
+/// posting URL loses its apply flow, and `source` has a meaningful default
+/// (`unknown`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum ClearField {
+    #[value(name = "title")]
+    Title,
+    #[value(name = "company")]
+    Company,
+    #[value(name = "req_id")]
+    ReqId,
+    #[value(name = "location")]
+    Location,
+    #[value(name = "remote")]
+    Remote,
+    #[value(name = "comp")]
+    Comp,
+}
+
+#[derive(Clone, Debug, Default, Args)]
+pub struct EditArgs {
+    /// Unambiguous UUID prefix of the lead
+    pub lead: String,
+    /// Corrected job title
+    #[arg(long)]
+    pub title: Option<String>,
+    /// Corrected company name
+    #[arg(long)]
+    pub company: Option<String>,
+    /// Corrected requisition ID
+    #[arg(long)]
+    pub req_id: Option<String>,
+    /// Corrected location
+    #[arg(long)]
+    pub location: Option<String>,
+    /// Remote signal: true, false, or unknown
+    #[arg(long, value_enum)]
+    pub remote: Option<RemoteState>,
+    /// Compensation as a raw string, parsed like extraction would
+    /// (e.g. "$220,000 - $290,000", "$180,000/yr")
+    #[arg(
+        long,
+        conflicts_with_all = ["comp_min", "comp_max"]
+    )]
+    pub comp: Option<String>,
+    /// Exact compensation floor in USD/year
+    #[arg(long)]
+    pub comp_min: Option<u64>,
+    /// Exact compensation ceiling in USD/year
+    #[arg(long)]
+    pub comp_max: Option<u64>,
+    /// Corrected posting URL (canonicalized before storing)
+    #[arg(long)]
+    pub url: Option<Url>,
+    /// Corrected lead source (search, recruiter, referrer, unknown)
+    #[arg(long, value_enum)]
+    pub source: Option<LeadSource>,
+    /// Reset fields to absent (comma-separated: title,company,req_id,
+    /// location,remote,comp)
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub clear: Vec<ClearField>,
+    /// Why the record was corrected (provenance)
+    #[arg(long)]
+    pub note: Option<String>,
+}
+
 #[derive(Clone, Debug, Args)]
 pub struct AppliedArgs {
     /// Unambiguous UUID prefix of the lead
@@ -270,6 +356,9 @@ pub enum Commands {
     /// Mark a lead (apply-automatically, apply-manual, defer, ignore)
     Mark(MarkArgs),
 
+    /// Manually correct or enrich a lead's fields
+    Edit(EditArgs),
+
     /// Interactively review the pending queue
     Review,
 
@@ -324,6 +413,7 @@ impl Cli {
             Some(Commands::Events(_)) => "events",
             Some(Commands::List(_)) => "list",
             Some(Commands::Mark(_)) => "mark",
+            Some(Commands::Edit(_)) => "edit",
             Some(Commands::Review) => "review",
             Some(Commands::Completion) => "completion",
             None => "none",
@@ -352,6 +442,9 @@ pub async fn execute(
         Some(Commands::Events(args)) => commands::execute_events(args, paths).await,
         Some(Commands::List(args)) => commands::execute_list(args, paths, json, color).await,
         Some(Commands::Mark(args)) => commands::execute_mark(args, config, paths).await,
+        Some(Commands::Edit(args)) => {
+            commands::execute_edit(args, config, paths, json, color).await
+        }
         Some(Commands::Review) => commands::execute_review(config, paths, color).await,
         Some(Commands::Completion) => Err(miette::miette!("completion is not yet implemented")),
         None => Err(miette::miette!(
@@ -372,6 +465,7 @@ fn cmd_label(command: &Option<Commands>) -> &'static str {
         Some(Commands::Events(_)) => "events",
         Some(Commands::List(_)) => "list",
         Some(Commands::Mark(_)) => "mark",
+        Some(Commands::Edit(_)) => "edit",
         Some(Commands::Review) => "review",
         Some(Commands::Completion) => "completion",
         None => "none",
@@ -497,6 +591,89 @@ mod tests {
     fn parse_offered() {
         let cli = Cli::try_parse_from(["gwl-jobs", "offered", "abc"]).unwrap();
         assert_eq!(cli.command_name(), "offered");
+    }
+
+    #[test]
+    fn parse_edit_field_flags() {
+        let cli = Cli::try_parse_from([
+            "gwl-jobs",
+            "edit",
+            "0192f8a1",
+            "--title",
+            "Staff Engineer",
+            "--company",
+            "Acme",
+            "--location",
+            "Remote, US",
+            "--remote",
+            "true",
+        ])
+        .unwrap();
+        assert_eq!(cli.command_name(), "edit");
+    }
+
+    #[test]
+    fn parse_edit_comp_and_clear() {
+        let cli = Cli::try_parse_from([
+            "gwl-jobs",
+            "edit",
+            "abc",
+            "--comp",
+            "$220,000 - $290,000",
+            "--clear",
+            "location,remote",
+            "--note",
+            "from the recruiter email",
+        ])
+        .unwrap();
+        assert_eq!(cli.command_name(), "edit");
+    }
+
+    #[test]
+    fn parse_edit_comp_conflicts_with_exact_bounds() {
+        // `--comp` (parsed) and `--comp-min`/`--comp-max` (exact) are two
+        // ways of saying the same thing; mixing them is ambiguous.
+        assert!(
+            Cli::try_parse_from([
+                "gwl-jobs",
+                "edit",
+                "abc",
+                "--comp",
+                "$200k",
+                "--comp-min",
+                "200000"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "gwl-jobs",
+                "edit",
+                "abc",
+                "--comp",
+                "$200k",
+                "--comp-max",
+                "250000"
+            ])
+            .is_err()
+        );
+        // The exact bounds alone are fine.
+        assert!(Cli::try_parse_from(["gwl-jobs", "edit", "abc", "--comp-min", "220000"]).is_ok());
+    }
+
+    #[test]
+    fn parse_edit_remote_is_tri_state() {
+        for value in ["true", "false", "unknown"] {
+            let cli = Cli::try_parse_from(["gwl-jobs", "edit", "abc", "--remote", value]).unwrap();
+            assert_eq!(cli.command_name(), "edit");
+        }
+        assert!(Cli::try_parse_from(["gwl-jobs", "edit", "abc", "--remote", "hybrid"]).is_err());
+    }
+
+    #[test]
+    fn parse_edit_clear_rejects_unknown_fields() {
+        assert!(Cli::try_parse_from(["gwl-jobs", "edit", "abc", "--clear", "source"]).is_err());
+        assert!(Cli::try_parse_from(["gwl-jobs", "edit", "abc", "--clear", "url"]).is_err());
     }
 
     #[test]

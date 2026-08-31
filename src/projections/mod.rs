@@ -116,6 +116,20 @@ impl Projection {
         matches
     }
 
+    /// Which lead owns an identifier form (`req:`/`url:`/`tc:`/`raw:` key or
+    /// dedupe key), if any. The edit command uses this to refuse a
+    /// correction that would collide with a different lead's identity
+    /// (decision record 0009): identifiers are indexed additively, never
+    /// re-pointed.
+    pub fn identifier_owner(&self, form: &str) -> Option<Uuid> {
+        self.req_index
+            .get(form)
+            .or_else(|| self.url_index.get(form))
+            .or_else(|| self.tc_index.get(form))
+            .or_else(|| self.dedupe_index.get(form))
+            .copied()
+    }
+
     /// The pending review queue (design doc §7): leads with a current
     /// `scored`, no outcome event, and latest mark absent or `defer` — plus
     /// the pending-recovery rule (an `apply-automatically` mark with no
@@ -164,7 +178,7 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
             continue;
         };
         match event.event_type.as_str() {
-            event_type::INGESTED | event_type::UPDATED => {
+            event_type::INGESTED | event_type::UPDATED | event_type::EDITED => {
                 // A payload we cannot decode is source-of-truth corruption,
                 // not something to skip: a stale projection can mint a
                 // duplicate lead on the next ingest. Fail loudly with the
@@ -483,6 +497,125 @@ mod tests {
             };
             assert_eq!(projection.lookup(&identity), Some(lead_id), "form {form}");
         }
+    }
+
+    #[test]
+    fn edited_event_refreshes_snapshot_and_additively_indexes() {
+        // Decision record 0009: `edited` is a snapshot event (refresh the
+        // record) and its recomputed identifiers are indexed WITHOUT
+        // dropping the old forms — a future posting matching either the
+        // old or the new identity must find the lead.
+        let lead_id = Uuid::now_v7();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), Some("tc:old")),
+            ),
+            envelope(
+                lead_id,
+                2,
+                event_type::EDITED,
+                serde_json::json!({
+                    "dedupe_key": "url:https://example.com/j",
+                    "identifiers": {
+                        "url": "url:https://example.com/j",
+                        "tc": "tc:new"
+                    },
+                    "changed": ["title", "company"],
+                    "adapter": "user",
+                    "source": "unknown",
+                    "raw_text": "body",
+                    "extracted": {"title": "Senior Engineer", "company": "Acme Corp"}
+                }),
+            ),
+        ];
+        let projection = rebuild(&events).unwrap();
+        let record = projection.leads.get(&lead_id).unwrap();
+        assert_eq!(record.extracted.title.as_deref(), Some("Senior Engineer"));
+        assert_eq!(record.adapter.as_deref(), Some("user"));
+        assert_eq!(record.event_count, 2);
+
+        // Additive: both the old and the recomputed tc forms match.
+        let old = LeadIdentity {
+            dedupe_key: "tc:old".into(),
+            identifiers: Identifiers {
+                tc: Some("tc:old".into()),
+                ..Default::default()
+            },
+        };
+        let new = LeadIdentity {
+            dedupe_key: "tc:new".into(),
+            identifiers: Identifiers {
+                tc: Some("tc:new".into()),
+                ..Default::default()
+            },
+        };
+        assert_eq!(projection.lookup(&old), Some(lead_id));
+        assert_eq!(projection.lookup(&new), Some(lead_id));
+    }
+
+    #[test]
+    fn identifier_owner_finds_forms_across_indexes() {
+        let lead_id = Uuid::now_v7();
+        let events = vec![envelope(
+            lead_id,
+            1,
+            event_type::INGESTED,
+            ingested_payload(
+                Some("req:acme:r-1"),
+                Some("url:https://example.com/j"),
+                Some("tc:abc"),
+            ),
+        )];
+        let projection = rebuild(&events).unwrap();
+        assert_eq!(projection.identifier_owner("req:acme:r-1"), Some(lead_id));
+        assert_eq!(
+            projection.identifier_owner("url:https://example.com/j"),
+            Some(lead_id)
+        );
+        assert_eq!(projection.identifier_owner("tc:abc"), Some(lead_id));
+        assert_eq!(projection.identifier_owner("tc:missing"), None);
+    }
+
+    #[test]
+    fn edited_snapshot_invalidates_stale_score() {
+        // The pass-marker rule (decision 0006) covers `edited` like every
+        // snapshot event.
+        let lead_id = Uuid::now_v7();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(lead_id, 2, event_type::SCORED, scored_payload(75, 1)),
+            envelope(
+                lead_id,
+                3,
+                event_type::EDITED,
+                serde_json::json!({
+                    "dedupe_key": "url:https://example.com/j",
+                    "identifiers": {"url": "url:https://example.com/j"},
+                    "changed": ["remote"],
+                    "adapter": "user",
+                    "source": "unknown",
+                    "raw_text": "body",
+                    "extracted": {"title": "Engineer", "company": "Acme", "remote": true}
+                }),
+            ),
+        ];
+        let projection = rebuild(&events).unwrap();
+        assert!(
+            projection
+                .leads
+                .get(&lead_id)
+                .unwrap()
+                .latest_score
+                .is_none()
+        );
     }
 
     #[test]

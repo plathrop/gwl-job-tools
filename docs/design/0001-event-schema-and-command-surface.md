@@ -188,13 +188,17 @@ limitation in the same family: the req form embeds a slugified company
 string, so the same company extracted differently across sources
 (`req:nvidia:…` vs `req:nvidia-corporation:…`) mints different keys —
 company canonicalization belongs to a future Company aggregate, not to
-v0's normalization heuristics.
+v0's normalization heuristics). A third limitation, accepted with the
+`edit` command (decision record 0009): a re-ingest snapshot replaces the
+whole snapshot, including fields the user corrected via `gwl-jobs edit`.
+At this volume re-ingests are rare, and the `edited` events' `changed`
+lists are the seam for a future merge-protection rule.
 
 ## 3. Event schema (question b)
 
 `●` = emitted by the v0 pipeline. `○` = defined in the schema now, emitted
-only by `gwl-jobs outcome` (user-recorded) — the pipeline itself never
-produces them in v0.
+only by user commands (`gwl-jobs outcome`, `gwl-jobs edit`) — the
+pipeline itself never produces them in v0.
 
 ### Pipeline events
 
@@ -254,6 +258,37 @@ already in hand; discovery (watchlist polling) remains vNext.
   "extracted": { "…": "…" }
 }
 ```
+
+**`edited`** ○ — a user-supplied correction to the latest snapshot
+(`gwl-jobs edit`; decision record 0009).
+
+```json
+{
+  "dedupe_key": "req:nvidia:JR2018233",
+  "identifiers": { "…": "…" },
+  "changed": ["comp", "remote"],
+  "note": "recruiter email quoted the band",
+  "adapter": "user",
+  "source": "search",
+  "url": "https://nvidia.wd5.myworkdayjobs.com/…",
+  "raw_text": "…carried forward unchanged…",
+  "extracted": { "…": "…" }
+}
+```
+
+A full-snapshot member of the `ingested`/`updated` family: it refreshes
+the projected snapshot, counts as one gate/score evaluation (bumping
+`revision`), and invalidates the prior score. The batch is `edited` +
+(`rejected` | `scored`), exactly like a re-ingest evaluation — so fixing a
+gate failure or a missing comp immediately restores the lead to the
+pending queue. The lead's `dedupe_key` is immutable; `identifiers` are
+recomputed from the corrected fields and indexed additively (an edit that
+collides with a different lead's identity is refused — that is a merge,
+not an edit). `raw_text` is carried forward (never edited in v0). Known
+limitation (accepted, decision 0009): a subsequent re-ingest snapshot
+replaces user corrections — no merge protection yet. Edits bypass
+durable-ignore suppression (explicit user action) but the mark stays
+latest-wins, so an ignored lead still does not re-enter the queue.
 
 **`reingest_suppressed`** ● — re-ingest matched a durably ignored lead.
 
@@ -491,22 +526,23 @@ recovery path.
 
 Supersedes and removes the placeholder `lead open|list|close`.
 
-| Command                                               | Purpose                                                                                                                                      | Events emitted                                                              |
-| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `gwl-jobs ingest <url>`                               | Fetch, extract, dedupe, gate, score a posting.                                                                                               | `ingested` / `updated` / `reingest_suppressed`, then `rejected` or `scored` |
-| `gwl-jobs ingest --file <path>`                       | Same, from a local HTML/PDF/text drop.                                                                                                       | same                                                                        |
-| `gwl-jobs list [--all]`                               | Print the ranked review queue.                                                                                                               | —                                                                           |
-| `gwl-jobs review`                                     | Interactive prompt loop (§5).                                                                                                                | `reviewed`, `apply_queued`                                                  |
-| `gwl-jobs mark <lead> <mark> [--note]`                | Non-interactive mark (scriptable). `apply-automatically` runs the same prepare → batch-append → open flow as the review loop's `a` key (§5). | `reviewed` (+ `apply_queued`)                                               |
-| `gwl-jobs package <lead>`                             | (Re)build the apply package for a lead marked `apply-automatically`; re-print and re-open the URL. Bails on unmarked leads — mark first.     | `apply_queued`                                                              |
-| `gwl-jobs show <lead> [--jd]`                         | Full detail: snapshot, score history, marks, events. (Steel-thread scope: snapshot + mark + counts; grows as scores/marks/events land.) `--jd` prints the raw posting text. | —                                                                           |
-| `gwl-jobs applied <lead> [--method <m>] [--at <ts>]`    | Record the `applied` transition.                                                                                                            | `applied`                                                                   |
-| `gwl-jobs screened <lead> [--contact <c>] [--at <ts>]` | Record the `screened` transition.                                                                                                           | `screened`                                                                  |
-| `gwl-jobs interviewed <lead> [--stage <s>] [--at <ts>]` | Record the `interviewed` transition.                                                                                                        | `interviewed`                                                               |
-| `gwl-jobs offered <lead> [--at <ts>]`                   | Record the `offered` transition.                                                                                                            | `offered`                                                                   |
-| `gwl-jobs outcome <lead> <type> [--note] [--at <ts>]`   | Record a terminal outcome (§3): `accepted` / `rejected_by_employer` / `withdrawn` / `declined` / `unresponsive` / `archived`.                | the terminal event                                                         |
-| `gwl-jobs events [--lead <id>] [--type <t>]`          | Dump/filter the raw log (debugging, golden tests).                                                                                           | —                                                                           |
-| `gwl-jobs completion`                                 | Shell completions (existing).                                                                                                                | —                                                                           |
+| Command                                                 | Purpose                                                                                                                                                                                                                                                                                                          | Events emitted                                                              |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| `gwl-jobs ingest <url>`                                 | Fetch, extract, dedupe, gate, score a posting.                                                                                                                                                                                                                                                                   | `ingested` / `updated` / `reingest_suppressed`, then `rejected` or `scored` |
+| `gwl-jobs ingest --file <path>`                         | Same, from a local HTML/PDF/text drop.                                                                                                                                                                                                                                                                           | same                                                                        |
+| `gwl-jobs list [--all]`                                 | Print the ranked review queue.                                                                                                                                                                                                                                                                                   | —                                                                           |
+| `gwl-jobs review`                                       | Interactive prompt loop (§5).                                                                                                                                                                                                                                                                                    | `reviewed`, `apply_queued`                                                  |
+| `gwl-jobs mark <lead> <mark> [--note]`                  | Non-interactive mark (scriptable). `apply-automatically` runs the same prepare → batch-append → open flow as the review loop's `a` key (§5).                                                                                                                                                                     | `reviewed` (+ `apply_queued`)                                               |
+| `gwl-jobs edit <lead> [flags] [--note]`                 | Manually correct/enrich fields extraction missed: `--title`, `--company`, `--req-id`, `--location`, `--remote true\|false\|unknown`, `--comp` (parsed like extraction) or `--comp-min`/`--comp-max`, `--url`, `--source`, `--clear field,…`. Dedupe key immutable; re-evaluates gates + scoring (decision 0009). | `edited` (+ `rejected` or `scored`)                                         |
+| `gwl-jobs package <lead>`                               | (Re)build the apply package for a lead marked `apply-automatically`; re-print and re-open the URL. Bails on unmarked leads — mark first.                                                                                                                                                                         | `apply_queued`                                                              |
+| `gwl-jobs show <lead> [--jd]`                           | Full detail: snapshot, score history, marks, events. (Steel-thread scope: snapshot + mark + counts; grows as scores/marks/events land.) `--jd` prints the raw posting text.                                                                                                                                      | —                                                                           |
+| `gwl-jobs applied <lead> [--method <m>] [--at <ts>]`    | Record the `applied` transition.                                                                                                                                                                                                                                                                                 | `applied`                                                                   |
+| `gwl-jobs screened <lead> [--contact <c>] [--at <ts>]`  | Record the `screened` transition.                                                                                                                                                                                                                                                                                | `screened`                                                                  |
+| `gwl-jobs interviewed <lead> [--stage <s>] [--at <ts>]` | Record the `interviewed` transition.                                                                                                                                                                                                                                                                             | `interviewed`                                                               |
+| `gwl-jobs offered <lead> [--at <ts>]`                   | Record the `offered` transition.                                                                                                                                                                                                                                                                                 | `offered`                                                                   |
+| `gwl-jobs outcome <lead> <type> [--note] [--at <ts>]`   | Record a terminal outcome (§3): `accepted` / `rejected_by_employer` / `withdrawn` / `declined` / `unresponsive` / `archived`.                                                                                                                                                                                    | the terminal event                                                          |
+| `gwl-jobs events [--lead <id>] [--type <t>]`            | Dump/filter the raw log (debugging, golden tests).                                                                                                                                                                                                                                                               | —                                                                           |
+| `gwl-jobs completion`                                   | Shell completions (existing).                                                                                                                                                                                                                                                                                    | —                                                                           |
 
 `<lead>` addressing: unambiguous UUID prefix of the `lead_id`. The review
 loop needs no addressing. Conventions carried forward: clap subcommands,
