@@ -112,8 +112,10 @@ impl LeadRecord {
     /// The submission method the lead's apply mark implies, for defaulting
     /// `applied --method` and decorating the status (design doc 0002): the
     /// mark recorded which flow was chosen, so the outcome need not repeat
-    /// it unless the user wants to correct the record.
-    fn mark_method(&self) -> Option<&'static str> {
+    /// it unless the user wants to correct the record. Single source of
+    /// truth for the mapping — `resolve_apply_method` delegates here (PR
+    /// #16 review: the map must not drift).
+    pub fn mark_method(&self) -> Option<&'static str> {
         match self.latest_mark.as_deref() {
             Some("apply-automatically") => Some("auto-assisted"),
             Some("apply-manual") => Some("manual"),
@@ -130,9 +132,11 @@ impl LeadRecord {
     }
 
     /// Whether the lead has reached a terminal state: its latest outcome is
-    /// one of the terminal types (design doc 0001 §3). Latest-wins by
-    /// `occurred_at`, so a later non-terminal outcome (e.g. `applied`
-    /// recorded after an `archived`) un-terminals the lead.
+    /// one of the terminal types (design doc 0001 §3). The latest-wins
+    /// resolution happens in `rebuild`'s `is_newer` guard — this method
+    /// only reads the already-resolved `latest_outcome` — so a later
+    /// non-terminal outcome (e.g. `applied` recorded after an `archived`)
+    /// un-terminals the lead.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self.latest_outcome.as_ref().map(|o| o.event_type.as_str()),
@@ -213,25 +217,33 @@ impl Projection {
             .copied()
     }
 
-    /// The active pipeline (design doc 0002, decision record 0010): every
-    /// lead that has neither reached a terminal state nor been durably
-    /// ignored. This is `list`'s default view — the pending review queue
-    /// (§7) remains what `review` steps through, and remains a subset of
-    /// this. Ranked by composite score descending, first-seen as the
-    /// deterministic tie-breaker. Ignored leads are excluded because the
-    /// ignore mark exists to bury leads permanently (`--all` reveals
-    /// them).
-    pub fn active_leads(&self) -> Vec<&LeadRecord> {
-        let mut active: Vec<&LeadRecord> = self
-            .leads
-            .values()
-            .filter(|r| !r.is_terminal() && !r.is_buried())
-            .collect();
-        active.sort_by(|a, b| {
+    /// All leads, ranked by composite score descending with first-seen as
+    /// the deterministic tie-breaker (design doc 0002). The shared ranking
+    /// for `list`'s default and `--all` views — one sort, so the two
+    /// cannot drift (PR #16 review).
+    pub fn ranked_leads(&self) -> Vec<&LeadRecord> {
+        let mut leads: Vec<&LeadRecord> = self.leads.values().collect();
+        leads.sort_by(|a, b| {
             let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
             let sb = b.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
             sb.cmp(&sa).then_with(|| a.first_seen.cmp(&b.first_seen))
         });
+        leads
+    }
+
+    /// The active pipeline (design doc 0002, decision record 0010): every
+    /// lead that has neither reached a terminal state nor been durably
+    /// ignored. This is `list`'s default view — the pending review queue
+    /// (§7) remains what `review` steps through, and remains a subset of
+    /// this. Same ranking as `--all` (via `ranked_leads`). Ignored leads
+    /// are excluded because the ignore mark exists to bury leads
+    /// permanently (`--all` reveals them). Gate-rejected leads ARE
+    /// included: a machine rejection is not a terminal state, the leads
+    /// sort to the bottom with a `[rejected]` tag, and they are `edit`-
+    /// revivable (decision record 0010).
+    pub fn active_leads(&self) -> Vec<&LeadRecord> {
+        let mut active = self.ranked_leads();
+        active.retain(|r| !r.is_terminal() && !r.is_buried());
         active
     }
 
@@ -1389,6 +1401,38 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_status_pins_remaining_rule_table_rows() {
+        // The rule table is the contract (design doc 0002); pin the rows
+        // the stage-walk test doesn't reach (PR #16 review).
+        let lead_id = Uuid::now_v7();
+
+        // Non-terminal outcome stages pass through by name.
+        for stage in ["screened", "interviewed", "offered"] {
+            let mut events = scored_lead(lead_id);
+            events.push(envelope(lead_id, 3, stage, serde_json::json!({})));
+            assert_eq!(
+                rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
+                stage,
+                "stage {stage}"
+            );
+        }
+
+        // Torn-batch edge: an ingested snapshot whose evaluation events
+        // were lost has neither a standing score nor a rejection — the
+        // last-resort row of the table.
+        let events = vec![envelope(
+            lead_id,
+            1,
+            event_type::INGESTED,
+            ingested_payload(None, Some("url:https://example.com/j"), None),
+        )];
+        assert_eq!(
+            rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
+            "ingested"
+        );
+    }
+
+    #[test]
     fn active_leads_is_the_non_terminal_unignored_pipeline() {
         // `list`'s default view (decision record 0010): every lead that has
         // neither reached a terminal state nor been durably ignored —
@@ -1446,9 +1490,7 @@ mod tests {
         let projection = rebuild(&events).unwrap();
         let active = projection.active_leads();
         let ids: Vec<Uuid> = active.iter().map(|r| r.lead_id).collect();
-        // Terminal c and ignored d are excluded; the rest ranked by
-        // composite descending (b 90 first), first-seen breaking the a/d
-        // tie at 75.
+        // Terminal c and ignored d are excluded; b (90) ranks above a (75).
         assert_eq!(ids, vec![b, a]);
     }
 
