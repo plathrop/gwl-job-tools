@@ -85,17 +85,15 @@ pub fn card_markdown(record: &LeadRecord) -> String {
     if record.deferral_count > 0 {
         md.push_str(&format!("| Deferral Count | {} |\n", record.deferral_count));
     }
-    if let Some(mark) = record.latest_mark.as_deref() {
-        md.push_str(&format!("| Mark | {} |\n", sanitize(mark)));
-    }
+    // The derived lifecycle status (design doc 0002): one dimension — not
+    // the mark (a decision) and the outcome (a fact) side by side. The
+    // underlying facts stay visible via `show --json` and `events`.
+    md.push_str(&format!(
+        "| Status | {} |\n",
+        sanitize(&record.lifecycle_status())
+    ));
     if let Some(source) = record.source.as_deref() {
         md.push_str(&format!("| Source | {} |\n", sanitize(source)));
-    }
-    if let Some(outcome) = &record.latest_outcome {
-        md.push_str(&format!(
-            "| Outcome | {} |\n",
-            sanitize(&outcome.event_type)
-        ));
     }
     md.push('\n');
 
@@ -125,7 +123,7 @@ pub fn render_card(record: &LeadRecord, color: bool) -> Result<()> {
 }
 
 /// Render the ranked queue to stdout (rank, colored score, title @ company,
-/// deferral count, mark, outcome, lead prefix).
+/// deferral count, derived status, lead prefix).
 pub fn render_list(records: &[&LeadRecord], color: bool) -> Result<()> {
     let mut out = std::io::stdout().lock();
     for (i, record) in records.iter().enumerate() {
@@ -151,12 +149,9 @@ fn list_line(rank: usize, record: &LeadRecord, color: bool) -> String {
     if record.deferral_count > 0 {
         line.push_str(&format!("  (deferred {}×)", record.deferral_count));
     }
-    if let Some(mark) = record.latest_mark.as_deref() {
-        line.push_str(&format!("  [{}]", sanitize(mark)));
-    }
-    if let Some(outcome) = &record.latest_outcome {
-        line.push_str(&format!("  [{}]", sanitize(&outcome.event_type)));
-    }
+    // One derived status tag (design doc 0002) — not the mark and the
+    // outcome as coequal parallel tags.
+    line.push_str(&format!("  [{}]", sanitize(&record.lifecycle_status())));
     // The 8-char lead prefix is the addressing handle for `mark`/`show`.
     let lead_prefix: String = record.lead_id.to_string().chars().take(8).collect();
     line.push_str(&format!("  [{lead_prefix}]"));
@@ -274,6 +269,46 @@ mod tests {
         assert!(md.contains("| Remote | Yes |"));
         assert!(md.contains("| Source | search |"));
         assert!(md.contains("https://example.com/j"));
+    }
+
+    #[test]
+    fn card_shows_derived_status_not_mark_and_outcome_rows() {
+        // Design doc 0002: the card renders ONE lifecycle dimension. A lead
+        // with both a decision mark and a recorded outcome shows a single
+        // derived status row — not Mark and Outcome side by side.
+        let mut record = lead_record();
+        record.latest_mark = Some("apply-manual".into());
+        record.latest_outcome = Some(crate::projections::OutcomeView {
+            event_type: "applied".into(),
+            note: None,
+            method: None,
+            occurred_at: Timestamp::now(),
+        });
+        let md = card_markdown(&record);
+        assert!(md.contains("| Status | applied (manual) |"), "md: {md}");
+        assert!(!md.contains("| Mark |"));
+        assert!(!md.contains("| Outcome |"));
+    }
+
+    #[test]
+    fn list_line_shows_one_status_tag() {
+        // Not the mark and the outcome as coequal parallel tags: a lead
+        // marked apply-manual and then recorded applied reads as one
+        // derived tag.
+        let mut record = lead_record();
+        record.latest_mark = Some("apply-manual".into());
+        record.latest_outcome = Some(crate::projections::OutcomeView {
+            event_type: "applied".into(),
+            note: None,
+            method: Some("manual".into()),
+            occurred_at: Timestamp::now(),
+        });
+        let line = list_line(1, &record, false);
+        assert!(line.contains("[applied (manual)]"), "line: {line}");
+        assert!(!line.contains("[apply-manual]"));
+        // Unmarked scored lead: the pending stage.
+        let line = list_line(1, &lead_record(), false);
+        assert!(line.contains("[pending]"), "line: {line}");
     }
 
     #[test]

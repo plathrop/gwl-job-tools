@@ -62,7 +62,90 @@ pub struct GateRejection {
 pub struct OutcomeView {
     pub event_type: String,
     pub note: Option<String>,
+    /// How an `applied` application was submitted (`manual`/
+    /// `auto-assisted`); absent on every other outcome type and when the
+    /// user didn't pass `--method`.
+    pub method: Option<String>,
     pub occurred_at: Timestamp,
+}
+
+impl LeadRecord {
+    /// The derived lifecycle status (design doc 0002, decision record 0010):
+    /// the single application-stage dimension the user sees — computed
+    /// from the underlying facts, never stored. The latest outcome (a
+    /// fact) wins; without one, the latest mark (a decision) stands in;
+    /// with neither, the queue state names the stage. Marks and outcomes
+    /// remain distinct events in the log; this is the view over them.
+    pub fn lifecycle_status(&self) -> String {
+        if let Some(outcome) = &self.latest_outcome {
+            if outcome.event_type == event_type::APPLIED {
+                // The automation bit prefers the recorded fact, falling
+                // back to what the decision mark implies (design doc 0002).
+                let method = outcome.method.as_deref().or_else(|| self.mark_method());
+                return match method {
+                    Some(method) => format!("applied ({method})"),
+                    None => "applied".into(),
+                };
+            }
+            return outcome.event_type.clone();
+        }
+        match self.latest_mark.as_deref() {
+            Some("apply-automatically") => "applying (auto-assisted)".into(),
+            Some("apply-manual") => "applying (manual)".into(),
+            Some("defer") => "deferred".into(),
+            Some("ignore") => "ignored".into(),
+            // Unmarked: the queue state names the stage — scored means
+            // pending review; a standing rejection means it never reached
+            // the queue at the latest evaluation.
+            _ => {
+                if self.latest_score.is_some() {
+                    "pending".into()
+                } else if self.latest_rejection.is_some() {
+                    "rejected".into()
+                } else {
+                    "ingested".into()
+                }
+            }
+        }
+    }
+
+    /// The submission method the lead's apply mark implies, for defaulting
+    /// `applied --method` and decorating the status (design doc 0002): the
+    /// mark recorded which flow was chosen, so the outcome need not repeat
+    /// it unless the user wants to correct the record.
+    fn mark_method(&self) -> Option<&'static str> {
+        match self.latest_mark.as_deref() {
+            Some("apply-automatically") => Some("auto-assisted"),
+            Some("apply-manual") => Some("manual"),
+            _ => None,
+        }
+    }
+
+    /// Whether the lead is durably ignored (design doc 0001 §2): the
+    /// latest mark is `ignore`, which exists to bury the lead permanently.
+    /// Ignored leads appear only in `list --all`, never in the active
+    /// pipeline (design doc 0002) — and never in the review queue (§7).
+    pub fn is_buried(&self) -> bool {
+        self.latest_mark.as_deref() == Some("ignore")
+    }
+
+    /// Whether the lead has reached a terminal state: its latest outcome is
+    /// one of the terminal types (design doc 0001 §3). Latest-wins by
+    /// `occurred_at`, so a later non-terminal outcome (e.g. `applied`
+    /// recorded after an `archived`) un-terminals the lead.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.latest_outcome.as_ref().map(|o| o.event_type.as_str()),
+            Some(
+                event_type::ACCEPTED
+                    | event_type::REJECTED_BY_EMPLOYER
+                    | event_type::WITHDRAWN
+                    | event_type::DECLINED
+                    | event_type::UNRESPONSIVE
+                    | event_type::ARCHIVED
+            )
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -128,6 +211,28 @@ impl Projection {
             .or_else(|| self.tc_index.get(form))
             .or_else(|| self.dedupe_index.get(form))
             .copied()
+    }
+
+    /// The active pipeline (design doc 0002, decision record 0010): every
+    /// lead that has neither reached a terminal state nor been durably
+    /// ignored. This is `list`'s default view — the pending review queue
+    /// (§7) remains what `review` steps through, and remains a subset of
+    /// this. Ranked by composite score descending, first-seen as the
+    /// deterministic tie-breaker. Ignored leads are excluded because the
+    /// ignore mark exists to bury leads permanently (`--all` reveals
+    /// them).
+    pub fn active_leads(&self) -> Vec<&LeadRecord> {
+        let mut active: Vec<&LeadRecord> = self
+            .leads
+            .values()
+            .filter(|r| !r.is_terminal() && !r.is_buried())
+            .collect();
+        active.sort_by(|a, b| {
+            let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
+            let sb = b.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
+            sb.cmp(&sa).then_with(|| a.first_seen.cmp(&b.first_seen))
+        });
+        active
     }
 
     /// The pending review queue (design doc §7): leads with a current
@@ -365,6 +470,7 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                         record.latest_outcome = Some(OutcomeView {
                             event_type: event.event_type.clone(),
                             note: payload.note,
+                            method: payload.method,
                             occurred_at: event.occurred_at,
                         });
                     }
@@ -1082,6 +1188,268 @@ mod tests {
         let record = projection.leads.get(&lead_id).unwrap();
         assert_eq!(record.deferral_count, 2);
         assert_eq!(record.latest_mark.as_deref(), Some("defer"));
+    }
+
+    // ── derived lifecycle status (design doc 0002) ───────────
+
+    #[test]
+    fn lifecycle_status_covers_the_stages() {
+        let lead_id = Uuid::now_v7();
+
+        // Scored, no mark: pending.
+        let projection = rebuild(&scored_lead(lead_id)).unwrap();
+        assert_eq!(projection.leads[&lead_id].lifecycle_status(), "pending");
+
+        // Gate-rejected at the latest evaluation (no standing score):
+        // rejected.
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(
+                lead_id,
+                2,
+                event_type::REJECTED,
+                serde_json::json!({"gate": "remote-only", "reason": "x", "revision": 1}),
+            ),
+        ];
+        assert_eq!(
+            rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
+            "rejected"
+        );
+
+        // Decisions without recorded outcomes.
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("apply-manual"),
+        ));
+        assert_eq!(
+            rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
+            "applying (manual)"
+        );
+
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("apply-automatically"),
+        ));
+        events.push(envelope(
+            lead_id,
+            4,
+            event_type::APPLY_QUEUED,
+            apply_queued_payload(),
+        ));
+        assert_eq!(
+            rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
+            "applying (auto-assisted)"
+        );
+
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("defer"),
+        ));
+        assert_eq!(
+            rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
+            "deferred"
+        );
+
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("ignore"),
+        ));
+        assert_eq!(
+            rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
+            "ignored"
+        );
+    }
+
+    #[test]
+    fn lifecycle_status_applied_method_prefers_fact_then_mark() {
+        // The recorded fact wins: an explicit --method on the outcome.
+        let lead_id = Uuid::now_v7();
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::APPLIED,
+            serde_json::json!({"method": "manual"}),
+        ));
+        let record = &rebuild(&events).unwrap().leads[&lead_id];
+        assert_eq!(record.lifecycle_status(), "applied (manual)");
+        assert!(!record.is_terminal());
+
+        // No method on the outcome: derive it from the decision mark
+        // (design doc 0002 — the mark recorded which flow was chosen).
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("apply-automatically"),
+        ));
+        events.push(envelope(
+            lead_id,
+            4,
+            event_type::APPLY_QUEUED,
+            apply_queued_payload(),
+        ));
+        events.push(envelope(
+            lead_id,
+            5,
+            event_type::APPLIED,
+            serde_json::json!({}),
+        ));
+        assert_eq!(
+            rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
+            "applied (auto-assisted)"
+        );
+
+        // Neither fact nor mark: plain applied.
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::APPLIED,
+            serde_json::json!({}),
+        ));
+        assert_eq!(
+            rebuild(&events).unwrap().leads[&lead_id].lifecycle_status(),
+            "applied"
+        );
+    }
+
+    #[test]
+    fn lifecycle_status_terminal_outcome_and_is_terminal() {
+        let lead_id = Uuid::now_v7();
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::REJECTED_BY_EMPLOYER,
+            serde_json::json!({"note": "gone with the req"}),
+        ));
+        let record = &rebuild(&events).unwrap().leads[&lead_id];
+        assert_eq!(record.lifecycle_status(), "rejected_by_employer");
+        assert!(record.is_terminal());
+
+        // A later non-terminal outcome un-terminals (latest-wins by
+        // occurred_at): archived then re-applied later is active again.
+        let archived = {
+            let mut e = envelope(lead_id, 3, event_type::ARCHIVED, serde_json::json!({}));
+            e.occurred_at = Timestamp::from_second(1_700_000_000).unwrap();
+            e
+        };
+        let reapplied = {
+            let mut e = envelope(
+                lead_id,
+                4,
+                event_type::APPLIED,
+                serde_json::json!({"method": "manual"}),
+            );
+            e.occurred_at = Timestamp::from_second(1_700_100_000).unwrap();
+            e
+        };
+        let mut events = scored_lead(lead_id);
+        events.push(archived);
+        events.push(reapplied);
+        let record = &rebuild(&events).unwrap().leads[&lead_id];
+        assert!(!record.is_terminal());
+        assert_eq!(record.lifecycle_status(), "applied (manual)");
+    }
+
+    #[test]
+    fn outcome_view_carries_method() {
+        let lead_id = Uuid::now_v7();
+        let mut events = scored_lead(lead_id);
+        events.push(envelope(
+            lead_id,
+            3,
+            event_type::APPLIED,
+            serde_json::json!({"method": "auto-assisted"}),
+        ));
+        let record = &rebuild(&events).unwrap().leads[&lead_id];
+        assert_eq!(
+            record.latest_outcome.as_ref().unwrap().method.as_deref(),
+            Some("auto-assisted")
+        );
+    }
+
+    #[test]
+    fn active_leads_is_the_non_terminal_unignored_pipeline() {
+        // `list`'s default view (decision record 0010): every lead that has
+        // neither reached a terminal state nor been durably ignored —
+        // pending, deferred, applying, applied — sorted by score. The
+        // ignore mark buries a lead permanently: `--all` is the only view
+        // that reveals it (settled with Grey 2026-08-31).
+        let a = Uuid::now_v7(); // scored, pending
+        let b = Uuid::now_v7(); // applied
+        let c = Uuid::now_v7(); // terminal (declined)
+        let d = Uuid::now_v7(); // ignored (buried)
+        let t1 = Timestamp::from_second(1_700_000_000).unwrap();
+        let t2 = Timestamp::from_second(1_700_000_001).unwrap();
+        let mut events = vec![
+            envelope_at(
+                a,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/a"), None),
+                t1,
+            ),
+            envelope_at(a, 2, event_type::SCORED, scored_payload(75, 1), t1),
+            envelope_at(
+                b,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/b"), None),
+                t2,
+            ),
+            envelope_at(b, 2, event_type::SCORED, scored_payload(90, 1), t2),
+            envelope_at(
+                b,
+                3,
+                event_type::APPLIED,
+                serde_json::json!({"method": "manual"}),
+                t2,
+            ),
+            envelope_at(
+                c,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/c"), None),
+                t2,
+            ),
+            envelope_at(c, 2, event_type::SCORED, scored_payload(50, 1), t2),
+            envelope_at(c, 3, event_type::DECLINED, serde_json::json!({}), t2),
+        ];
+        events.extend(scored_lead(d));
+        events.push(envelope(
+            d,
+            3,
+            event_type::REVIEWED,
+            reviewed_payload("ignore"),
+        ));
+
+        let projection = rebuild(&events).unwrap();
+        let active = projection.active_leads();
+        let ids: Vec<Uuid> = active.iter().map(|r| r.lead_id).collect();
+        // Terminal c and ignored d are excluded; the rest ranked by
+        // composite descending (b 90 first), first-seen breaking the a/d
+        // tie at 75.
+        assert_eq!(ids, vec![b, a]);
     }
 
     #[test]
