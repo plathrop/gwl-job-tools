@@ -251,9 +251,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_dir = dir.path().join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
+        // `telemetry = "on"` only parses with the feature compiled in
+        // (the On variant is feature-gated), so the line — and its
+        // assertion — are conditional (PR #18 review: the suite must
+        // compile under --no-default-features).
+        #[cfg(feature = "telemetry")]
+        let telemetry_line = "\ntelemetry = \"on\"";
+        #[cfg(not(feature = "telemetry"))]
+        let telemetry_line = "";
         std::fs::write(
             config_dir.join(Config::FILE_NAME),
-            r#"
+            format!(
+                r#"
 compensation_floor = 180000
 compensation_ceiling = 300000
 remote_only = true
@@ -261,9 +270,7 @@ blacklist = ["salesforce"]
 cover_letter_path = "~/letters/generic.pdf"
 target_companies = []
 log_level = "debug"
-log_file = "~/logs/gwl.log"
-telemetry = "on"
-
+log_file = "~/logs/gwl.log"{telemetry_line}
 [aliases]
 K8s = "Kubernetes"
 
@@ -271,7 +278,8 @@ K8s = "Kubernetes"
 level = 0.3
 skills = 0.3
 compensation = 0.4
-"#,
+"#
+            ),
         )
         .unwrap();
         let paths = AppPaths::new(config_dir, dir.path().join("data"));
@@ -295,10 +303,24 @@ compensation = 0.4
         assert!(config.target_companies.is_empty());
         assert_eq!(config.log_level, Some(LogLevel::Debug));
         assert_eq!(config.log_file, Some(home.join("logs/gwl.log")));
+        #[cfg(feature = "telemetry")]
         assert!(matches!(
             config.telemetry,
             Some(crate::telemetry::TelemetryStatus::On)
         ));
+    }
+
+    #[test]
+    fn bogus_telemetry_value_fails_loudly() {
+        // PR #18 review: the PR body claimed loud failure on a bad
+        // telemetry value; this locks it in (config.rs pattern: a
+        // bad-value test per validated key).
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join(Config::FILE_NAME), r#"telemetry = "bogus""#).unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        assert!(Config::load(&paths).is_err());
     }
 
     #[test]
