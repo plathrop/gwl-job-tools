@@ -444,8 +444,11 @@ reader so the seam exists from day one.
 1. Rebuilds the projection, prints a session line (`review session
 <run_id>` — one UUIDv7 per invocation, also recorded as a span field so
    every mark made in the session is greppable in the log), then the
-   ranked queue (rank, composite, title @ company, deferral count).
+   ranked queue (rank, composite, title @ company, deferral count). The
+   log-side grep needs `--log-level info` (or the config equivalent):
+   mark events log at `info` and the default level is `error` (decision 0005) — worth knowing _before_ a session crashes mid-loop.
 2. Steps through pending leads highest-score-first. For each: renders the
+3. Steps through pending leads highest-score-first. For each: renders the
    lead card (title, company, location, remote, comp, URL, composite score
    with human-readable breakdown, deferral count, mark, source, outcome —
    termimad markdown, with the score colored red→yellow→green), then
@@ -478,7 +481,7 @@ reader so the seam exists from day one.
      deferral counted).
    - `q` — stop.
 
-3. Because state is the event log, quitting mid-loop loses nothing; the loop
+4. Because state is the event log, quitting mid-loop loses nothing; the loop
    is resumable by construction.
 
 Prompt input reads single keys via crossterm's `event::read()` (already a
