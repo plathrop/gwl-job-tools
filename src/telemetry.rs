@@ -25,9 +25,11 @@ use crate::config::LogLevel;
 #[serde(rename_all = "lowercase")]
 pub enum TelemetryStatus {
     #[value(name = "off", alias = "false")]
+    #[serde(alias = "false")]
     Off,
     #[cfg(feature = "telemetry")]
     #[value(name = "on", alias = "true")]
+    #[serde(alias = "true")]
     On,
 }
 
@@ -210,10 +212,17 @@ mod tests {
     #[test]
     fn resolve_prefers_cli_over_config_over_default() {
         use crate::telemetry::TelemetryStatus as T;
-        // CLI wins over config.
-        assert!(matches!(resolve(Some(T::Off), Some(T::On)), T::Off));
-        // Config fills in when the CLI flag is absent.
-        assert!(matches!(resolve(None, Some(T::On)), T::On));
+        // Without the telemetry feature there is no `On` variant, so the
+        // CLI-wins/config-fills assertions (which need two distinct values)
+        // compile only with it; the default-off chain holds either way
+        // (PR #18 review: the suite must compile under --no-default-features).
+        #[cfg(feature = "telemetry")]
+        {
+            // CLI wins over config.
+            assert!(matches!(resolve(Some(T::Off), Some(T::On)), T::Off));
+            // Config fills in when the CLI flag is absent.
+            assert!(matches!(resolve(None, Some(T::On)), T::On));
+        }
         // Default: off.
         assert!(matches!(resolve(None, None), T::Off));
     }
@@ -270,10 +279,11 @@ mod tests {
 
     // ── TelemetryStatus (via clap) ────────────────────────────────
 
-    // TelemetryStatus is a clap ValueEnum. It is tested implicitly
-    // through the CLI parsing tests in cli.rs (parse_telemetry_*).
-    // Adding a separate serde test is not applicable since the type
-    // does not implement serde::Deserialize.
+    // TelemetryStatus is a clap ValueEnum and (since the telemetry config
+    // key, PR #18) a serde enum: "on"/"off" (with "true"/"false" aliases
+    // mirroring the clap aliases). It is tested through the CLI parsing
+    // tests in cli.rs (parse_telemetry_*) and the Config TOML tests
+    // (parses_full_config, bogus telemetry value).
 
     // ── redact_header_values ────────────────────────────────────
 

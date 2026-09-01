@@ -841,9 +841,10 @@ fn infer_shell() -> Result<clap_complete::Shell> {
 #[instrument(skip_all, fields(review.run_id))]
 pub async fn execute_review(config: &Config, paths: &AppPaths, color: bool) -> Result<()> {
     // One id per review invocation (GWLJ-u8psvi): every mark made in the
-    // session inherits the `review.run_id` span field (mark_lead's spans
-    // nest under this one), so "which leads did I action in the session
-    // that crashed at lead 7?" is a log grep away.
+    // session inherits the `review.run_id` field in the log — mark_lead is
+    // a plain fn with no span of its own, so its info! events inherit the
+    // field from the enclosing review span — so "which leads did I action
+    // in the session that crashed at lead 7?" is a log grep away.
     let run_id = Uuid::now_v7();
     tracing::Span::current().record("review.run_id", run_id.to_string());
 
