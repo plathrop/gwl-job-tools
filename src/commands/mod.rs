@@ -771,12 +771,12 @@ pub async fn execute_package(
     } else {
         print!("{}", render::render_cheat_sheet(&apply.package.cheat_sheet));
     }
-    // Re-open the posting URL (best-effort, like the review loop's `a` key;
-    // the final click is the user's).
-    if let Some(url) = record.url.as_deref() {
-        if !json {
-            println!("  URL: {}", render::sanitize(url));
-        }
+    // Re-open the posting URL (best-effort, like the review loop's `a`
+    // key; the final click is the user's). The machine-readable --json path
+    // must not spawn a browser on the operator's display (PR #17 review:
+    // Remi + kimi, verified live with a stubbed xdg-open).
+    if !json && let Some(url) = record.url.as_deref() {
+        println!("  URL: {}", render::sanitize(url));
         open_url(url);
     }
     Ok(())
@@ -2584,21 +2584,37 @@ mod tests {
         .await
         .unwrap();
 
-        let store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
-        let queued: Vec<_> = store
-            .replay()
-            .unwrap()
-            .into_iter()
-            .filter(|e| e.event_type == "apply_queued")
-            .collect();
-        assert_eq!(queued.len(), 2);
-        // The rebuilt package still carries the posting URL.
-        assert_eq!(queued[1].payload["url"], record.url.clone().unwrap());
+        {
+            let store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
+            let queued: Vec<_> = store
+                .replay()
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.event_type == "apply_queued")
+                .collect();
+            assert_eq!(queued.len(), 2);
+            // The rebuilt package still carries the posting URL.
+            assert_eq!(queued[1].payload["url"], record.url.clone().unwrap());
+        } // release the single-writer lock before the re-entry below
         // The browser-open intent fired twice: once for the mark's own
         // flow, once for the package re-entry (recorded by the test stub;
         // real runs spawn the browser).
         let expected = record.url.clone().unwrap();
         assert_eq!(opened_urls(), vec![expected.clone(), expected]);
+
+        // The machine-readable path must not spawn a browser: same re-entry
+        // with --json fires no open intent (PR #17 review).
+        execute_package(
+            PackageArgs {
+                lead: record.lead_id.to_string(),
+            },
+            &Config::default(),
+            &paths,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(opened_urls().is_empty());
     }
 
     #[tokio::test]
@@ -2684,8 +2700,8 @@ mod tests {
     #[test]
     fn completion_generation_produces_a_script() {
         // Smoke: bash generation through the real clap command produces
-        // actual completion script content (not an empty buffer).
-        use clap::CommandFactory;
+        // actual completion script content (not an empty buffer). The
+        // module-level `use clap::CommandFactory` is in scope here.
         let shell = shell_from_name("bash").unwrap();
         let mut cmd = crate::cli::Cli::command();
         let mut buf: Vec<u8> = Vec::new();
