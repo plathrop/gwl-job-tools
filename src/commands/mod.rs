@@ -2193,8 +2193,9 @@ mod tests {
             summary.note.as_deref(),
             Some("recruiter email quoted the band")
         );
-        // Field order follows ExtractedFields::diff: remote before comp.
-        assert_eq!(summary.changed, vec!["remote", "comp"]);
+        // Field order follows ExtractedFields::diff: remote before comp; the
+        // adapter flip drop-in → user (decision record 0009) closes the list.
+        assert_eq!(summary.changed, vec!["remote", "comp", "adapter"]);
         assert!(summary.rejected.is_none());
         let score = summary.score.as_ref().unwrap();
         // The compensation dimension is present now (no longer renormalized
@@ -2260,8 +2261,7 @@ mod tests {
         let spec = build_edit_spec(&record, &args).unwrap();
         let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let summary = record_edit(&mut store, &projection, &config, &[], &record, spec).unwrap();
-        assert_eq!(summary.changed, vec!["remote"]);
-        assert!(summary.score.is_some());
+        assert_eq!(summary.changed, vec!["remote", "adapter"]);
 
         let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let record = projection.leads.get(&record.lead_id).unwrap();
@@ -2470,7 +2470,9 @@ mod tests {
             spec,
         )
         .unwrap();
-        assert_eq!(summary.changed, vec!["source"]);
+        // The edit also flips the adapter drop-in → user (decision record
+        // 0009), which the changed list names alongside the source.
+        assert_eq!(summary.changed, vec!["source", "adapter"]);
         assert_eq!(summary.source, "recruiter");
     }
 
