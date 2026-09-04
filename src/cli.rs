@@ -406,6 +406,19 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Use an alternate data directory (event log, default log file)
+    /// instead of the platform-discovered one. The directory must already
+    /// exist — it is never created implicitly (a typo'd path should fail,
+    /// not silently start a new corpus).
+    #[arg(long, global = true)]
+    pub data_dir: Option<PathBuf>,
+
+    /// Load config from this file instead of `<config_dir>/config.toml`.
+    /// The file must exist — a missing explicitly-named config is an error
+    /// (unlike the default config, where missing means defaults).
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -497,6 +510,8 @@ fn cmd_label(command: &Option<Commands>) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::ColorChoice;
 
     use super::*;
@@ -574,6 +589,8 @@ mod tests {
             telemetry: None,
             log_level: None,
             json: false,
+            data_dir: None,
+            config: None,
             command: None,
         };
         assert_eq!(cli.command_name(), "none");
@@ -772,5 +789,44 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn parse_data_dir_flag() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "--data-dir", "/corpus/alt", "list"]).unwrap();
+        assert_eq!(cli.data_dir.as_deref(), Some(Path::new("/corpus/alt")));
+        assert_eq!(cli.command_name(), "list");
+    }
+
+    #[test]
+    fn parse_data_dir_flag_after_subcommand() {
+        // `global = true`: the flag must work after the subcommand too.
+        let cli = Cli::try_parse_from(["gwl-jobs", "list", "--data-dir", "/corpus/alt"]).unwrap();
+        assert_eq!(cli.data_dir.as_deref(), Some(Path::new("/corpus/alt")));
+    }
+
+    #[test]
+    fn parse_config_flag() {
+        let cli =
+            Cli::try_parse_from(["gwl-jobs", "--config", "/etc/gwl/alt.toml", "list"]).unwrap();
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/etc/gwl/alt.toml")));
+        assert_eq!(cli.command_name(), "list");
+    }
+
+    #[test]
+    fn parse_config_flag_after_subcommand() {
+        // `global = true`: the flag must work after the subcommand too.
+        let cli =
+            Cli::try_parse_from(["gwl-jobs", "list", "--config", "/etc/gwl/alt.toml"]).unwrap();
+        assert_eq!(cli.config.as_deref(), Some(Path::new("/etc/gwl/alt.toml")));
+    }
+
+    #[test]
+    fn overrides_default_to_none() {
+        // Absent flags mean "use the discovered paths and the default
+        // config location" — the pre-flag behavior.
+        let cli = Cli::try_parse_from(["gwl-jobs", "list"]).unwrap();
+        assert!(cli.data_dir.is_none());
+        assert!(cli.config.is_none());
     }
 }
