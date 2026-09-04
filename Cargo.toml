@@ -5,7 +5,6 @@ description = "A simple job search tracker."
 version = "0.1.0"
 license = "MIT"
 repository = "https://github.com/plathrop/gwl-job-tools"
-readme = "README.md"
 keywords = ["cli", "job-search", "event-sourcing"]
 categories = ["command-line-utilities"]
 
