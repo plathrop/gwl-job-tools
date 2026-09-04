@@ -37,6 +37,10 @@ pub struct LeadState {
     pub latest_mark: Option<String>,
     pub snapshot: Option<ExtractedFields>,
     pub url: Option<String>,
+    /// The extraction adapter that produced the latest snapshot
+    /// (`greenhouse`/`ashby`/`lever`/`workday`/`drop-in`), or `user` once
+    /// the lead has been edited (decision record 0009).
+    pub adapter: Option<String>,
     /// How the lead was found, from the latest snapshot (`search`/
     /// `recruiter`/`referrer`/`unknown`).
     pub source: Option<String>,
@@ -73,8 +77,9 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
             if let Ok(snapshot) = serde_json::from_value::<SnapshotFields>(event.payload.clone()) {
                 state.snapshot = Some(snapshot.extracted);
                 state.url = snapshot.url;
-                state.source = Some(snapshot.source);
+                state.adapter = Some(snapshot.adapter);
                 state.raw_text = snapshot.raw_text;
+                state.source = Some(snapshot.source);
             }
         }
         // Marks are latest-wins (design doc §3). The `reviewed` event lands
@@ -181,6 +186,9 @@ pub fn decide_ingest(
         state.raw_text.as_deref() != Some(raw_text.as_str()),
         state.url != url,
     );
+    if state.adapter.as_deref() != Some(adapter) {
+        changed.push("adapter".into());
+    }
     if state.source.as_deref() != Some(source) {
         changed.push("source".into());
     }
@@ -246,6 +254,13 @@ pub fn decide_edit(
         bail!(
             "nothing to edit: no fields changed (a note alone does not change the snapshot; record it with a field correction)"
         );
+    }
+    // `edited` snapshots carry `adapter: "user"` (decision record 0009), so
+    // the provenance flip from the ingesting adapter is a real snapshot
+    // change and belongs in the list — but only on a real edit: the check
+    // sits after the bail above so a note-only edit cannot ride on it.
+    if state.adapter.as_deref() != Some("user") {
+        changed.push("adapter".into());
     }
 
     let payload = EditedPayload {
@@ -449,6 +464,7 @@ mod tests {
         state.snapshot = Some(extracted("Engineer"));
         state.url = Some("https://example.com/j".into());
         state.raw_text = Some("body".into());
+        state.adapter = Some("drop-in".into());
         state.source = Some("unknown".into());
 
         let (kind, events) = decide_ingest(
@@ -744,6 +760,7 @@ mod tests {
         state.snapshot = Some(extracted("Engineer"));
         state.url = Some("https://example.com/old".into());
         state.raw_text = Some("body".into());
+        state.adapter = Some("drop-in".into());
         state.source = Some("unknown".into());
 
         let (kind, events) = decide_ingest(
@@ -780,6 +797,7 @@ mod tests {
         state.snapshot = Some(extracted("Engineer"));
         state.url = Some("https://example.com/j".into());
         state.raw_text = Some("body".into());
+        state.adapter = Some("drop-in".into());
         state.source = Some("unknown".into());
         state
     }
@@ -811,6 +829,82 @@ mod tests {
     }
 
     #[test]
+    fn ingest_reports_adapter_change_in_changed() {
+        // The motivating defect (GWLJ-duo6au): re-ingesting identical
+        // content via a different adapter (drop-in fallback → platform API
+        // once a repost is served by the API path) writes the new adapter
+        // into the snapshot — `changed` must name it, or the audit summary
+        // under-reports what the update did.
+        let state = existing_state();
+        let (kind, events) = decide_ingest(
+            &state,
+            &identity(),
+            "greenhouse",
+            "unknown",
+            Some("https://example.com/j".into()),
+            "body".into(),
+            extracted("Engineer"),
+            vec![],
+            Some(score_result()),
+        )
+        .unwrap();
+        assert_eq!(
+            kind,
+            IngestKind::Updated {
+                changed: vec!["adapter".into()]
+            }
+        );
+        assert_eq!(events[0].payload["changed"], serde_json::json!(["adapter"]));
+    }
+
+    #[test]
+    fn ingest_same_adapter_not_reported_in_changed() {
+        // Same content, same adapter → a genuinely unchanged snapshot.
+        let state = existing_state();
+        let (kind, _) = decide_ingest(
+            &state,
+            &identity(),
+            "drop-in",
+            "unknown",
+            Some("https://example.com/j".into()),
+            "body".into(),
+            extracted("Engineer"),
+            vec![],
+            Some(score_result()),
+        )
+        .unwrap();
+        assert_eq!(kind, IngestKind::Updated { changed: vec![] });
+    }
+
+    #[test]
+    fn edit_reports_adapter_change_in_changed() {
+        // `edited` events carry `adapter: "user"` (decision record 0009),
+        // so an edit after an ingest flips the snapshot's adapter — the
+        // documented contract (changed names every changed snapshot field)
+        // requires it in the list.
+        let state = existing_state();
+        let (changed, events) = decide_edit(
+            &state,
+            "url:https://example.com/j",
+            &identity().identifiers,
+            None,
+            "unknown",
+            Some("https://example.com/j".into()),
+            Some("body".into()),
+            extracted("Senior Engineer"),
+            vec![],
+            Some(score_result()),
+        )
+        .unwrap();
+        assert!(changed.contains(&"adapter".into()));
+        assert!(changed.contains(&"title".into()));
+        assert_eq!(
+            events[0].payload["changed"],
+            serde_json::json!(["title", "adapter"])
+        );
+    }
+
+    #[test]
     fn edit_emits_edited_then_scored() {
         let state = existing_state();
         let (changed, events) = decide_edit(
@@ -826,10 +920,15 @@ mod tests {
             Some(score_result()),
         )
         .unwrap();
-        assert_eq!(changed, vec!["title"]);
+        // The adapter flips drop-in → user (decision record 0009) and the
+        // changed list names every changed snapshot field.
+        assert_eq!(changed, vec!["title", "adapter"]);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, event_type::EDITED);
-        assert_eq!(events[0].payload["changed"], serde_json::json!(["title"]));
+        assert_eq!(
+            events[0].payload["changed"],
+            serde_json::json!(["title", "adapter"])
+        );
         assert_eq!(events[0].payload["adapter"], "user");
         assert_eq!(events[0].payload["note"], "recruiter told me the band");
         // The dedupe key is immutable (decision record 0009): the caller's
@@ -945,7 +1044,7 @@ mod tests {
             Some(score_result()),
         )
         .unwrap();
-        assert_eq!(changed, vec!["title"]);
+        assert_eq!(changed, vec!["title", "adapter"]);
         assert_eq!(events[0].event_type, event_type::EDITED);
     }
 
