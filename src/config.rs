@@ -116,12 +116,32 @@ impl Config {
     /// Load `<config_dir>/config.toml`; a missing file means defaults.
     #[instrument]
     pub fn load(paths: &AppPaths) -> Result<Self> {
-        let path = paths.config_dir().join(Self::FILE_NAME);
+        Self::load_from(paths.config_dir().join(Self::FILE_NAME), false)
+    }
+
+    /// Load config from an explicitly-passed file path. Unlike the default
+    /// config, a missing file is an error: naming a file says you expect it
+    /// to be there.
+    #[instrument]
+    pub fn load_explicit(path: &Path) -> Result<Self> {
+        Self::load_from(path.to_path_buf(), true)
+    }
+
+    /// Read and parse a config file. `required` distinguishes the default
+    /// config (missing → defaults) from an explicitly-passed one (missing →
+    /// error).
+    #[instrument]
+    fn load_from(path: PathBuf, required: bool) -> Result<Self> {
         let mut config = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("parsing {}", path.display()))?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if required {
+                    bail!("config file {} not found", path.display());
+                }
+                Self::default()
+            }
             Err(err) => {
                 return Err(err)
                     .into_diagnostic()
@@ -179,6 +199,16 @@ impl AppPaths {
         }
     }
 
+    /// A copy of `self` with the data directory replaced (the `--data-dir`
+    /// override): the config dir is untouched, the data dir (event log,
+    /// default log file) points at `data_dir`.
+    pub fn with_data_dir(&self, data_dir: PathBuf) -> Self {
+        Self {
+            config_dir: self.config_dir.clone(),
+            data_dir,
+        }
+    }
+
     #[instrument]
     pub fn discover() -> Result<Self> {
         let project_dirs = ProjectDirs::from("st.ember", "gwl", APP_NAME).ok_or_else(|| {
@@ -227,6 +257,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn with_data_dir_keeps_config_dir_and_replaces_data_dir() {
+        // The `--data-dir` override must not disturb the config dir: config
+        // still comes from the discovered location, only the corpus (event
+        // log, default log file) moves.
+        let paths = AppPaths::new(
+            PathBuf::from("/home/user/.config/gwl-jobs"),
+            PathBuf::from("/home/user/.local/share/gwl-jobs"),
+        );
+
+        let overridden = paths.with_data_dir(PathBuf::from("/corpus/alt"));
+
+        assert_eq!(
+            overridden.config_dir(),
+            Path::new("/home/user/.config/gwl-jobs")
+        );
+        assert_eq!(overridden.data_dir(), Path::new("/corpus/alt"));
+    }
+
     // ── Config (TOML) ────────────────────────────────────────────
 
     #[test]
@@ -244,6 +293,32 @@ mod tests {
         assert_eq!(config.scoring_weights.remote, 1.0);
         assert!(config.log_level.is_none());
         assert!(config.log_file.is_none());
+    }
+
+    #[test]
+    fn explicit_config_path_loads() {
+        // `--config <path>` bypasses the `<config_dir>/config.toml`
+        // derivation entirely: the named file is the config.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alt-config.toml");
+        std::fs::write(&path, "compensation_floor = 180000\n").unwrap();
+
+        let config = Config::load_explicit(&path).unwrap();
+
+        assert_eq!(config.compensation_floor, Some(180_000));
+    }
+
+    #[test]
+    fn explicit_config_path_missing_is_an_error() {
+        // A missing DEFAULT config means defaults, but an explicitly-passed
+        // path that does not exist is a hard error — naming a file says you
+        // expect it to be there.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.toml");
+
+        let err = Config::load_explicit(&path).unwrap_err();
+
+        assert!(err.to_string().contains("not found"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use gwl_job_tools::{
     telemetry,
     telemetry::init_telemetry,
 };
-use miette::Result;
+use miette::{Result, bail};
 use tracing::{Instrument, error, info_span};
 
 #[tokio::main]
@@ -17,9 +17,23 @@ async fn main() -> Result<()> {
     cli.color.write_global();
 
     // Load config before initializing the subscriber so the log level can be
-    // resolved from config (decision 0005).
-    let paths = AppPaths::discover()?;
-    let config = Config::load(&paths)?;
+    // resolved from config (decision 0005). The `--data-dir`/`--config`
+    // global overrides apply here once, so every command sees the same
+    // paths and config.
+    let mut paths = AppPaths::discover()?;
+    if let Some(data_dir) = &cli.data_dir {
+        if !data_dir.is_dir() {
+            bail!(
+                "--data-dir {} does not exist or is not a directory; create it first",
+                data_dir.display()
+            );
+        }
+        paths = paths.with_data_dir(data_dir.clone());
+    }
+    let config = match &cli.config {
+        Some(path) => Config::load_explicit(path)?,
+        None => Config::load(&paths)?,
+    };
 
     let log_path = config
         .log_file
