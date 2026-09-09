@@ -2262,6 +2262,9 @@ mod tests {
         let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let summary = record_edit(&mut store, &projection, &config, &[], &record, spec).unwrap();
         assert_eq!(summary.changed, vec!["remote", "adapter"]);
+        // Fixing a gate failure re-scores: the summary carries the new score,
+        // not just the projection.
+        assert!(summary.score.is_some());
 
         let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let record = projection.leads.get(&record.lead_id).unwrap();
@@ -2474,6 +2477,56 @@ mod tests {
         // 0009), which the changed list names alongside the source.
         assert_eq!(summary.changed, vec!["source", "adapter"]);
         assert_eq!(summary.source, "recruiter");
+    }
+
+    #[test]
+    fn second_edit_does_not_rereport_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, record) = ingested_lead(
+            &dir,
+            &Config::default(),
+            ExtractedFields {
+                title: Some("Engineer".into()),
+                company: Some("Acme".into()),
+                ..Default::default()
+            },
+            "body",
+        );
+
+        // First edit flips the adapter drop-in → user (decision record 0009)
+        // and names it in the changed list.
+        let mut args = edit_args();
+        args.title = Some("Senior Engineer".into());
+        let spec = build_edit_spec(&record, &args).unwrap();
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let summary = record_edit(
+            &mut store,
+            &projection,
+            &Config::default(),
+            &[],
+            &record,
+            spec,
+        )
+        .unwrap();
+        assert_eq!(summary.changed, vec!["title", "adapter"]);
+
+        // Once the adapter has settled to "user", a second edit reports only
+        // the field that actually changed — no adapter noise.
+        let record = projection.leads.get(&record.lead_id).unwrap().clone();
+        let mut args = edit_args();
+        args.title = Some("Staff Engineer".into());
+        let spec = build_edit_spec(&record, &args).unwrap();
+        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
+        let summary = record_edit(
+            &mut store,
+            &projection,
+            &Config::default(),
+            &[],
+            &record,
+            spec,
+        )
+        .unwrap();
+        assert_eq!(summary.changed, vec!["title"]);
     }
 
     #[test]
