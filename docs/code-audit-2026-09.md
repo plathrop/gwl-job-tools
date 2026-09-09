@@ -7,9 +7,11 @@ repo executes it. Nothing here has been changed in code.
 
 ## Scope and method
 
-Audited: all of `src/` (12,670 lines across 20 files — the 2,870-line
-`commands/mod.rs`, the 1,683-line `projections/mod.rs`, the 1,305-line
-`domain/lead.rs`, and the rest), `docs/` (the spec, both design docs, all
+Audited: all of `src/` (12,670 lines across 21 files — 7 root, 6 in
+`domain/`, 3 in `event_store/`, 3 in `ingest/`, plus `commands/mod.rs`
+and `projections/mod.rs`; the 2,870-line `commands/mod.rs`, the
+1,683-line `projections/mod.rs`, the 1,305-line `domain/lead.rs`, and
+the rest), `docs/` (the spec, both design docs, all
 ten decision records, both READMEs), `Cargo.toml`, `README.md`, and
 `AGENTS.md`. The full test suite (318 tests) passes on the audited
 revision; `cargo clippy -- -D warnings` is clean. Every finding below was
@@ -73,22 +75,33 @@ commands/
 ```
 
 Pure moves, no signature changes; `cli::execute` dispatch is unchanged.
-**Effort: M.**
 
-### H2. Store + projection boilerplate repeated in 13 commands
+Note on §9: the proposed `outcome.rs` still holds five commands
+(`applied`/`screened`/`interviewed`/`offered`/`outcome`), so this layout
+does not literally satisfy §9's "one module per command". Splitting
+those five further would fragment a copy-paste family (H3) across files
+for no readability gain — the better resolution is to amend §9 when this
+lands: "one module per command; closely-related command families (e.g.
+the five outcome transitions) may share a module." **Effort: M.**
+
+### H2. Store + projection boilerplate repeated across the commands
 
 **Evidence:** the three-line preamble
 `JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))` →
-`store.replay()` → `projections::rebuild(...)` appears at
-`src/commands/mod.rs:80-82`, `242-244`, `320-322`, `355-357`, `435-437`,
-`745-747`, `851-853`, `1187-1188`, `1223-1224`, `1244-1245`, `1265-1266`,
-`1291-1292`, `1313-1314`. The `EVENT_LOG_NAME` constant and the
-`data_dir().join(...)` construction are each duplicated knowledge.
+`store.replay()` → `projections::rebuild(...)` appears unconditionally in
+**12 commands** at `src/commands/mod.rs:80-82`, `242-244`, `320-322`,
+`355-357`, `435-437`, `745-747`, `851-853`, `1187-1188`, `1223-1224`,
+`1244-1245`, `1265-1266`, `1291-1292`. A thirteenth command,
+`execute_events` (`1313-1314`), repeats the open → replay part but
+rebuilds only inside its `--lead` branch (`1319`). The `EVENT_LOG_NAME`
+constant and the `data_dir().join(...)` construction are each duplicated
+knowledge.
 
 **Recommendation:** add `AppPaths::event_log(&self) -> PathBuf` in
 `config.rs` (single source for the log path), and a commands-layer helper
-`fn open_workspace(paths: &AppPaths) -> Result<(JsonlEventStore, Projection)>`.
-Fold into the H1 split. **Effort: S** (do together with H1).
+`fn open_workspace(paths: &AppPaths) -> Result<(JsonlEventStore, Projection)>`
+(the conditional rebuild in `execute_events` keeps its branch — it only
+needs the events, not a projection). Fold into the H1 split. **Effort: S** (do together with H1).
 
 ### H3. The five outcome commands are copy-paste variants
 
@@ -126,7 +139,8 @@ through pending leads highest-score-first. For each: renders the"
 appears twice in a row; the first occurrence is truncated mid-thought
 and the second is the real one.
 
-**Recommendation:** delete line 450. **Effort: S.**
+**Recommendation:** delete line 450 and renumber the surviving steps
+(1, 2, 3…). **Effort: S.**
 
 ### M3. Design doc 0001 §8 command table drift vs the shipped CLI
 
@@ -149,8 +163,8 @@ and the second is the real one.
   design doc 0002 and decision 0008 and are the user's addressing
   handle, worth stating.
 
-**Recommendation:** update the four rows to match the shipped surface.
-**Effort: S.**
+**Recommendation:** update the seven rows to match the shipped surface
+(two `ingest` rows, four outcome rows, one `list` row). **Effort: S.**
 
 ### M4. Personal names in code comments (tracked by GWLJ-bypxri)
 
@@ -166,6 +180,8 @@ and the second is the real one.
 - `src/domain/gates.rs:61` — "the content is empty until the LLM scorer
   (Remi) lands"
 - `src/domain/scoring.rs:406` — "k3 review round 2 (PR #7)" (test
+  comment)
+- `src/domain/scoring.rs:569` — "Accepted over-match (k3 review)" (test
   comment)
 - `src/resume.rs:3` — "too strict to parse Grey's actual resume.json"
 - `src/projections/mod.rs:1413` — "(PR #16: Grey's rejected-vs-…)"
@@ -218,8 +234,11 @@ from M3), config keys, and a pointer to
 `cmd_label` (`src/cli.rs:478-496`) are byte-identical 15-arm matches
 over `Commands`.
 
-**Recommendation:** delete `cmd_label`; use `command_name` in the
-`#[instrument]` field (`src/cli.rs:445`). **Effort: S.**
+**Recommendation:** extract the 15-arm match into one free function
+`fn cmd_label(command: &Option<Commands>) -> &'static str`; have
+`Cli::command_name` delegate to it, and keep the free function for the
+`#[instrument]` field on `execute` (`src/cli.rs:445`), which receives
+`Option<Commands>`, not `Cli`. **Effort: S.**
 
 ### M8. `pending_queue` duplicates `ranked_leads`' comparator
 
@@ -257,17 +276,23 @@ id (script-friendly). **Effort: S.**
 
 ## Low severity
 
-### L1. The ideological gate compiles its regex per red line per posting
+### L1. The ideological gate (and `token_in`) compile regexes per call
 
 **Evidence:** `src/domain/gates.rs:122` — `regex::Regex::new(...)` inside
-the `evaluate` loop. Every other regex in the codebase is a
-compile-once `LazyLock` static (`src/ingest/extract.rs:17-59`,
-`src/ingest/platforms.rs:99`).
+the `evaluate` loop. The same per-call compile pattern exists in
+`token_in` (`src/domain/scoring.rs:277-290`), which builds and compiles a
+dynamic regex for every skill-token check — a likely hotter path than
+the config-rare ideological gate. Most other regexes in the codebase are
+compile-once `LazyLock` statics (`src/ingest/extract.rs:17-59`,
+`src/ingest/platforms.rs:99`), though the compile-once convention is not
+universal, as these two sites show.
 
-**Recommendation:** impact is trivial (config-rare red lines, few
-postings), but the codebase convention is compile-once. Either accept
-with a comment saying why, or compile the patterns once per config (e.g.
-in `Config::validate`, storing them alongside). **Effort: S.**
+**Recommendation:** impact is trivial in both places (config-rare red
+lines, few postings; small token lists), but the codebase convention is
+compile-once. Either accept with a comment saying why, or compile the
+patterns once — the gate's in `Config::validate` (stored alongside the
+config), `token_in`'s via a small cache or a single combined alternation.
+**Effort: S.**
 
 ### L2. `execute_applied` resolves the lead prefix twice
 
@@ -427,6 +452,10 @@ isn't confusing.
 ---
 
 ## Suggested execution order
+
+Line numbers and counts above are pinned to the audited revision
+(`8575bae`); main moves — re-verify citations against the tree before
+executing each step rather than trusting them verbatim.
 
 1. **Doc fixes:** M1, M2, M3, L10 — one PR, no code risk. (S)
 2. **Comment/code hygiene:** M4, M5, M6-description, L4 — one PR. (S)
