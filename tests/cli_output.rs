@@ -24,11 +24,16 @@ struct Corpus {
 }
 
 fn corpus() -> Corpus {
+    corpus_with_config("")
+}
+
+/// A corpus whose config file carries `config_toml` (empty = defaults).
+fn corpus_with_config(config_toml: &str) -> Corpus {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = dir.path().join("config.toml");
-    std::fs::write(&config, "").unwrap();
+    std::fs::write(&config, config_toml).unwrap();
     Corpus {
         _dir: dir,
         data_dir,
@@ -160,13 +165,35 @@ fn data_dir_flag_routes_to_alternate_corpus() {
     assert_eq!(json_stdout(&list_b).as_array().unwrap().len(), 0);
 }
 
+#[test]
+fn config_flag_routes_to_alternate_config() {
+    // An empty config is behaviorally identical to the default, so this is
+    // the test that proves `--config` is honored rather than ignored: a
+    // blacklist entry must actually gate the ingest.
+    let c = corpus_with_config("blacklist = [\"Northwind Labs\"]\n");
+    let fixture = fixture("northwind-staff-backend.html");
+    let output = cmd(&c)
+        .args(["ingest", "--file", fixture.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let v = json_stdout(&output);
+    let rejected = v["rejected"].as_array().expect("blacklist gate rejects");
+    assert_eq!(rejected[0]["gate"], "blacklist");
+    assert!(v["score"].is_null());
+}
+
 // ── Error paths ────────────────────────────────────────────────
 
 #[test]
 fn ingest_missing_file_errors() {
     let c = corpus();
+    // A path inside the fresh corpus is guaranteed absent (unlike a
+    // hard-coded absolute path, which could exist on some machine).
+    let missing = c.data_dir.join("missing.html");
     cmd(&c)
-        .args(["ingest", "--file", "/nonexistent/jd.html"])
+        .args(["ingest", "--file", missing.to_str().unwrap()])
         .assert()
         .failure()
         .stderr(predicate::str::contains("reading"));
@@ -189,11 +216,18 @@ fn edit_contradictory_flags_error() {
     cmd(&c)
         .args(["edit", &lead_id, "--remote", "true", "--clear", "remote"])
         .assert()
-        .failure();
+        .code(1)
+        .stderr(predicate::str::contains("both set and cleared"));
 }
 
 #[test]
 fn ingest_without_source_errors() {
     let c = corpus();
-    cmd(&c).arg("ingest").assert().failure();
+    // Clap rejects the missing <url>/--file before any command runs: exit
+    // code 2 (usage error) and the "required arguments" diagnostic.
+    cmd(&c)
+        .arg("ingest")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("required arguments"));
 }
