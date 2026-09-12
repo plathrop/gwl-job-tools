@@ -13,7 +13,7 @@ use clap::Parser;
 use gwl_job_tools::{
     cli::{self, Cli},
     config::{AppPaths, Config},
-    event_store::{EventStore, JsonlEventStore},
+    domain::events::EventEnvelope,
     projections::{self, LeadRecord, Projection},
 };
 use miette::Result;
@@ -42,9 +42,26 @@ async fn run(paths: &AppPaths, config: &Config, args: &[&str]) -> Result<()> {
 }
 
 /// Rebuild the projection from the on-disk event log (the source of truth).
+///
+/// Reads the log directly rather than through `JsonlEventStore::open`, which
+/// takes the single-writer flock: the test only needs a read-only view, and
+/// opening a second store can race with the command's store teardown (a
+/// spurious "another process holds the lock" failure).
 fn projection(paths: &AppPaths) -> Projection {
-    let store = JsonlEventStore::open(paths.data_dir().join("events.jsonl")).unwrap();
-    projections::rebuild(&store.replay().unwrap()).unwrap()
+    let path = paths.data_dir().join("events.jsonl");
+    // A corpus that has never been written has no log yet — treat it as
+    // empty (the store's `open` would create it; a read-only view must not).
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => panic!("reading event log {}: {e}", path.display()),
+    };
+    let events: Vec<EventEnvelope> = bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
+        .map(|line| serde_json::from_slice(line).expect("valid event envelope"))
+        .collect();
+    projections::rebuild(&events).unwrap()
 }
 
 /// The single lead in a corpus, or panic with a useful message.
