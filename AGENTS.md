@@ -56,7 +56,7 @@ These come from the spec and apply to every change:
   human) on existing PRs and incorporate it.
 - Review cast: Copilot auto-reviews with inline comments; Remi is a required
   reviewer; Grey may also post folded third-party reviews (e.g., deepseek) as
-  PR comments from his own account — treat those as review feedback, not as
+  PR comments from their own account — treat those as review feedback, not as
   Grey's own inline comments.
 - **Merging**: GitHub disallows merge commits on this repo. Rebase the branch
   onto `main` locally, force-push, then `gh pr merge <n> --rebase`. GitHub
