@@ -1,7 +1,7 @@
 # Decision Records
 
 Numbered decision records: `NNNN-short-slug.md` (e.g.,
-`0001-jsonl-event-log-over-sqlite.md`).
+`0001-fresh-start-over-alpha-csv-import.md`).
 
 A decision record captures a point-in-time choice: context, options
 considered, decision, and rationale. Records are append-only — if a decision
