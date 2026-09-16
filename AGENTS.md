@@ -20,7 +20,7 @@ specs carry the scope.
 These come from the spec and apply to every change:
 
 - Never auto-submit an application without explicit per-job approval. The
-  "apply-automatically" mark _is_ that approval; the final browser click is
+  "apply-automatically" mark *is* that approval; the final browser click is
   expected and fine.
 - Never fabricate or embellish experience or skills.
 - Never contact people (recruiters, insiders) automatically.
@@ -64,7 +64,7 @@ These come from the spec and apply to every change:
 - **Merging**: GitHub disallows merge commits on this repo. Rebase the branch
   onto `main` locally, force-push, then `gh pr merge <n> --rebase`. GitHub
   auto-deletes the PR branch on merge; local cleanup is `git worktree
-remove`, `git branch -d` (the "not fully merged" warning is expected —
+  remove`, `git branch -d` (the "not fully merged" warning is expected —
   rebase-merge rewrote the SHAs), and `git fetch --prune`.
 
 ## Documentation

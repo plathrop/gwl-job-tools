@@ -10,7 +10,7 @@
   "yaml": {
   },
   "excludes": [
-    "**/*-lock.json"
+    "**/*-lock.json",
     ".pebble/**",
     ".pi/**"
   ],

@@ -6,7 +6,7 @@ Amends: design doc 0001 §5, §7, §8; decision record 0010
 
 ## The problem
 
-Marks and outcomes are distinct _events_ — a decision (`reviewed
+Marks and outcomes are distinct *events* — a decision (`reviewed
 {apply-manual}`) vs. a fact (`applied`) — but the projection exposed them
 as two parallel, independent latest-wins fields, and `list`/the card
 rendered both as undifferentiated bracket tags:
@@ -16,8 +16,8 @@ rendered both as undifferentiated bracket tags:
 ```
 
 Read as coequal "statuses", this conflates state dimensions: a user who
-cares about one thing — _what stage is this application at, and was it
-automated?_ — had to mentally merge two fields that can also disagree
+cares about one thing — *what stage is this application at, and was it
+automated?* — had to mentally merge two fields that can also disagree
 (the "automated?" bit lives in both the mark and `applied --method`, and
 both can be absent).
 

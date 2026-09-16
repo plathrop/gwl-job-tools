@@ -56,8 +56,8 @@ recorded via a `rejected { gate, reason }` event. Gates:
   the `remote` scoring dimension below that bubbles positive signals.)
 - **compensation floor** — reject below the configured floor.
 - **blacklist** — reject blacklisted companies (e.g., Salesforce).
-- **ideological red lines** — the _mechanism_ must exist in v0 (a filter list),
-  but the _content_ is deferred to a later LLM-based scorer (Remi).
+- **ideological red lines** — the *mechanism* must exist in v0 (a filter list),
+  but the *content* is deferred to a later LLM-based scorer (Remi).
 
 ### 3. Scoring
 
@@ -79,7 +79,7 @@ Dimensions:
 
 Composite = weighted sum (`Σ(wᵢ·scoreᵢ) / Σwᵢ`), default equal weights,
 configurable. The breakdown must be human-readable (e.g.,
-`75 = 0.3·level(80) + 0.3·skills(90) + 0.4·comp(60)`) so I can debug _why_ a
+`75 = 0.3·level(80) + 0.3·skills(90) + 0.4·comp(60)`) so I can debug *why* a
 lead ranked where it did. Emit a `scored` event.
 
 ### 4. Review queue
@@ -89,7 +89,7 @@ per lead (number of times marked defer). I mark each lead with one of:
 
 | Mark                    | Meaning                                                                                                     |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------- |
-| **apply-automatically** | This mark _is_ the approval (no second confirmation). Tool prepares the full package and opens the posting. |
+| **apply-automatically** | This mark *is* the approval (no second confirmation). Tool prepares the full package and opens the posting. |
 | **apply-manual**        | I take personal action (internal contact, custom cover letter). Tool facilitates.                           |
 | **defer**               | Stays in the queue; reappears next review.                                                                  |
 | **ignore**              | Durable; never re-matches on future runs.                                                                   |
@@ -115,7 +115,7 @@ rebuilt on startup for the queue. SQLite projection is deferred.
 ## What It Should NOT Do
 
 - Never auto-submit without explicit per-job approval. The "apply-automatically"
-  mark _is_ that approval; the final click in the browser is expected and fine.
+  mark *is* that approval; the final click in the browser is expected and fine.
 - Never fabricate or embellish experience or skills.
 - Never contact people (recruiters, insiders) automatically.
 - Be a good citizen: respect ToS and rate limits (e.g., 200–500ms delay between

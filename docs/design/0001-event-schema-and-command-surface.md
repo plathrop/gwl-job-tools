@@ -52,7 +52,7 @@ queue command is `list`). The spec has been updated to match.
   writer lock is held, so the next append starts at a clean offset.
   Truncating a torn tail is not "rewriting the log": the torn bytes were
   never a committed event — only complete, parseable events are sacred. A
-  _syntactically complete_ final line that fails validation (envelope
+  *syntactically complete* final line that fails validation (envelope
   version, upcast path) is corruption, not a torn tail, and is a hard
   error. Any other malformed line anywhere is likewise a hard error. A
   batch torn between its events can leave a prefix visible — the §7
@@ -120,7 +120,7 @@ Computed from extracted fields, first applicable rule wins:
 1. **`req:<company-slug>:<req-id>`** — when both company and req id were
    extracted. Normalized: lowercase, trimmed, whitespace collapsed.
 2. **`url:<canonical-url>`** — canonicalized: scheme/host lowercased,
-   default port dropped, fragment dropped, _known tracking parameters_
+   default port dropped, fragment dropped, *known tracking parameters*
    dropped (`utm_*`, `fbclid`, `gclid`, …), all other query params
    **preserved**, trailing slashes collapsed. Boards that put the job id in
    the query (`?jobId=123`) must not have distinct postings collapse into
@@ -129,7 +129,7 @@ Computed from extracted fields, first applicable rule wins:
    session/token (rather than the job id) in a non-tracking param defeats
    dedupe for that board until its adapter lands.
 3. **`tc:<sha256>`** — SHA-256 over `normalize(title) + "\n" +
-normalize(company)`. Fallback for file drops with no URL or req id.
+   normalize(company)`. Fallback for file drops with no URL or req id.
 4. **`raw:<sha256>`** — SHA-256 over the raw text. Last resort for postings
    with no usable structured fields at all (no title, no company, no URL);
    added in Increment 1 after review found the three-form scheme left such
@@ -442,11 +442,11 @@ reader so the seam exists from day one.
 `gwl-jobs review`:
 
 1. Rebuilds the projection, prints a session line (`review session
-<run_id>` — one UUIDv7 per invocation, also recorded as a span field so
+   <run_id>` — one UUIDv7 per invocation, also recorded as a span field so
    every mark made in the session is greppable in the log), then the
    ranked queue (rank, composite, title @ company, deferral count). The
    log-side grep needs `--log-level info` (or the config equivalent):
-   mark events log at `info` and the default level is `error` (decision 0005) — worth knowing _before_ a session crashes mid-loop.
+   mark events log at `info` and the default level is `error` (decision 0005) — worth knowing *before* a session crashes mid-loop.
 2. Steps through pending leads highest-score-first. For each: renders the
 3. Steps through pending leads highest-score-first. For each: renders the
    lead card (title, company, location, remote, comp, URL, composite score
@@ -466,7 +466,7 @@ reader so the seam exists from day one.
      `apply_queued` **in a single batch `append()`** (one `correlation_id`;
      the `apply_queued`'s `causation_id` is the `reviewed` event's id), then
      opens the posting URL. If package preparation fails, no events are
-     appended and the lead stays pending. The mark _is_ the approval; there
+     appended and the lead stays pending. The mark *is* the approval; there
      is no second confirmation. The browser click is the user's.
    - `m` — emits `reviewed{apply-manual}`; prints JD + resume context +
      cheat sheet for the user to act on, plus a one-line hint to view the

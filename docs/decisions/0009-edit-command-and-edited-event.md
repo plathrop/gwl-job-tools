@@ -32,12 +32,12 @@ Design discussion (Grey, 2026-08-30) settled a manual correction command:
   `--location`, `--remote true|false|unknown`, `--comp` (parsed through the
   same `extract_comp` the ingest path uses) with `--comp-min`/`--comp-max`
   for exact bounds, `--url`, `--source`, and an explicit `--clear
-field,…` (no empty-string sentinels). `$EDITOR`-based bulk editing is
+  field,…` (no empty-string sentinels). `$EDITOR`-based bulk editing is
   filed as a follow-up (GWLJ-hi6szo).
 - **The dedupe key is immutable.** An edit never changes the stored key;
   identifiers recomputed from the corrected fields are indexed
-  _additively_ (old forms stay), and an edit that would collide with a
-  _different_ lead's identity is refused — that is a merge, not an edit.
+  *additively* (old forms stay), and an edit that would collide with a
+  *different* lead's identity is refused — that is a merge, not an edit.
 - **Edits re-evaluate like re-ingests**: gates and scoring run on the
   corrected content, appending `edited` + (`rejected` | `scored`) in one
   batch. This is the point: fixing a gate failure or a missing comp

@@ -1,21 +1,21 @@
 [package]
-edition = "2024"
 name = "gwl-job-tools"
-description = "A simple job search tracker."
 version = "0.1.0"
+categories = ["command-line-utilities"]
+edition = "2024"
+keywords = ["cli", "job-search", "event-sourcing"]
 license = "MIT"
 repository = "https://github.com/plathrop/gwl-job-tools"
-keywords = ["cli", "job-search", "event-sourcing"]
-categories = ["command-line-utilities"]
+description = "A simple job search tracker."
 
 [features]
 default = ["telemetry"]
 telemetry = [
-    "dep:opentelemetry",
-    "dep:opentelemetry-otlp",
-    "dep:opentelemetry-semantic-conventions",
-    "dep:opentelemetry_sdk",
-    "dep:tracing-opentelemetry",
+  "dep:opentelemetry",
+  "dep:opentelemetry-otlp",
+  "dep:opentelemetry-semantic-conventions",
+  "dep:opentelemetry_sdk",
+  "dep:tracing-opentelemetry",
 ]
 
 [dependencies]
@@ -31,7 +31,11 @@ httpdate = "1.0.3"
 jiff = { version = "0.2.35", features = ["serde"] }
 miette = { version = "7.6.0", features = ["fancy", "derive"] }
 opentelemetry = { version = "0.32.0", features = ["trace"], optional = true }
-opentelemetry-otlp = { version = "0.32", features = ["http-proto", "reqwest-client", "reqwest-rustls"], optional = true }
+opentelemetry-otlp = { version = "0.32", features = [
+  "http-proto",
+  "reqwest-client",
+  "reqwest-rustls",
+], optional = true }
 opentelemetry-semantic-conventions = { version = "0.26", optional = true }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"], optional = true }
 regex = "1.13.1"
