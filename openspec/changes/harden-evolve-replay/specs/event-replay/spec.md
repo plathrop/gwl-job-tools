@@ -7,11 +7,14 @@ state: corruption is a hard error, never a silent skip or partial state.
 
 ### Requirement: Replay fails loudly on malformed payloads
 
-When replaying an event whose type is known, a payload that does not
-deserialize into that type's expected shape is source-of-truth corruption.
-The system MUST fail replay with a hard error identifying the event, and
-MUST NOT leave partially-applied state (e.g. a lead marked "existing" with
-no snapshot, adapter, URL, or text).
+When the aggregate replay consumes a snapshot (`ingested`/`updated`/
+`edited`), `scored`, or `reviewed` event — the payload families it decodes —
+a payload that does not deserialize into its expected shape is
+source-of-truth corruption. The system MUST fail replay with a hard error
+identifying the event, and MUST NOT leave partially-applied state (e.g. a
+lead marked "existing" with no snapshot, adapter, URL, or text). Known event
+types the aggregate does not consume are validated by the read-model
+projection instead.
 
 #### Scenario: Legacy snapshot payload fails replay
 

@@ -47,3 +47,12 @@ and the latent data-integrity bug.
 Behavior note: a log that previously degraded silently now refuses to replay.
 That is the intent — and already the projection's behavior — so a corrupt
 snapshot can no longer mint a lead that "exists" with no data.
+
+## Observability
+
+No new instrumentation. The new failure mode — a malformed payload refusing
+to replay — is itself the instrumentation: a hard `miette` error naming the
+event's type, id, and seq, surfaced through the enclosing command span.
+`evolve` is a pure in-memory decode invoked per event in the replay loop, so
+a per-event span would be noise, not signal; the boundary to instrument
+(were any needed) is `replay_lead`, not `evolve`.

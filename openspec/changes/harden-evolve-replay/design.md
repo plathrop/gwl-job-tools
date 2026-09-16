@@ -54,16 +54,24 @@ Reorder the snapshot arm so the `SnapshotFields` decode happens first and
 fields. This keeps `evolve` side-effect-free on error even though the caller
 discards the state when replay bails.
 
-### 3. Reuse the same typed payload structs as the projection
+### 3. Decode into typed structs, matching the projection where it does
 
-Decode into `SnapshotFields`, `ScoredPayload`, and `ReviewedPayload` — the
-same structs `rebuild` uses — rather than hand-rolled field extraction. This
-prevents the two paths from drifting.
+Decode into `SnapshotFields` (snapshot events), `ScoredPayload`, and
+`ReviewedPayload` — rather than hand-rolled field extraction. `rebuild` uses
+the same `ScoredPayload` and `ReviewedPayload` for those two families, but
+decodes the ingest family as `IngestView`, which additionally requires
+`dedupe_key`/`identifiers`; the aggregate uses `SnapshotFields`, which
+requires neither. The difference is intentional: the aggregate only needs
+the snapshot fields to decide, while the projection needs the identity
+fields to build its indexes. A snapshot missing `dedupe_key` passes `evolve`
+but is caught by `rebuild`, which runs first in every command, so the
+stricter path always gates the aggregate.
 
 The `reviewed` arm currently reads `mark` with
 `.get("mark").and_then(Value::as_str)`; it becomes a strict `ReviewedPayload`
 decode. This is the lowest-severity case (a missing mark means "unmarked,"
-not data loss), but it is included so `evolve` and `rebuild` are uniform.
+not data loss), but it is included so `evolve` and `rebuild` stay uniform
+for the families they both decode.
 
 ### 4. Keep unknown event types ignored
 
@@ -88,3 +96,12 @@ data, not corruption. This is a spec requirement (see
 
 Pure code change — no data migration. The corpus needs no rewrite (verified
 clean). Rollback is a revert of the commit.
+
+## Observability
+
+No new instrumentation. The new failure mode — a malformed payload refusing
+to replay — is itself the instrumentation: a hard `miette` error naming the
+event's type, id, and seq, surfaced through the enclosing command span.
+`evolve` is a pure in-memory decode invoked per event in the replay loop, so
+a per-event `#[instrument]` span would be noise, not signal; were any span
+needed, the boundary would be `replay_lead`, not `evolve`.

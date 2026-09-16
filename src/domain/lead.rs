@@ -57,7 +57,6 @@ impl LeadState {
 }
 
 pub fn evolve(state: &mut LeadState, event: &EventEnvelope) -> Result<()> {
-    state.seq = event.seq;
     match event.event_type.as_str() {
         event_type::INGESTED | event_type::UPDATED | event_type::EDITED => {
             // Decode first: a payload we cannot decode is source-of-truth
@@ -120,6 +119,11 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) -> Result<()> {
         }
         _ => {}
     }
+    // Sequence advances only after the payload decodes successfully: a
+    // decode failure must leave the aggregate side-effect-free (the caller
+    // discards the state on error, but the contract is no partial mutation).
+    // The `_` arm still advances for unknown, forward-compatible event types.
+    state.seq = event.seq;
     Ok(())
 }
 
@@ -1250,10 +1254,11 @@ mod tests {
         };
         assert!(evolve(&mut state, &legacy).is_err());
         // No partial state: the lead must not be left "existing" with no
-        // snapshot/adapter/url/raw_text.
+        // snapshot/adapter/url/raw_text, and the sequence must not advance.
         assert!(!state.exists);
         assert!(state.snapshot.is_none());
         assert!(state.adapter.is_none());
+        assert_eq!(state.seq, 0);
     }
 
     #[test]
@@ -1269,6 +1274,9 @@ mod tests {
             ..ingested
         };
         assert!(evolve(&mut state, &malformed).is_err());
+        // No partial state: the sequence must not advance past the ingested
+        // event (seq 1).
+        assert_eq!(state.seq, 1);
         assert!(state.latest_score.is_none());
     }
 
@@ -1285,6 +1293,9 @@ mod tests {
             ..ingested
         };
         assert!(evolve(&mut state, &malformed).is_err());
+        // No partial state: the sequence must not advance past the ingested
+        // event (seq 1).
+        assert_eq!(state.seq, 1);
         assert!(state.latest_mark.is_none());
     }
 
