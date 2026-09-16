@@ -67,6 +67,41 @@ These come from the spec and apply to every change:
   `git branch -d` (the "not fully merged" warning is expected — rebase-merge
   rewrote the SHAs), and `git fetch --prune`.
 
+## Observability
+
+Instrumentation is part of this project's contract, not an afterthought. The
+policy and its rationale live in
+`docs/decisions/0011-observability-by-default-for-agent-changes.md`; concrete
+conventions live under "Logging & telemetry" in Code Conventions. This section
+is the operating procedure.
+
+**Load skills conditionally.** If your change adds or modifies application
+logic (commands, domain, event store, projections, ingest), load the
+`otel-instrumentation` skill before writing code. Load
+`observability-fundamentals` only when the change involves a design decision
+about *what* to instrument (new subsystem, new failure modes). Docs-only,
+spec-only, and config-only changes need neither. Scope instrumentation to the
+code you're touching — never retrofit unrelated code.
+
+**Instrumentation floor** (minimum for code you touch):
+
+- `#[instrument]` on public functions doing I/O or crossing module boundaries,
+  with `skip()` for sensitive args.
+- A span around every external call (event-log file I/O, future network
+  fetches) with outcome fields.
+- `info!` on command start/finish and significant decisions; `debug!` for
+  detail; `warn!`/`error!` always with identifying fields (job id, path, event
+  type) so the offending input can be located.
+
+**OpenSpec changes must spec observability.** Proposals for behavior-bearing
+changes must state what an operator needs to see to answer "did this work, and
+how well?" — which spans/logs/metrics the feature should emit — or explicitly
+justify why none is needed. Apply the same test in `design.md`.
+
+**PR gate.** Every PR description must include an **Observability** section:
+what instrumentation the change adds, or one line on why none is needed. A
+missing section is an incomplete PR; reviewers should treat it as such.
+
 ## Documentation
 
 - **Specs** — the living contract of what the system must do — live in
@@ -108,7 +143,8 @@ commands must fail loudly with `miette::bail!`, not `todo!()` or silent success.
 
 - Use `tracing` for logging: `#[instrument]` on functions (with `skip()` for
   sensitive args, `fields()` for structured fields), `info!` / `debug!` macros.
-- Logs go to **stderr**; stdout is reserved for command output.
+- Logs go to a **file sink** (decision 0005), not stdout/stderr; stdout is
+  reserved for command output and stderr for miette error reports.
 - Telemetry is **opt-in** and behind the `telemetry` feature. Never fail a
   command because telemetry init/shutdown/export failed. Honor
   `OTEL_SDK_DISABLED`. Keep the exporter timeout short. Redact header values
