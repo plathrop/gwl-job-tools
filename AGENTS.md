@@ -63,9 +63,9 @@ These come from the spec and apply to every change:
   Grey's own inline comments.
 - **Merging**: GitHub disallows merge commits on this repo. Rebase the branch
   onto `main` locally, force-push, then `gh pr merge <n> --rebase`. GitHub
-  auto-deletes the PR branch on merge; local cleanup is `git worktree
-  remove`, `git branch -d` (the "not fully merged" warning is expected —
-  rebase-merge rewrote the SHAs), and `git fetch --prune`.
+  auto-deletes the PR branch on merge; local cleanup is `git worktree remove`,
+  `git branch -d` (the "not fully merged" warning is expected — rebase-merge
+  rewrote the SHAs), and `git fetch --prune`.
 
 ## Documentation
 
