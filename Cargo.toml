@@ -6,7 +6,7 @@ edition = "2024"
 keywords = ["cli", "job-search", "event-sourcing"]
 license = "MIT"
 repository = "https://github.com/plathrop/gwl-job-tools"
-description = "A simple job search tracker."
+description = "Event-sourced job-search triage CLI: ingest, gate, score, review, and track applications."
 
 [features]
 default = ["telemetry"]

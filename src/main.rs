@@ -65,21 +65,3 @@ async fn main() -> Result<()> {
 
     result
 }
-
-// Kept to show how to create the data file.
-// pub async fn datafile() -> Result<File> {
-//     let paths = AppPaths::discover()?;
-//     let data_dir = paths.data_dir();
-//     let data_file_name = format!("{APP_NAME}.jsonl");
-//     let data_file_path = data_dir.join(data_file_name);
-//
-//     let dir = data_dir.to_str().unwrap();
-//
-//     fs::create_dir_all(data_dir).await.into_diagnostic()?;
-//     OpenOptions::new()
-//         .create(true)
-//         .append(true)
-//         .open(&data_file_path)
-//         .await
-//         .into_diagnostic()
-// }

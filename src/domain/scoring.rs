@@ -403,7 +403,7 @@ mod tests {
 
     #[test]
     fn extract_years_prefers_experience_adjacent_mention() {
-        // k3 review round 2 (PR #7): leftmost-match is arbitrary. "2 years
+        // review round 2 (PR #7): leftmost-match is arbitrary. "2 years
         // of Kubernetes" is a technology mention, not the role's experience
         // requirement; "10+ years overall experience" is.
         assert_eq!(
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn single_char_keyword_over_matches_punctuated_token() {
-        // Accepted over-match (k3 review): a single-character keyword (`C`)
+        // Accepted over-match (review): a single-character keyword (`C`)
         // matches a punctuation-adjacent token (`C++`), because `+` is a
         // non-alphanumeric boundary. Pinned so the behavior is explicit, not
         // drift.

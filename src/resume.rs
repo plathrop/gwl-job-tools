@@ -1,10 +1,10 @@
 //! Resume loading (decision 0004): own lenient parsing of the JSON Resume
 //! schema, for the fields v0 consumes. The official `json-resume-serde` crate
-//! is not used (v0.1.0, unpublished, and too strict to parse Grey's actual
-//! resume.json).
+//! is not used (v0.1.0, unpublished, and too strict to parse the
+//! maintainer's actual resume.json).
 //!
-//! v0 consumes `skills` (scoring, Increment 3) and `basics`/`work` (the
-//! apply-package cheat sheet, Increment 4a).
+//! v0 consumes `skills` (scoring) and `basics`/`work` (the apply-package
+//! cheat sheet).
 
 use std::path::Path;
 
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn missing_skills_defaults_to_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_resume(&dir, r#"{"basics": {"name": "Grey"}}"#);
+        let path = write_resume(&dir, r#"{"basics": {"name": "Avery"}}"#);
         let resume = load(Some(&path)).unwrap().unwrap();
         assert!(resume.keywords().is_empty());
     }

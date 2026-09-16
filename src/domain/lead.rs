@@ -1,9 +1,10 @@
 //! The Lead aggregate: pure `decide` / `evolve` over replayed state.
 //!
 //! Design doc 0001 §2 (identity & re-ingest semantics) and §1 (aggregate
-//! pattern). Gates and scoring land in Increments 2–3; the aggregate already
-//! understands `reviewed` marks so the durable-ignore suppression rule is in
-//! place before marks exist.
+//! pattern). `decide_*` applies gates and scoring and emits events for
+//! ingest, edits, marks, and apply packaging; `evolve` replays events into
+//! `LeadState`, including the `reviewed` marks that drive durable-ignore
+//! suppression.
 
 use miette::{IntoDiagnostic, Result, bail};
 use uuid::Uuid;
@@ -1421,7 +1422,7 @@ mod tests {
                 resume_path: Some("/tmp/resume.pdf".into()),
                 cheat_sheet: vec![crate::domain::events::CheatSheetEntry {
                     question: "Full name".into(),
-                    answer: "Grey".into(),
+                    answer: "Avery".into(),
                 }],
             },
             url: Some("https://example.com/j".into()),

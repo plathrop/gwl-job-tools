@@ -58,7 +58,7 @@ pub struct GateFailure {
 /// - **blacklist**: slug-substring match on company. Never match
 ///   blacklisted companies.
 /// - **ideological**: the mechanism ships in v0 as a filter list over the
-///   posting text; the content is empty until the LLM scorer (Remi) lands.
+///   posting text; the content is empty until the LLM scorer (vNext) lands.
 pub fn evaluate(config: &Config, extracted: &ExtractedFields, raw_text: &str) -> Vec<GateFailure> {
     let mut failures = Vec::new();
 

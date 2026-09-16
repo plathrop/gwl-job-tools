@@ -500,8 +500,8 @@ pub struct EditSpec {
 /// (`true`/`false`/`unknown`). `--comp` parses through the same extractor
 /// the ingest path uses; `--comp-min`/`--comp-max` set exact USD/year bounds.
 /// A field that is both set and cleared is a contradiction and bails —
-/// silently discarding the set value is the footgun this prevents (Remi,
-/// PR #15 review).
+/// silently discarding the set value is the footgun this prevents
+/// (PR #15 review).
 pub fn build_edit_spec(record: &LeadRecord, args: &EditArgs) -> Result<EditSpec> {
     // Contradiction check first, so `--comp "garbage" --clear comp` reports
     // the contradiction rather than a parse error for a value that is about
@@ -774,7 +774,7 @@ pub async fn execute_package(
     // Re-open the posting URL (best-effort, like the review loop's `a`
     // key; the final click is the user's). The machine-readable --json path
     // must not spawn a browser on the operator's display (PR #17 review:
-    // Remi + kimi, verified live with a stubbed xdg-open).
+    // verified live with a stubbed xdg-open).
     if !json && let Some(url) = record.url.as_deref() {
         println!("  URL: {}", render::sanitize(url));
         open_url(url);
@@ -1373,7 +1373,7 @@ mod tests {
 
     #[test]
     fn unstructured_drop_dedupes_on_reingest() {
-        // Regression (Remi's raw-fallback bug): an unstructured posting with
+        // Regression (raw-fallback bug): an unstructured posting with
         // no req/url/title/company falls back to a `raw:` dedupe key — and
         // re-ingesting it must match the same lead, not mint a new one.
         let dir = tempfile::tempdir().unwrap();
@@ -2077,7 +2077,7 @@ mod tests {
 
     #[test]
     fn build_edit_spec_contradictory_flags_bail() {
-        // Remi (PR #15): a field both set and cleared must not silently
+        // PR #15: a field both set and cleared must not silently
         // discard the set value — it is a contradiction, and a loud one.
         let record = lead_record(None);
 
@@ -2804,8 +2804,8 @@ mod tests {
     fn cheat_sheet_derives_answers_from_resume() {
         let resume = Resume {
             basics: resume::Basics {
-                name: Some("Grey".into()),
-                email: Some("grey@example.com".into()),
+                name: Some("Avery".into()),
+                email: Some("avery@example.com".into()),
                 phone: None,
                 location: Some(resume::Location {
                     city: Some("San Francisco".into()),
@@ -2825,8 +2825,8 @@ mod tests {
             .iter()
             .map(|e| (e.question.as_str(), e.answer.as_str()))
             .collect();
-        assert!(qa.contains(&("Full name", "Grey")));
-        assert!(qa.contains(&("Email address", "grey@example.com")));
+        assert!(qa.contains(&("Full name", "Avery")));
+        assert!(qa.contains(&("Email address", "avery@example.com")));
         assert!(qa.contains(&("Location", "San Francisco, CA, US")));
         assert!(qa.contains(&("Current or most recent title", "Staff Engineer")));
         assert!(qa.contains(&("Current or most recent employer", "Acme")));
@@ -2840,7 +2840,7 @@ mod tests {
         let resume_path = dir.path().join("resume.json");
         std::fs::write(
             &resume_path,
-            r#"{"basics": {"name": "Grey"}, "work": [{"name": "Acme", "position": "Staff Engineer"}]}"#,
+            r#"{"basics": {"name": "Avery"}, "work": [{"name": "Acme", "position": "Staff Engineer"}]}"#,
         )
         .unwrap();
         let config = Config {

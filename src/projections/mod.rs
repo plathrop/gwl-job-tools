@@ -1442,7 +1442,7 @@ mod tests {
         // A gate-rejected lead the user applied to anyway, later declined
         // by the employer: two different "rejections" — the machine's
         // content filter and the employer's decision. The outcome is the
-        // later stage and must win (PR #16: Grey's rejected-vs-
+        // later stage and must win (PR #16: rejected-vs-
         // rejected_by_employer question).
         let lead_id = Uuid::now_v7();
         let events = vec![
@@ -1514,7 +1514,7 @@ mod tests {
         // neither reached a terminal state nor been durably ignored —
         // pending, deferred, applying, applied — sorted by score. The
         // ignore mark buries a lead permanently: `--all` is the only view
-        // that reveals it (settled with Grey 2026-08-31).
+        // that reveals it (settled in review 2026-08-31).
         let a = Uuid::now_v7(); // scored, pending
         let b = Uuid::now_v7(); // applied
         let c = Uuid::now_v7(); // terminal (declined)
