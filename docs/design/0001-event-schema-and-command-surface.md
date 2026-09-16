@@ -1,7 +1,7 @@
 # 0001: Event Schema and Command Surface
 
 Status: proposed (Increment 0, GWLJ-rk2cnb)
-Spec: `docs/specs/job-search-automation-v2.md`
+Spec: `docs/archive/job-search-automation-v2.md`
 
 This document defines the event-sourced model and CLI command surface for
 `gwl-jobs` v0. It is the design contract for the pipeline increments that

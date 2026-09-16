@@ -225,7 +225,7 @@ CLI: ingest, gate, score, review, and track applications." README: add a
 short "what it does" paragraph (adapt AGENTS.md:7-10), install
 (`cargo install` from repo), the command table (copy the corrected §8
 from M3), config keys, and a pointer to
-`docs/specs/job-search-automation-v2.md`. **Effort: S** (description) /
+`docs/archive/job-search-automation-v2.md`. **Effort: S** (description) /
 **M** (README).
 
 ### M7. `cli.rs` contains two identical command-name match functions

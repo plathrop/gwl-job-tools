@@ -1,7 +1,7 @@
 # 0002: Derived Lifecycle Status and the `list` Default
 
 Status: accepted (Increment, GWLJ-w27khs)
-Spec: `docs/specs/job-search-automation-v2.md`
+Spec: `docs/archive/job-search-automation-v2.md`
 Amends: design doc 0001 §5, §7, §8; decision record 0010
 
 ## The problem

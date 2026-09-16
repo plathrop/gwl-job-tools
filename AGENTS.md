@@ -9,9 +9,11 @@ automates the high-volume, low-judgment work of a job search (sift, score,
 capture metadata, prepare application materials) and reserves human judgment
 for the high-value decisions (which jobs to pursue).
 
-The full specification is **`docs/specs/job-search-automation-v2.md`**.
-Read it before starting work. This file carries the always-relevant context;
-the spec carries the scope.
+The living specification lives in `openspec/specs/` (reachable via the
+`docs/specs/` symlink); the original v2 prompt is archived at
+**`docs/archive/job-search-automation-v2.md`**. Read the archived prompt
+before starting work. This file carries the always-relevant context; the
+specs carry the scope.
 
 ## Non-Negotiable Guardrails
 
@@ -49,7 +51,8 @@ These come from the spec and apply to every change:
 
 ## Delivery Workflow
 
-- Deliver in small increments, each as a PR. PRs are the review checkpoint.
+- Deliver in small increments, each as a PR (an increment = an OpenSpec change;
+  see OpenSpec). PRs are the review checkpoint.
 - When opening a PR, add @remi-ashe as a reviewer.
 - The agent may continue ahead via stacked PRs, capped at 2.
 - Before opening a new stacked PR, check for review feedback (Copilot, Remi,
@@ -63,20 +66,20 @@ These come from the spec and apply to every change:
   auto-deletes the PR branch on merge; local cleanup is `git worktree
 remove`, `git branch -d` (the "not fully merged" warning is expected —
   rebase-merge rewrote the SHAs), and `git fetch --prune`.
-- The first increment is a design PR (event schema + command surface) that must
-  answer: lead identity & re-ingest semantics, full lifecycle events, alpha CSV
-  fate, and the review-loop interaction model. Its design doc lands in
-  `docs/design/` (see Documentation).
 
 ## Documentation
 
-- Specs live in `docs/specs/`.
-- Design docs live in `docs/design/`, numbered: `NNNN-short-slug.md` (e.g.,
+- **Specs** — the living contract of what the system must do — live in
+  `openspec/specs/`, modified only through OpenSpec changes. `docs/specs/` is
+  a symlink to that directory for convenience.
+- **Design docs** live in `docs/design/`, numbered: `NNNN-short-slug.md` (e.g.,
   `0001-event-schema-and-command-surface.md`). A design doc describes how a
   piece of the system works; it may evolve as the system does.
-- Decision records live in `docs/decisions/`, same numbering convention. A
+- **Decision records** live in `docs/decisions/`, same numbering convention. A
   decision record captures a point-in-time choice and its rationale; records
   are append-only — supersede, don't rewrite.
+- **Historical/superseded documents** (e.g., the original v2 prompt) live in
+  `docs/archive/` — kept for provenance, not authority.
 
 ## Architecture
 
@@ -130,7 +133,7 @@ Imports must be at the **top level** (top of the file), except:
 ### Formatting & lints (before every commit)
 
 - `cargo fmt` (rustfmt) for Rust.
-- `prettier --write` for Markdown/JSON.
+- `dprint fmt` for Markdown, TOML, YAML, and JSON.
 - `cargo clippy -- -D warnings` must pass.
 
 ## Commands
@@ -143,12 +146,36 @@ Imports must be at the **top level** (top of the file), except:
 | `cargo fmt --check`           | Verify formatting |
 | `cargo build`                 | Build             |
 
+## OpenSpec
+
+Change management uses the spec-driven workflow, under `openspec/`:
+
+- **Specs** (`openspec/specs/`) are the living contract of what the system
+  does. Modify them only through changes, never by hand.
+- **Changes** (`openspec/changes/`) carry `proposal.md`, `specs/`, `design.md`,
+  and `tasks.md`. Lifecycle: propose → apply → archive.
+- Drive it with the openspec skills (`.pi/skills/openspec-*`).
+
+One change = one delivery increment = one PR. Break large specs into multiple
+small changes rather than one large one. A change's `design.md` is transient
+and archived with the change; durable architecture lives in `docs/design/`
+(see Documentation).
+
 ## Pebble
 
-This repo uses Pebble for issue tracking (prefix `GWLJ`). Follow the worktree
+This repo uses Pebble (prefix `GWLJ`) as the **backlog and in-flight ledger** —
+the complement to OpenSpec, not a second planning layer. Follow the worktree
 discipline from the global agent instructions: feature work in linked
 worktrees, `.pebble` changes committed only from the primary checkout.
 
-Pebbles map 1:1 to delivery increments. Claim the pebble before starting work,
-reference its ID (e.g., `GWLJ-xxxxxx`) in the PR description, and close it
-with `--reason` when the PR merges.
+Pebbles track:
+
+- ideas not yet ready to become specs;
+- bugfixes (no spec needed);
+- epics — an arc of work or a bucket (e.g., the "Bug Fixes" epic);
+- breaking a large spec into small deliverable chunks;
+- tasks that surface during execution of a change but don't belong in it.
+
+Claim the pebble before starting work, reference its ID (e.g., `GWLJ-xxxxxx`)
+in the PR description, and close it with `--reason` when the PR merges. A
+change may close several pebbles or none; pebbles don't map 1:1 to changes.
