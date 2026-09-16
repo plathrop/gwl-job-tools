@@ -481,17 +481,7 @@ New findings from the delta (the `--data-dir`/`--config` flags, the
 adapter/source change-tracking, the strict-replay hardening, and the new
 integration tests):
 
-### N1. `expand_tilde` mis-expands the `~user` form
-
-**Evidence:** `src/config.rs:9-17` — `strip_prefix("~")` turns `~user/foo`
-into `$HOME/user/foo`, not the `user` account's home (and not unchanged).
-Only `~` and `~/` expand correctly.
-
-**Recommendation:** expand only when the remainder is empty or starts with
-`/`; return the path unchanged otherwise. Impact negligible (config paths
-are `~/…` in practice). **Effort: S.**
-
-### N2. Integration-test replay bypasses `upcast` and envelope validation
+### N1. Integration-test replay bypasses `upcast` and envelope validation
 
 **Evidence:** `tests/cli_integration.rs:56-71` — the `projection()` helper
 re-implements the JSONL split/parse and calls `rebuild` directly, skipping
@@ -503,7 +493,7 @@ tests do cover both, so the gap is narrow).
 **Recommendation:** note only — leave the read-only helper, or (if it ever
 churns) route it through a shared read-only parse. **Effort: S** if done.
 
-### N3. Subprocess coverage still misses review/package/events/completion
+### N2. Subprocess coverage still misses review/package/events/completion
 
 **Evidence:** `tests/cli_output.rs` covers ingest/show/list/edit, the
 `--data-dir`/`--config` routing, and error paths, but not `review`,
@@ -519,3 +509,4 @@ churns) route it through a shared read-only parse. **Effort: S** if done.
 - Config/data separation is clean: `with_data_dir` replaces only the data
   dir; `--config` bypasses config-dir derivation entirely.
 - "referrer" spelling is now consistent across the code and design doc 0001.
+- `expand_tilde` (`src/config.rs`) leaves `~user` unchanged: `Path::strip_prefix` compares whole path components, so `~user/foo` does not match the `~` prefix and falls through the early return. Correct as-is.
