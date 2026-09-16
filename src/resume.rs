@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn missing_skills_defaults_to_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let path = write_resume(&dir, r#"{"basics": {"name": "Avery"}}"#);
+        let path = write_resume(&dir, r#"{"basics": {"name": "Avery Example"}}"#);
         let resume = load(Some(&path)).unwrap().unwrap();
         assert!(resume.keywords().is_empty());
     }

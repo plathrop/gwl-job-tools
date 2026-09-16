@@ -2804,7 +2804,7 @@ mod tests {
     fn cheat_sheet_derives_answers_from_resume() {
         let resume = Resume {
             basics: resume::Basics {
-                name: Some("Avery".into()),
+                name: Some("Avery Example".into()),
                 email: Some("avery@example.com".into()),
                 phone: None,
                 location: Some(resume::Location {
@@ -2825,7 +2825,7 @@ mod tests {
             .iter()
             .map(|e| (e.question.as_str(), e.answer.as_str()))
             .collect();
-        assert!(qa.contains(&("Full name", "Avery")));
+        assert!(qa.contains(&("Full name", "Avery Example")));
         assert!(qa.contains(&("Email address", "avery@example.com")));
         assert!(qa.contains(&("Location", "San Francisco, CA, US")));
         assert!(qa.contains(&("Current or most recent title", "Staff Engineer")));
@@ -2840,7 +2840,7 @@ mod tests {
         let resume_path = dir.path().join("resume.json");
         std::fs::write(
             &resume_path,
-            r#"{"basics": {"name": "Avery"}, "work": [{"name": "Acme", "position": "Staff Engineer"}]}"#,
+            r#"{"basics": {"name": "Avery Example"}, "work": [{"name": "Acme", "position": "Staff Engineer"}]}"#,
         )
         .unwrap();
         let config = Config {
