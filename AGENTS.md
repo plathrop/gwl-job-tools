@@ -61,14 +61,15 @@ These come from the spec and apply to every change:
   reviewer; Grey may also post folded third-party reviews (e.g., deepseek) as
   PR comments from their own account — treat those as review feedback, not as
   Grey's own inline comments.
-- **Merging**: commits must stay signed, and GitHub's rebase-and-merge
-  creates unsigned commits — never use `gh pr merge`. Merge locally
-  instead: rebase the branch onto `main` (in the worktree), force-push the
-  branch so GitHub sees the new commit IDs, then from the primary checkout
-  fast-forward `main` onto the branch (`git merge --ff-only <branch>`) and
-  push `main`. Pushing `main` auto-closes the PR and auto-deletes the remote
-  branch; local cleanup is `git worktree remove`, `git branch -d`, and
-  `git fetch --prune`.
+- **Merging**: merge locally with fast-forward — never through GitHub. The
+  flow and rationale live in the global agent instructions ("Git merges:
+  local fast-forward only"). This repo enforces it by construction: merge
+  commits are the only GitHub merge method enabled, and the `main` ruleset
+  requires linear history (which merge commits violate) plus signed
+  commits — so every GitHub-side merge fails and unsigned pushes are
+  rejected. Pushing `main` after a local ff-merge marks the PR merged and
+  auto-deletes the branch; local cleanup is `git worktree remove`,
+  `git branch -d`, and `git fetch --prune`.
 
 ## Observability
 
