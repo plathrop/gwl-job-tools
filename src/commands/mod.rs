@@ -108,7 +108,7 @@ fn replay_lead(store: &impl EventStore, lead_id: Uuid) -> Result<LeadState> {
     let stream = LeadState::stream_id(lead_id);
     let mut state = LeadState::default();
     for event in store.load(&stream)? {
-        lead::evolve(&mut state, &event);
+        lead::evolve(&mut state, &event)?;
     }
     Ok(state)
 }

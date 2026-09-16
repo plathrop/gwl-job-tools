@@ -1,0 +1,49 @@
+## Why
+
+`lead::evolve` — the aggregate's replay path that builds `LeadState` for
+`decide_ingest`/`decide_edit` — silently swallows payload deserialization
+failures with `if let Ok(...)`, and sets `state.exists = true` *before* the
+decode. A lead whose snapshot event carries a legacy or malformed payload
+ends up "existing" with no snapshot/adapter/url/raw_text. The read-model
+projection (`Projection::rebuild`) already treats the same condition as
+source-of-truth corruption and hard-errors. This closes that inconsistency
+and the latent data-integrity bug.
+
+## What Changes
+
+- `lead::evolve` returns `miette::Result<()>` and hard-errors — identifying
+  the event — when a *known* event type's payload fails to deserialize,
+  instead of silently skipping:
+  - `ingested`/`updated`/`edited` → `SnapshotFields`
+  - `scored` → `ScoredPayload`
+  - `reviewed` → `ReviewedPayload` (a missing/non-string `mark` becomes an
+    error, matching the projection)
+- `commands::replay_lead` propagates the new error with `?`.
+- Unknown event types remain ignored (forward compatibility) — unchanged.
+- No upcaster is added: the live corpus was verified clean (oldest event is
+  one day after the source→adapter rename), so there are no legacy payloads
+  to migrate.
+
+## Capabilities
+
+### New Capabilities
+
+- `event-replay`: the contract that replaying a *known* event type whose
+  payload fails to deserialize is a hard error (source-of-truth corruption),
+  never a silent skip or partial state.
+
+### Modified Capabilities
+
+<!-- none — openspec/specs/ is empty; this is the first capability -->
+
+## Impact
+
+- `src/domain/lead.rs` — `evolve` signature and per-event-type decode paths.
+- `src/commands/mod.rs` — `replay_lead` propagates the new error.
+- `src/domain/lead.rs` tests — update `evolve` call sites; add malformed-
+  payload hard-error tests (legacy `source`-without-`adapter` snapshot,
+  malformed `scored`, malformed `reviewed`).
+
+Behavior note: a log that previously degraded silently now refuses to replay.
+That is the intent — and already the projection's behavior — so a corrupt
+snapshot can no longer mint a lead that "exists" with no data.

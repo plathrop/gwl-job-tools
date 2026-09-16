@@ -5,8 +5,7 @@
 //! understands `reviewed` marks so the durable-ignore suppression rule is in
 //! place before marks exist.
 
-use miette::{Result, bail};
-use serde_json::Value;
+use miette::{IntoDiagnostic, Result, bail};
 use uuid::Uuid;
 
 use crate::domain::{
@@ -57,10 +56,22 @@ impl LeadState {
     }
 }
 
-pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
+pub fn evolve(state: &mut LeadState, event: &EventEnvelope) -> Result<()> {
     state.seq = event.seq;
     match event.event_type.as_str() {
         event_type::INGESTED | event_type::UPDATED | event_type::EDITED => {
+            // Decode first: a payload we cannot decode is source-of-truth
+            // corruption (the read-model projection treats it the same way),
+            // not something to skip — a lenient decode would leave a lead
+            // that "exists" with no snapshot/adapter/url/raw_text.
+            let snapshot: SnapshotFields = serde_json::from_value(event.payload.clone())
+                .into_diagnostic()
+                .map_err(|e| {
+                    e.wrap_err(format!(
+                        "decoding {} payload of event {} (seq {})",
+                        event.event_type, event.id, event.seq
+                    ))
+                })?;
             state.exists = true;
             // Every snapshot event is one gate/score evaluation; rejected
             // and scored events carry that evaluation's revision. Counting
@@ -74,30 +85,42 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) {
             // If the batch tears, the lead must not present a stale score
             // (decision 0006).
             state.latest_score = None;
-            if let Ok(snapshot) = serde_json::from_value::<SnapshotFields>(event.payload.clone()) {
-                state.snapshot = Some(snapshot.extracted);
-                state.url = snapshot.url;
-                state.adapter = Some(snapshot.adapter);
-                state.raw_text = snapshot.raw_text;
-                state.source = Some(snapshot.source);
-            }
+            state.snapshot = Some(snapshot.extracted);
+            state.url = snapshot.url;
+            state.adapter = Some(snapshot.adapter);
+            state.raw_text = snapshot.raw_text;
+            state.source = Some(snapshot.source);
         }
         // Marks are latest-wins (design doc §3). The `reviewed` event lands
         // with Increment 4; the suppression rule below already honors it.
         event_type::REVIEWED => {
-            state.latest_mark = event
-                .payload
-                .get("mark")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            // Strict, like the snapshot payloads: a mistyped mark is
+            // source-of-truth corruption, not "unmarked" — a lenient read
+            // would silently clear the mark and the queue state.
+            let payload: ReviewedPayload = serde_json::from_value(event.payload.clone())
+                .into_diagnostic()
+                .map_err(|e| {
+                    e.wrap_err(format!(
+                        "decoding reviewed payload of event {} (seq {})",
+                        event.id, event.seq
+                    ))
+                })?;
+            state.latest_mark = Some(payload.mark);
         }
         event_type::SCORED => {
-            if let Ok(score) = serde_json::from_value::<ScoredPayload>(event.payload.clone()) {
-                state.latest_score = Some(score);
-            }
+            let score: ScoredPayload = serde_json::from_value(event.payload.clone())
+                .into_diagnostic()
+                .map_err(|e| {
+                    e.wrap_err(format!(
+                        "decoding scored payload of event {} (seq {})",
+                        event.id, event.seq
+                    ))
+                })?;
+            state.latest_score = Some(score);
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// What an ingest command decided to append.
@@ -679,7 +702,8 @@ mod tests {
                     correlation_id: Uuid::now_v7(),
                     payload,
                 },
-            );
+            )
+            .unwrap();
         }
         assert_eq!(state.eval_revision, 1);
 
@@ -1094,7 +1118,7 @@ mod tests {
         // score (decision 0006).
         let mut state = LeadState::default();
         let ingested = ingested_envelope();
-        evolve(&mut state, &ingested);
+        evolve(&mut state, &ingested).unwrap();
         assert_eq!(state.eval_revision, 1);
 
         let edited = EventEnvelope {
@@ -1111,7 +1135,7 @@ mod tests {
             }),
             ..ingested
         };
-        evolve(&mut state, &edited);
+        evolve(&mut state, &edited).unwrap();
         assert_eq!(state.eval_revision, 2);
         assert_eq!(
             state.snapshot.as_ref().unwrap().title.as_deref(),
@@ -1130,7 +1154,7 @@ mod tests {
             }),
             ..edited
         };
-        evolve(&mut state, &scored);
+        evolve(&mut state, &scored).unwrap();
         assert_eq!(state.latest_score.as_ref().unwrap().revision, 2);
     }
 
@@ -1158,7 +1182,7 @@ mod tests {
                 "extracted": {"title": "Engineer", "company": "Acme"}
             }),
         };
-        evolve(&mut state, &ingested);
+        evolve(&mut state, &ingested).unwrap();
         assert!(state.exists);
         assert_eq!(state.seq, 1);
         assert_eq!(
@@ -1172,7 +1196,7 @@ mod tests {
             payload: serde_json::json!({"mark": "ignore"}),
             ..ingested
         };
-        evolve(&mut state, &reviewed);
+        evolve(&mut state, &reviewed).unwrap();
         assert_eq!(state.latest_mark.as_deref(), Some("ignore"));
         assert_eq!(state.seq, 2);
     }
@@ -1193,16 +1217,82 @@ mod tests {
             correlation_id: Uuid::now_v7(),
             payload: serde_json::json!({}),
         };
-        evolve(&mut state, &unknown);
+        evolve(&mut state, &unknown).unwrap();
         assert_eq!(state.seq, 7);
         assert!(!state.exists);
+    }
+
+    #[test]
+    fn evolve_legacy_source_without_adapter_errors() {
+        // The source→adapter rename (461958f) did not bump schema_version
+        // and registered no upcaster; a pre-rename snapshot (adapter value
+        // under `source`, no `adapter` key) is source-of-truth corruption.
+        // evolve must fail loudly, not leave a lead "existing" with no data.
+        let mut state = LeadState::default();
+        let legacy = EventEnvelope {
+            envelope_version: 1,
+            id: Uuid::now_v7(),
+            stream: "lead/x".into(),
+            seq: 1,
+            event_type: event_type::INGESTED.into(),
+            schema_version: 1,
+            occurred_at: jiff::Timestamp::now(),
+            recorded_at: jiff::Timestamp::now(),
+            causation_id: None,
+            correlation_id: Uuid::now_v7(),
+            payload: serde_json::json!({
+                "dedupe_key": "tc:abc",
+                "identifiers": {"tc": "tc:abc"},
+                "source": "drop-in",
+                "raw_text": "body",
+                "extracted": {"title": "Engineer", "company": "Acme"}
+            }),
+        };
+        assert!(evolve(&mut state, &legacy).is_err());
+        // No partial state: the lead must not be left "existing" with no
+        // snapshot/adapter/url/raw_text.
+        assert!(!state.exists);
+        assert!(state.snapshot.is_none());
+        assert!(state.adapter.is_none());
+    }
+
+    #[test]
+    fn evolve_malformed_scored_payload_errors() {
+        let mut state = LeadState::default();
+        let ingested = ingested_envelope();
+        evolve(&mut state, &ingested).unwrap();
+
+        let malformed = EventEnvelope {
+            event_type: event_type::SCORED.into(),
+            seq: 2,
+            payload: serde_json::json!({"composite": "high"}),
+            ..ingested
+        };
+        assert!(evolve(&mut state, &malformed).is_err());
+        assert!(state.latest_score.is_none());
+    }
+
+    #[test]
+    fn evolve_malformed_reviewed_payload_errors() {
+        let mut state = LeadState::default();
+        let ingested = ingested_envelope();
+        evolve(&mut state, &ingested).unwrap();
+
+        let malformed = EventEnvelope {
+            event_type: event_type::REVIEWED.into(),
+            seq: 2,
+            payload: serde_json::json!({}),
+            ..ingested
+        };
+        assert!(evolve(&mut state, &malformed).is_err());
+        assert!(state.latest_mark.is_none());
     }
 
     #[test]
     fn evolve_scored_sets_latest_score() {
         let mut state = LeadState::default();
         let ingested = ingested_envelope();
-        evolve(&mut state, &ingested);
+        evolve(&mut state, &ingested).unwrap();
 
         let scored = EventEnvelope {
             event_type: event_type::SCORED.into(),
@@ -1215,7 +1305,7 @@ mod tests {
             }),
             ..ingested
         };
-        evolve(&mut state, &scored);
+        evolve(&mut state, &scored).unwrap();
 
         let score = state.latest_score.as_ref().unwrap();
         assert_eq!(score.composite, 75);
@@ -1228,7 +1318,7 @@ mod tests {
         // scored event (torn batch) must not keep an old score current.
         let mut state = LeadState::default();
         let ingested = ingested_envelope();
-        evolve(&mut state, &ingested);
+        evolve(&mut state, &ingested).unwrap();
 
         let scored = EventEnvelope {
             event_type: event_type::SCORED.into(),
@@ -1241,7 +1331,7 @@ mod tests {
             }),
             ..ingested.clone()
         };
-        evolve(&mut state, &scored);
+        evolve(&mut state, &scored).unwrap();
 
         let updated = EventEnvelope {
             event_type: event_type::UPDATED.into(),
@@ -1255,7 +1345,7 @@ mod tests {
             }),
             ..ingested
         };
-        evolve(&mut state, &updated);
+        evolve(&mut state, &updated).unwrap();
 
         assert!(state.latest_score.is_none());
     }
@@ -1286,14 +1376,14 @@ mod tests {
                 "extracted": {"title": "Engineer", "company": "Acme"}
             }),
         };
-        evolve(&mut state, &ingested);
+        evolve(&mut state, &ingested).unwrap();
         let reviewed = EventEnvelope {
             event_type: event_type::REVIEWED.into(),
             seq: 2,
             payload: serde_json::json!({"mark": "ignore"}),
             ..ingested
         };
-        evolve(&mut state, &reviewed);
+        evolve(&mut state, &reviewed).unwrap();
 
         let (kind, events) = decide_ingest(
             &state,
