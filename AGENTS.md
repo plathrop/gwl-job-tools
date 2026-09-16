@@ -61,11 +61,14 @@ These come from the spec and apply to every change:
   reviewer; Grey may also post folded third-party reviews (e.g., deepseek) as
   PR comments from their own account — treat those as review feedback, not as
   Grey's own inline comments.
-- **Merging**: GitHub disallows merge commits on this repo. Rebase the branch
-  onto `main` locally, force-push, then `gh pr merge <n> --rebase`. GitHub
-  auto-deletes the PR branch on merge; local cleanup is `git worktree remove`,
-  `git branch -d` (the "not fully merged" warning is expected — rebase-merge
-  rewrote the SHAs), and `git fetch --prune`.
+- **Merging**: commits must stay signed, and GitHub's rebase-and-merge
+  creates unsigned commits — never use `gh pr merge`. Merge locally
+  instead: rebase the branch onto `main` (in the worktree), force-push the
+  branch so GitHub sees the new commit IDs, then from the primary checkout
+  fast-forward `main` onto the branch (`git merge --ff-only <branch>`) and
+  push `main`. Pushing `main` auto-closes the PR and auto-deletes the remote
+  branch; local cleanup is `git worktree remove`, `git branch -d`, and
+  `git fetch --prune`.
 
 ## Observability
 
