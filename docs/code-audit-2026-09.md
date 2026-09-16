@@ -464,3 +464,58 @@ executing each step rather than trusting them verbatim.
 4. **The split:** H1 (with L8 decided alongside) — one PR. (M)
 5. **Small consistency:** M7, M8, M9, L2, L3 — one PR. (S)
 6. **UX + docs + tests:** M6-README, M10, L1, L7 — one PR. (S–M)
+
+---
+
+## Second pass — 2026-09-16
+
+Re-audited at `main` @ `22e4c5a`. Re-verified every finding above against the
+current tree: **all 24 findings remain open and valid** (line numbers shifted
+for M4/L4/L7; the cited lines still resolve). No finding was resolved by the
+intervening work — it was features, tests, and docs, not cleanup. The 6-PR
+execution order above is unchanged, with one note: L7 is now partly mitigated
+by the `list_json_output` subprocess test (company + status), but the
+`review_loop`/`filter_events` gaps and the full queue-entry row shape remain.
+
+New findings from the delta (the `--data-dir`/`--config` flags, the
+adapter/source change-tracking, the strict-replay hardening, and the new
+integration tests):
+
+### N1. `expand_tilde` mis-expands the `~user` form
+
+**Evidence:** `src/config.rs:9-17` — `strip_prefix("~")` turns `~user/foo`
+into `$HOME/user/foo`, not the `user` account's home (and not unchanged).
+Only `~` and `~/` expand correctly.
+
+**Recommendation:** expand only when the remainder is empty or starts with
+`/`; return the path unchanged otherwise. Impact negligible (config paths
+are `~/…` in practice). **Effort: S.**
+
+### N2. Integration-test replay bypasses `upcast` and envelope validation
+
+**Evidence:** `tests/cli_integration.rs:56-71` — the `projection()` helper
+re-implements the JSONL split/parse and calls `rebuild` directly, skipping
+`event_store::upcast` and the `envelope_version` check that the real
+`read_envelopes` performs. A regression in upcasting or envelope validation
+would not be caught by the in-process integration suite (the jsonl.rs unit
+tests do cover both, so the gap is narrow).
+
+**Recommendation:** note only — leave the read-only helper, or (if it ever
+churns) route it through a shared read-only parse. **Effort: S** if done.
+
+### N3. Subprocess coverage still misses review/package/events/completion
+
+**Evidence:** `tests/cli_output.rs` covers ingest/show/list/edit, the
+`--data-dir`/`--config` routing, and error paths, but not `review`,
+`package`, `events`, `completion`, or the `apply-automatically` mark →
+`apply_queued` flow. This extends L7 (unit-level) to the subprocess level.
+
+**Recommendation:** fold into the L7 work in execution step 6. **Effort: S–M.**
+
+### Checked and fine (delta)
+
+- `--data-dir` requires a pre-existing directory and `--config` a
+  pre-existing file, both deliberately (documented in the flag help).
+- Config/data separation is clean: `with_data_dir` replaces only the data
+  dir; `--config` bypasses config-dir derivation entirely.
+- "referrer" spelling is now consistent across the code and design doc 0001.
