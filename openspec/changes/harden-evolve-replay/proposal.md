@@ -19,6 +19,9 @@ and the latent data-integrity bug.
   - `reviewed` → `ReviewedPayload` (a missing/non-string `mark` becomes an
     error, matching the projection)
 - `commands::replay_lead` propagates the new error with `?`.
+- `Projection::rebuild`'s `reingest_suppressed` arm is hardened: it was the
+  one remaining lenient decode, silently skipping a malformed payload; it is
+  now a strict `SuppressedView` decode with a regression test.
 - Unknown event types remain ignored (forward compatibility) — unchanged.
 - No upcaster is added: the live corpus was verified clean (oldest event is
   one day after the source→adapter rename), so there are no legacy payloads
@@ -40,9 +43,13 @@ and the latent data-integrity bug.
 
 - `src/domain/lead.rs` — `evolve` signature and per-event-type decode paths.
 - `src/commands/mod.rs` — `replay_lead` propagates the new error.
+- `src/projections/mod.rs` — `reingest_suppressed` arm hardened from `if let
+  Ok` to a strict decode.
 - `src/domain/lead.rs` tests — update `evolve` call sites; add malformed-
   payload hard-error tests (legacy `source`-without-`adapter` snapshot,
   malformed `scored`, malformed `reviewed`).
+- `src/projections/mod.rs` tests — add a malformed `reingest_suppressed`
+  hard-error test.
 
 Behavior note: a log that previously degraded silently now refuses to replay.
 That is the intent — and already the projection's behavior — so a corrupt

@@ -3,9 +3,10 @@
 Two paths replay the event log into state, and they disagree on malformed
 payloads:
 
-- `Projection::rebuild` (`src/projections/mod.rs`) — the read model — already
-  decodes every known event type strictly: `serde_json::from_value::<T>(...)
-  .into_diagnostic().wrap_err(...)?` hard-errors with the event's id and seq.
+- `Projection::rebuild` (`src/projections/mod.rs`) — the read model — decodes
+  every known event type strictly (`serde_json::from_value::<T>(...)
+  .into_diagnostic().wrap_err(...)?`), except `reingest_suppressed`, which
+  still uses `if let Ok` and silently skips a malformed payload.
 - `lead::evolve` (`src/domain/lead.rs`) — the aggregate decide path, reached
   via `commands::replay_lead` — is lenient: `if let Ok(...)` swallows
   `SnapshotFields`/`ScoredPayload` decode failures, and sets `state.exists =
@@ -20,12 +21,14 @@ See proposal.md for the motivation.
 - Make `lead::evolve` fail loudly on malformed payloads, matching the
   projection's existing strict contract.
 - Leave no partial aggregate state behind on a decode failure.
+- Close the projection's one remaining lenient arm (`reingest_suppressed`),
+  so the "corruption is a hard error" contract is uniform across both replay
+  paths.
 
 **Non-Goals:**
 
 - No upcaster: the corpus was verified clean (oldest event is one day after
   the source→adapter rename), so no legacy payloads exist to migrate.
-- No change to the projection (`rebuild` is already strict).
 - No change to unknown-event-type handling (forward compatibility).
 
 ## Decisions
@@ -39,8 +42,10 @@ payload with the same strict pattern the projection uses
 the error instead of `if let Ok`.
 
 **Why:** the codebase's contract is already "corruption is a hard error"
-(jsonl.rs refuses a corrupt log; `rebuild` refuses malformed payloads).
-`evolve` is the one lenient holdout. Consistency demands it match.
+(jsonl.rs refuses a corrupt log; `rebuild` hard-errors on malformed
+payloads). `evolve` was lenient on the payload families it consumes — and
+the projection's `reingest_suppressed` arm was lenient too (decision 5) —
+so consistency demands both match the strict contract.
 
 **Alternatives considered:** warn-and-skip ("counted") was rejected — it
 would still leave `state.exists = true` with no snapshot (partial state), and
@@ -60,8 +65,9 @@ Decode into `SnapshotFields` (snapshot events), `ScoredPayload`, and
 `ReviewedPayload` — rather than hand-rolled field extraction. `rebuild` uses
 the same `ScoredPayload` and `ReviewedPayload` for those two families, but
 decodes the ingest family as `IngestView`, which additionally requires
-`dedupe_key`/`identifiers`; the aggregate uses `SnapshotFields`, which
-requires neither. The difference is intentional: the aggregate only needs
+`dedupe_key` (its `identifiers` field is `#[serde(default)]`); the aggregate
+uses `SnapshotFields`, which carries neither. The difference is intentional:
+the aggregate only needs
 the snapshot fields to decide, while the projection needs the identity
 fields to build its indexes. A snapshot missing `dedupe_key` passes `evolve`
 but is caught by `rebuild`, which runs first in every command, so the
@@ -78,6 +84,17 @@ for the families they both decode.
 The `_ => {}` arm is unchanged: an unrecognized `type` is forward-compatible
 data, not corruption. This is a spec requirement (see
 `specs/event-replay/spec.md`).
+
+### 5. Harden the projection's `reingest_suppressed` arm
+
+`rebuild` was strict on every known event type except `reingest_suppressed`,
+which still used `if let Ok` and silently skipped a malformed payload — the
+one hole in the "corruption is a hard error" contract this capability
+states. It is now a strict `SuppressedView` decode (matching the other
+arms), with a regression test. A silently skipped `reingest_suppressed`
+would drop the identifier indexing that makes durable-ignore stick across
+reposts, so the leniency was a real (if edge-case) gap, not just a
+stylistic one.
 
 ## Risks / Trade-offs
 

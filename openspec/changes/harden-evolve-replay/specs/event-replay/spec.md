@@ -35,6 +35,13 @@ projection instead.
 - **WHEN** a `reviewed` event's payload lacks a string `mark`
 - **THEN** replay fails with a hard error naming the event
 
+#### Scenario: Malformed suppressed payload fails replay
+
+- **WHEN** a `reingest_suppressed` event's payload lacks the required
+  `dedupe_key` (a type the aggregate does not consume)
+- **THEN** replay fails with a hard error naming the event, via the
+  read-model projection's validation
+
 ### Requirement: Unknown event types are ignored
 
 An event whose type this build does not recognize is forward-compatible

@@ -429,10 +429,19 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                     #[serde(default)]
                     identifiers: Identifiers,
                 }
-                if let Ok(view) = serde_json::from_value::<SuppressedView>(event.payload.clone()) {
-                    projection.dedupe_index.insert(view.dedupe_key, lead_id);
-                    index_identifiers(&mut projection, lead_id, &view.identifiers);
-                }
+                // Strict, like the other source-of-truth payloads: a
+                // malformed suppressed payload is corruption, not a skip —
+                // otherwise the durable-ignore index silently misses a form.
+                let view: SuppressedView = serde_json::from_value(event.payload.clone())
+                    .into_diagnostic()
+                    .map_err(|e| {
+                        e.wrap_err(format!(
+                            "decoding reingest_suppressed payload of event {} (seq {})",
+                            event.id, event.seq
+                        ))
+                    })?;
+                projection.dedupe_index.insert(view.dedupe_key, lead_id);
+                index_identifiers(&mut projection, lead_id, &view.identifiers);
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
                     record.event_count += 1;
                     record.last_event = event.recorded_at;
@@ -990,6 +999,29 @@ mod tests {
                 2,
                 event_type::APPLIED,
                 serde_json::json!({"note": 5}),
+            ),
+        ];
+        assert!(rebuild(&events).is_err());
+    }
+
+    #[test]
+    fn malformed_reingest_suppressed_payload_is_hard_error() {
+        // Strict, like the other source-of-truth payloads: a malformed
+        // suppressed payload must not be silently skipped — that would leave
+        // the durable-ignore index missing an identifier form.
+        let lead_id = Uuid::now_v7();
+        let events = vec![
+            envelope(
+                lead_id,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/j"), None),
+            ),
+            envelope(
+                lead_id,
+                2,
+                event_type::REINGEST_SUPPRESSED,
+                serde_json::json!({"suppressed_by_mark": "ignore"}),
             ),
         ];
         assert!(rebuild(&events).is_err());
