@@ -6,9 +6,6 @@ score, and puts it in a review queue — so you spend your attention on the
 high-value decision (which jobs to pursue), not the low-judgment work of
 sifting and scoring.
 
-v0 is fully deterministic: no LLM, no API keys, no network calls beyond
-fetching the posting you point it at.
-
 ## Install
 
 ```sh
@@ -88,10 +85,10 @@ defaults. All keys:
 
 ```toml
 compensation_floor = 180000 # reject below, USD/year
-compensation_ceiling = 400000
+compensation_ceiling = 400000 # leads at or above this score 100%
 remote_only = false # reject confident non-remote postings
 reject_location_only = false # treat location-only postings as non-remote
-blacklist = ["salesforce"] # never match these companies
+blacklist = ["initech"] # never match these companies
 target_companies = []
 
 [aliases] # skill synonyms
