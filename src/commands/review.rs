@@ -12,9 +12,11 @@ use super::{cheat_sheet, mark_lead, open_workspace};
 use crate::{
     cli::Mark,
     config::{AppPaths, Config},
+    domain::events::CheatSheetEntry,
     event_store::EventStore,
     projections::LeadRecord,
-    render, resume,
+    render,
+    resume::{self, Resume},
 };
 
 #[instrument(skip_all, fields(review.run_id))]
@@ -134,7 +136,7 @@ fn review_loop(
                     mark_lead(store, config, record, Mark::ApplyManual, None)?;
                     match resume::load(config.resume_path.as_deref()) {
                         Ok(resume) => {
-                            let sheet = resume.as_ref().map(cheat_sheet).unwrap_or_default();
+                            let sheet = manual_cheat_sheet(resume.as_ref());
                             print!("{}", render::render_cheat_sheet(&sheet));
                         }
                         Err(err) => warn!(error = %err, "could not load resume for cheat sheet"),
@@ -173,4 +175,40 @@ fn review_loop(
         }
     }
     Ok(())
+}
+
+/// The apply-manual cheat sheet: resume-derived when a resume loaded, empty
+/// otherwise. A missing/broken resume degrades to no answers — it never
+/// aborts the review session. Extracted so the degradation branch is
+/// directly testable (no terminal I/O).
+fn manual_cheat_sheet(resume: Option<&Resume>) -> Vec<CheatSheetEntry> {
+    resume.map(cheat_sheet).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_cheat_sheet_degrades_when_no_resume() {
+        // A missing/broken resume must not abort the session; it degrades
+        // to an empty answer set.
+        assert!(manual_cheat_sheet(None).is_empty());
+    }
+
+    #[test]
+    fn manual_cheat_sheet_delegates_when_resume_present() {
+        let resume = Resume {
+            basics: resume::Basics {
+                name: Some("Avery Example".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let sheet = manual_cheat_sheet(Some(&resume));
+        // `cheat_sheet` (tested in package.rs) fills the entries; here we
+        // confirm the Some path delegates rather than degrading.
+        assert_eq!(sheet.len(), 1);
+        assert_eq!(sheet[0].question, "Full name");
+    }
 }

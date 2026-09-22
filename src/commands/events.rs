@@ -103,4 +103,45 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn filter_events_type_filter_selects_only_matching_type() {
+        // L7: the `--type` filter path was untested (only lead-prefix
+        // resolution had coverage).
+        let lead = Uuid::new_v4();
+        let now = jiff::Timestamp::now();
+        let env = |stream: &str, event_type: &str| EventEnvelope {
+            envelope_version: crate::domain::events::ENVELOPE_VERSION,
+            id: Uuid::now_v7(),
+            stream: stream.to_string(),
+            seq: 1,
+            event_type: event_type.to_string(),
+            schema_version: 1,
+            occurred_at: now,
+            recorded_at: now,
+            causation_id: None,
+            correlation_id: Uuid::now_v7(),
+            payload: serde_json::json!({}),
+        };
+
+        let events = vec![
+            env(&format!("lead/{lead}"), "ingested"),
+            env(&format!("lead/{lead}"), "scored"),
+            env(&format!("lead/{lead}"), "reviewed"),
+        ];
+
+        // Type-only filter.
+        let scored = filter_events(&events, None, Some("scored"));
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].event_type, "scored");
+
+        // Combined lead + type filter: a scored event on another lead is
+        // excluded.
+        let other = Uuid::new_v4();
+        let mut mixed = events;
+        mixed.push(env(&format!("lead/{other}"), "scored"));
+        let filtered = filter_events(&mixed, Some(lead), Some("scored"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].stream, format!("lead/{lead}"));
+    }
 }

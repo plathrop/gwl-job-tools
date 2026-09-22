@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::{
     config::Config,
-    domain::{events::ExtractedFields, identity::slugify},
+    domain::{cached_regex, events::ExtractedFields, identity::slugify},
 };
 
 /// Gate identifiers, matching the `gate` enum on `rejected` payloads
@@ -118,9 +118,9 @@ pub fn evaluate(config: &Config, extracted: &ExtractedFields, raw_text: &str) ->
         }
         // Case-insensitive match on the ORIGINAL text: lowercasing can
         // change byte length (e.g. 'İ'), so offsets from a lowercased copy
-        // must never index the original string.
-        let re = regex::Regex::new(&format!("(?i){}", regex::escape(red_line)))
-            .expect("escaped pattern compiles");
+        // must never index the original string. Compiled once per red line
+        // (cached_regex), not per evaluate call.
+        let re = cached_regex(red_line, || format!("(?i){}", regex::escape(red_line)));
         if let Some(m) = re.find(raw_text) {
             let start = raw_text.floor_char_boundary(m.start());
             let end = raw_text.ceil_char_boundary((m.end() + 40).min(raw_text.len()));

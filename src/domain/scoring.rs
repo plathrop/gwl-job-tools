@@ -11,7 +11,10 @@ use std::collections::HashMap;
 
 use crate::{
     config::Config,
-    domain::events::{CompRange, DimensionScore, ExtractedFields},
+    domain::{
+        cached_regex,
+        events::{CompRange, DimensionScore, ExtractedFields},
+    },
 };
 
 /// The result of scoring a posting that passed all gates. `revision` is not
@@ -280,14 +283,15 @@ fn token_in(token: &str, text: &str) -> bool {
     }
     // The regex crate does not support look-around, so the boundaries are an
     // explicit group: the token must be preceded and followed by a
-    // non-alphanumeric character (or the start/end of the text).
-    let pattern = format!(
-        r"(?i)(?:^|[^[:alnum:]]){}(?:$|[^[:alnum:]])",
-        regex::escape(token)
-    );
-    regex::Regex::new(&pattern)
-        .map(|re| re.is_match(text))
-        .unwrap_or(false)
+    // non-alphanumeric character (or the start/end of the text). Compiled
+    // once per token (cached_regex), not per call.
+    let re = cached_regex(token, || {
+        format!(
+            r"(?i)(?:^|[^[:alnum:]]){}(?:$|[^[:alnum:]])",
+            regex::escape(token)
+        )
+    });
+    re.is_match(text)
 }
 
 // ── compensation ─────────────────────────────────────────────────

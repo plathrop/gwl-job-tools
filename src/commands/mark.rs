@@ -15,26 +15,38 @@ use crate::{
 };
 
 #[instrument(skip_all)]
-pub async fn execute_mark(args: MarkArgs, config: &Config, paths: &AppPaths) -> Result<()> {
+pub async fn execute_mark(
+    args: MarkArgs,
+    config: &Config,
+    paths: &AppPaths,
+    json: bool,
+) -> Result<()> {
     let (mut store, projection) = open_workspace(paths)?;
 
     let record = select_lead(&projection, &args.lead)?;
     let lead_id = record.lead_id;
     let apply = mark_lead(&mut store, config, record, args.mark, args.note)?;
 
-    let mut output = serde_json::json!({
-        "lead_id": lead_id,
-        "mark": args.mark.as_str(),
-    });
-    // Surface the prepared package (including the cheat sheet) so the user
-    // can see the answers while completing the opened form.
-    if let Some(package) = &apply {
-        output["package"] = serde_json::to_value(package).into_diagnostic()?;
+    if json {
+        let mut output = serde_json::json!({
+            "lead_id": lead_id,
+            "mark": args.mark.as_str(),
+        });
+        // Surface the prepared package (including the cheat sheet) so the
+        // user can see the answers while completing the opened form.
+        if let Some(package) = &apply {
+            output["package"] = serde_json::to_value(package).into_diagnostic()?;
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).into_diagnostic()?
+        );
+    } else {
+        // One-line confirmation (design doc §8): `mark` is scriptable like
+        // the outcome commands, whose human output is the bare lead id.
+        let prefix: String = lead_id.to_string().chars().take(8).collect();
+        println!("marked {prefix} {}", args.mark.as_str());
     }
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&output).into_diagnostic()?
-    );
     Ok(())
 }
 

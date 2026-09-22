@@ -459,7 +459,7 @@ pub async fn execute(
         Some(Commands::Outcome(args)) => commands::execute_outcome(args, paths).await,
         Some(Commands::Events(args)) => commands::execute_events(args, paths).await,
         Some(Commands::List(args)) => commands::execute_list(args, paths, json, color).await,
-        Some(Commands::Mark(args)) => commands::execute_mark(args, config, paths).await,
+        Some(Commands::Mark(args)) => commands::execute_mark(args, config, paths, json).await,
         Some(Commands::Edit(args)) => {
             commands::execute_edit(args, config, paths, json, color).await
         }

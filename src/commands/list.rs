@@ -72,3 +72,33 @@ pub async fn execute_list(args: ListArgs, paths: &AppPaths, json: bool, color: b
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::commands::test_support::*;
+
+    #[test]
+    fn queue_entry_serializes_the_json_row_shape() {
+        // L7: queue_entry/QueueEntry had no direct test of the JSON row
+        // shape.
+        let mut record = lead_record(Some("https://example.com/j"));
+        record.extracted.title = Some("Staff Engineer".into());
+        record.extracted.company = Some("Acme".into());
+        record.latest_mark = Some("defer".into());
+        record.deferral_count = 2;
+
+        let entry = queue_entry(3, &record);
+        let json = serde_json::to_value(&entry).unwrap();
+
+        assert_eq!(json["rank"], 3);
+        assert_eq!(json["title"], "Staff Engineer");
+        assert_eq!(json["company"], "Acme");
+        assert_eq!(json["deferral_count"], 2);
+        assert_eq!(json["mark"], "defer");
+        assert_eq!(json["status"], "deferred");
+        // composite and outcome are None → omitted (skip_serializing_none).
+        assert!(json.get("composite").is_none());
+        assert!(json.get("outcome").is_none());
+    }
+}
