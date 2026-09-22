@@ -340,6 +340,16 @@ pub struct MarkArgs {
     pub note: Option<String>,
 }
 
+/// `gwl-jobs discover` (OpenSpec change `discovery-ingestion`): run the
+/// discovery layer — fetch postings from feed sources and ingest them.
+#[derive(Clone, Debug, Args)]
+pub struct DiscoverArgs {
+    /// Run a single source (may name a disabled source; explicit naming is
+    /// the opt-in)
+    #[arg(long)]
+    pub source: Option<String>,
+}
+
 #[derive(Clone, Debug, Subcommand)]
 pub enum Commands {
     /// Fetch and ingest a job posting (URL or local file)
@@ -380,6 +390,9 @@ pub enum Commands {
 
     /// Interactively review the pending queue
     Review,
+
+    /// Discover and ingest postings from enabled feed sources
+    Discover(DiscoverArgs),
 
     /// Generate shell completions (bash, zsh, fish)
     Completion(CompletionArgs),
@@ -465,6 +478,9 @@ pub async fn execute(
         }
         Some(Commands::Package(args)) => commands::execute_package(args, config, paths, json).await,
         Some(Commands::Review) => commands::execute_review(config, paths, color).await,
+        Some(Commands::Discover(args)) => {
+            commands::execute_discover(args, config, paths, json).await
+        }
         Some(Commands::Completion(args)) => commands::execute_completion(args),
         None => Err(miette::miette!(
             "no command provided; run `{APP_NAME} --help`"
@@ -487,6 +503,7 @@ fn cmd_label(command: &Option<Commands>) -> &'static str {
         Some(Commands::Edit(_)) => "edit",
         Some(Commands::Package(_)) => "package",
         Some(Commands::Review) => "review",
+        Some(Commands::Discover(_)) => "discover",
         Some(Commands::Completion(_)) => "completion",
         None => "none",
     }
@@ -542,6 +559,18 @@ mod tests {
     fn parse_completion() {
         let cli = Cli::try_parse_from(["gwl-jobs", "completion"]).unwrap();
         assert_eq!(cli.command_name(), "completion");
+    }
+
+    #[test]
+    fn parse_discover() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "discover"]).unwrap();
+        assert_eq!(cli.command_name(), "discover");
+    }
+
+    #[test]
+    fn parse_discover_source_flag() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "discover", "--source", "remotive"]).unwrap();
+        assert_eq!(cli.command_name(), "discover");
     }
 
     #[test]

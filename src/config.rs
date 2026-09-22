@@ -85,6 +85,9 @@ pub struct Config {
     /// Telemetry on/off (decision 0005's precedence pattern: CLI > config
     /// > default off). `None` = not configured.
     pub telemetry: Option<crate::telemetry::TelemetryStatus>,
+    /// Discovery feed sources (OpenSpec change `discovery-ingestion`),
+    /// keyed by source name. Opt-in per source via `enabled`.
+    pub sources: HashMap<String, SourceConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -108,6 +111,16 @@ impl Default for ScoringWeights {
             remote: 1.0,
         }
     }
+}
+
+/// One discovery feed source's config (OpenSpec change
+/// `discovery-ingestion`). Sources are opt-in: fetched only when
+/// `enabled = true`. Per-source parameters (URL overrides, filters) land
+/// here as later adapters need them.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SourceConfig {
+    pub enabled: bool,
 }
 
 impl Config {
@@ -514,6 +527,56 @@ compensation = 0.4
         std::fs::write(
             config_dir.join(Config::FILE_NAME),
             "[scoring_weights]\nlevel = -0.5\n",
+        )
+        .unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        assert!(Config::load(&paths).is_err());
+    }
+
+    // ── Sources (discovery) ───────────────────────────────────────
+
+    #[test]
+    fn sources_default_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(dir.path().join("config"), dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        assert!(config.sources.is_empty());
+    }
+
+    #[test]
+    fn sources_parse_enabled_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(Config::FILE_NAME),
+            "[sources.remotive]\nenabled = true\n",
+        )
+        .unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        assert!(config.sources["remotive"].enabled);
+    }
+
+    #[test]
+    fn sources_disabled_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join(Config::FILE_NAME), "[sources.remotive]\n").unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        assert!(!config.sources["remotive"].enabled);
+    }
+
+    #[test]
+    fn sources_reject_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(Config::FILE_NAME),
+            "[sources.remotive]\nbogus = 1\n",
         )
         .unwrap();
         let paths = AppPaths::new(config_dir, dir.path().join("data"));

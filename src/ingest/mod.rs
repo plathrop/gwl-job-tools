@@ -28,6 +28,10 @@ const MAX_RETRIES: u32 = 1;
 pub struct FetchResponse {
     pub status: u16,
     pub retry_after: Option<String>,
+    /// The post-redirect final URL (reqwest follows redirects). A proxy link
+    /// (e.g. a board's redirect) lands elsewhere; that final URL is the
+    /// canonical posting URL the discovery layer needs for dedupe.
+    pub final_url: Option<String>,
     pub body: String,
 }
 
@@ -91,6 +95,7 @@ impl Fetcher for HttpFetcher {
             .await
             .map_err(|e| miette::Report::new(transport(e)))?;
         let status = response.status().as_u16();
+        let final_url = Some(response.url().to_string());
         let retry_after = response
             .headers()
             .get(reqwest::header::RETRY_AFTER)
@@ -103,6 +108,7 @@ impl Fetcher for HttpFetcher {
         Ok(FetchResponse {
             status,
             retry_after,
+            final_url,
             body,
         })
     }
@@ -164,6 +170,12 @@ impl<F: Fetcher> PoliteClient<F> {
             }
             return Ok(response);
         }
+    }
+
+    /// The raw response, including the post-redirect final URL. The HTML
+    /// path uses this to resolve proxy URLs to their canonical posting.
+    pub async fn get_response(&self, url: &Url) -> Result<FetchResponse> {
+        self.get(url).await
     }
 
     pub async fn get_text(&self, url: &Url) -> Result<String> {
@@ -266,10 +278,40 @@ async fn ingest_via_api<F: Fetcher>(
 }
 
 async fn ingest_via_html<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Result<IngestOutcome> {
-    let html = http
-        .get_text(url)
+    let response = http
+        .get_response(url)
         .await
         .wrap_err_with(|| format!("fetching {url}"))?;
+    let html = response.body;
+    // Resolve the canonical posting URL: a proxy URL (e.g. a board's
+    // redirect link) may land on the real ATS. Re-detect on the final URL so
+    // a proxy gets the same API-first treatment a direct URL does.
+    let final_url = response
+        .final_url
+        .as_deref()
+        .and_then(|s| Url::parse(s).ok())
+        .unwrap_or_else(|| url.clone());
+
+    if final_url != *url
+        && let Some(platform) = platforms::detect(&final_url)
+    {
+        match ingest_via_api(&final_url, platform, http).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) => {
+                // Only *shape* failures fall back (as in `ingest_url`);
+                // rate-limit/transport failures propagate.
+                if err.downcast_ref::<FetchError>().is_some() {
+                    return Err(err);
+                }
+                warn!(
+                    error = %err,
+                    platform = platform.source_name(),
+                    "API extraction after redirect failed; falling back to HTML"
+                );
+            }
+        }
+    }
+
     // Structured JSON-LD (embedded for SEO) beats readability on JS-rendered
     // boards like Ashby, where the visible page is a shell and readability
     // finds no article.
@@ -293,13 +335,13 @@ async fn ingest_via_html<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Resul
             return Ok(IngestOutcome {
                 adapter: "drop-in".into(),
                 source: "unknown".into(),
-                url: Some(url.to_string()),
+                url: Some(final_url.to_string()),
                 raw_text,
                 extracted,
             });
         }
     }
-    let (title, raw_text) = extract::extract_main_text(&html, url)?;
+    let (title, raw_text) = extract::extract_main_text(&html, &final_url)?;
     if raw_text.trim().is_empty() {
         bail!("no text could be extracted from {url}");
     }
@@ -314,7 +356,7 @@ async fn ingest_via_html<F: Fetcher>(url: &Url, http: &PoliteClient<F>) -> Resul
     Ok(IngestOutcome {
         adapter: "drop-in".into(),
         source: "unknown".into(),
-        url: Some(url.to_string()),
+        url: Some(final_url.to_string()),
         raw_text,
         extracted,
     })
@@ -399,6 +441,18 @@ mod tests {
             status,
             retry_after: retry_after.map(str::to_string),
             body: body.into(),
+            final_url: None,
+        }
+    }
+
+    /// A response whose post-redirect final URL differs from the requested
+    /// URL (what `HttpFetcher` produces when a proxy link redirects).
+    fn response_with_final_url(status: u16, body: &str, final_url: &str) -> FetchResponse {
+        FetchResponse {
+            status,
+            retry_after: None,
+            body: body.into(),
+            final_url: Some(final_url.into()),
         }
     }
 
@@ -594,6 +648,55 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(client.fetcher.calls().len(), 1);
+    }
+
+    // ── redirect-aware canonicalization ──────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn get_response_surfaces_post_redirect_final_url() {
+        let fetcher = ScriptedFetcher::with(vec![response_with_final_url(
+            200,
+            "html",
+            "https://boards.greenhouse.io/acme/jobs/123",
+        )]);
+        let client = client_with(fetcher);
+        let url = Url::parse("https://remotive.com/remote-jobs/acme/123").unwrap();
+
+        let response = client.get_response(&url).await.unwrap();
+
+        assert_eq!(
+            response.final_url.as_deref(),
+            Some("https://boards.greenhouse.io/acme/jobs/123")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn proxy_url_resolves_to_known_board_and_uses_api() {
+        let proxy = Url::parse("https://remotive.com/remote-jobs/acme/123").unwrap();
+        let canonical = "https://boards.greenhouse.io/acme/jobs/123";
+        let html = "<html><body>unused</body></html>";
+        let api_json = serde_json::json!({
+            "id": 123,
+            "title": "Staff Engineer",
+            "location": {"name": "Remote"},
+            "content": "<p>Salary: $200,000 - $250,000.</p>"
+        });
+        let fetcher = ScriptedFetcher::with(vec![
+            response_with_final_url(200, html, canonical),
+            response(200, None, &api_json.to_string()),
+        ]);
+        let client = client_with(fetcher);
+
+        let outcome = ingest_url(&proxy, &client).await.unwrap();
+
+        assert_eq!(outcome.adapter, "greenhouse");
+        assert_eq!(outcome.url.as_deref(), Some(canonical));
+        let calls = client.fetcher.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1],
+            "https://boards-api.greenhouse.io/v1/boards/acme/jobs/123"
+        );
     }
 
     // ── parse_retry_after ────────────────────────────────────────

@@ -5,6 +5,7 @@
 //! the command entry points for `cli::execute`.
 
 mod completion;
+mod discover;
 mod edit;
 mod events;
 mod ingest;
@@ -22,6 +23,7 @@ mod test_support;
 // structs/helpers that were `pub` before the split. A pure move must not
 // change the library surface, so these stay at their old `commands::*` paths.
 pub use completion::execute_completion;
+pub use discover::{BatchSummary, execute_discover, ingest_outcomes};
 pub use edit::{EditSpec, EditSummary, build_edit_spec, execute_edit, record_edit};
 pub use events::execute_events;
 pub use ingest::{IngestSummary, execute_ingest, record_ingest};
