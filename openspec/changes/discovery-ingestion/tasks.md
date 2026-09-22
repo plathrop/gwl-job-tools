@@ -14,11 +14,12 @@
 
 ## 4. Batch driver + `discover` command
 
-- [ ] 4.1 Add the `discover` subcommand to the CLI (runs all enabled sources; `--source <name>` runs one). Verify: `gwl-jobs discover --help` renders, and no-enabled-sources is a clean no-op with a message.
+- [ ] 4.1 Add the `discover` subcommand to the CLI (runs all enabled sources; `--source <name>` runs exactly that source). Verify: `gwl-jobs discover --help` renders; no-enabled-sources is a clean no-op with a message; an unknown `--source` name errors; and naming a disabled source runs it for that invocation.
 - [ ] 4.2 Implement the batch driver: fetch + extract postings without the writer lock, then acquire the lock once and loop `record_ingest`, re-projecting between postings. Verify: an integration test where two postings denote the same job produces exactly one lead stream (second is a re-ingest, not a duplicate).
 - [ ] 4.3 Make per-posting fetch/extract failures non-fatal: log with the URL, count as `failed`, continue the batch. Verify: a test with one dead posting among healthy ones continues and reports the failure.
-- [ ] 4.4 Emit the batch summary (new / updated / suppressed / rejected / failed) in human and `--json` output. Verify: a test asserts the summary counts match the events appended.
-- [ ] 4.5 Confirm idempotent re-runs and durable-ignore suppression through the discovery path. Verify: an integration test re-runs the same feed (no new leads) and one where a posting matches an `ignore`d lead (suppressed, not re-queued).
+- [ ] 4.4 Make a source-level fetch failure non-fatal: log with the source name, continue with the remaining enabled sources, and report the failed source in the summary. Verify: a two-source test where one source's fetch fails continues ingesting the other source's postings and reports the failure.
+- [ ] 4.5 Emit the batch summary (new / updated / suppressed / rejected / failed) in human and `--json` output. Verify: a test asserts the summary counts match the events appended.
+- [ ] 4.6 Confirm idempotent re-runs and durable-ignore suppression through the discovery path. Verify: an integration test re-runs the same feed (no new leads) and one where a posting matches an `ignore`d lead (suppressed, not re-queued).
 
 ## 5. Observability and finishing
 

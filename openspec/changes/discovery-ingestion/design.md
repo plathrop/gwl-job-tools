@@ -125,13 +125,16 @@ per-event fold that today lives inline in `rebuild`. Left as the documented
 scaling path (the seam exists: `append` returns the envelopes), not built
 now.
 
-### 6. Per-posting failures are logged and counted, not fatal
+### 6. Per-posting and per-source failures are non-fatal; store corruption is fatal
 
 One dead link must not kill a batch run. A posting whose fetch/extract fails
 is `warn!`-logged with its URL, counted in the summary as `failed`, and the
-loop continues. Store/consistency errors (lock failure, malformed log,
-projection corruption) abort the whole run — those are source-of-truth
-failures, not per-posting noise.
+loop continues. One level up, the same holds: a source whose fetch fails
+(feed down, malformed response, timeout) is logged with the source name, the
+run continues with the remaining enabled sources, and the failed source is
+reported in the summary. Store/consistency errors (lock failure, malformed
+log, projection corruption) abort the whole run — those are source-of-truth
+failures, not per-posting or per-source noise.
 
 ### 7. Config: opt-in `[sources.<name>]`
 
