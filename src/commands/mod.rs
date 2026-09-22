@@ -18,16 +18,17 @@ mod show;
 #[cfg(test)]
 mod test_support;
 
-// Public API: the command entry points `cli::execute` dispatches to.
+// Public API: the command entry points `cli::execute` dispatches to, plus the
+// structs/helpers that were `pub` before the split. A pure move must not
+// change the library surface, so these stay at their old `commands::*` paths.
 pub use completion::execute_completion;
-pub use edit::execute_edit;
+pub use edit::{EditSpec, EditSummary, build_edit_spec, execute_edit, record_edit};
 pub use events::execute_events;
-pub use ingest::execute_ingest;
-#[cfg(test)]
-pub(crate) use ingest::record_ingest;
-pub use list::execute_list;
+pub use ingest::{IngestSummary, execute_ingest, record_ingest};
+pub use list::{QueueEntry, execute_list};
 pub use mark::execute_mark;
-// Crate-visible seams shared across command modules.
+// Crate-visible seams shared across command modules (were `fn`/private before
+// the split; not part of the public API).
 pub(crate) use mark::mark_lead;
 use miette::{Result, miette};
 pub use outcome::{
