@@ -42,8 +42,8 @@ pub async fn execute_mark(
             serde_json::to_string_pretty(&output).into_diagnostic()?
         );
     } else {
-        // One-line confirmation (design doc §8): `mark` is scriptable like
-        // the outcome commands, whose human output is the bare lead id.
+        // One-line confirmation (design doc §8): `marked <prefix> <mark>`,
+        // where the prefix is the 8-char addressing handle (decision 0008).
         let prefix: String = lead_id.to_string().chars().take(8).collect();
         println!("marked {prefix} {}", args.mark.as_str());
     }
