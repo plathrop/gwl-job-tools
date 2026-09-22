@@ -25,3 +25,7 @@
 
 - [x] 5.1 Instrument per design.md: a span per source fetch and per posting ingest, `info!` run start/finish with summary counts, `warn!`/`error!` with the offending URL. Verify: manual run against a fixture feed shows the spans and summary in the log.
 - [x] 5.2 Run `cargo fmt`, `dprint fmt`, and `cargo clippy -- -D warnings` clean, and confirm the full `cargo test` suite passes. Verify: all three commands exit 0.
+
+## 6. Discovery run event
+
+- [x] 6.1 Add a `discovery` event type + payload; thread one run `correlation_id` through the batch's posting events; and append a `discovery` event recording the run summary. Verify: a test that a run appends the `discovery` event (correct stream + payload) with the run's `correlation_id` shared across all its posting events, and `openspec validate` passes.

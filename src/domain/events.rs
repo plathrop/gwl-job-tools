@@ -26,6 +26,9 @@ pub mod event_type {
     pub const SCORED: &str = "scored";
     pub const REVIEWED: &str = "reviewed";
     pub const APPLY_QUEUED: &str = "apply_queued";
+    // Discovery run record (openspec change discovery-ingestion): one per
+    // run, on a non-lead `discovery/<run_id>` stream.
+    pub const DISCOVERY: &str = "discovery";
 
     // User-recorded correction events (design doc 0001 §3; emitted by
     // `gwl-jobs edit`). The pipeline never emits them.
@@ -250,6 +253,20 @@ pub struct ScoredPayload {
     pub revision: u64,
     pub dimensions: Vec<DimensionScore>,
     pub breakdown: String,
+}
+
+/// Payload for the `discovery` event (openspec change discovery-ingestion):
+/// the summary of one discovery run, appended once per run on a non-lead
+/// `discovery/<run_id>` stream. `failed` counts postings whose fetch/extract
+/// failed; `failed_sources` names sources whose fetch failed entirely.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DiscoveryPayload {
+    pub new: u64,
+    pub updated: u64,
+    pub suppressed: u64,
+    pub rejected: u64,
+    pub failed: u64,
+    pub failed_sources: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

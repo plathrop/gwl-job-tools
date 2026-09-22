@@ -125,3 +125,15 @@ postings were new, updated, suppressed, rejected, and failed to ingest.
 - **WHEN** a discovery run completes
 - **THEN** the command outputs a summary carrying new, updated, suppressed,
   rejected, and failed counts
+
+### Requirement: Discovery records a run event
+
+A completed discovery run SHALL append a `discovery` event to the event
+log — on a stream distinct from lead streams — carrying the run's summary
+(new / updated / suppressed / rejected / failed, and any failed sources).
+
+#### Scenario: A run appends a discovery event
+
+- **WHEN** a discovery run completes
+- **THEN** a `discovery` event carrying the run summary is appended to the
+  event log

@@ -26,6 +26,7 @@ pub use completion::execute_completion;
 pub use discover::{BatchSummary, execute_discover, ingest_outcomes};
 pub use edit::{EditSpec, EditSummary, build_edit_spec, execute_edit, record_edit};
 pub use events::execute_events;
+pub(crate) use ingest::record_ingest_correlated;
 pub use ingest::{IngestSummary, execute_ingest, record_ingest};
 pub use list::{QueueEntry, execute_list};
 pub use mark::execute_mark;

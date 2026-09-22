@@ -5,12 +5,14 @@
 use miette::{IntoDiagnostic, Result, miette};
 use serde::Serialize;
 use tracing::{info, instrument};
+use uuid::Uuid;
 
-use super::{open_workspace, record_ingest};
+use super::{open_workspace, record_ingest_correlated};
 use crate::{
     cli::DiscoverArgs,
     config::{AppPaths, Config},
     discovery::{self, Posting},
+    domain::events::{DiscoveryPayload, PendingEvent, event_type},
     event_store::EventStore,
     ingest::{self, IngestOutcome},
     projections, resume,
@@ -43,6 +45,7 @@ pub async fn execute_discover(
         .unwrap_or_default();
 
     let client = ingest::default_client()?;
+    let run_id = Uuid::now_v7();
     let sources = discovery::build_sources(config, args.source.as_deref())?;
 
     if sources.is_empty() {
@@ -79,9 +82,11 @@ pub async fn execute_discover(
 
     // Acquire the single-writer lock only for the decide → append cycle.
     let (mut store, _projection) = open_workspace(paths)?;
-    let mut summary = ingest_outcomes(&mut store, config, &resume_skills, outcomes)?;
+    let mut summary =
+        ingest_outcomes_correlated(&mut store, config, &resume_skills, outcomes, run_id)?;
     summary.failed = failed_postings;
     summary.failed_sources = failed_sources;
+    append_discovery_event(&mut store, run_id, &summary)?;
 
     if json {
         println!(
@@ -120,6 +125,19 @@ pub fn ingest_outcomes(
     resume_skills: &[String],
     outcomes: Vec<(String, IngestOutcome)>,
 ) -> Result<BatchSummary> {
+    ingest_outcomes_correlated(store, config, resume_skills, outcomes, Uuid::now_v7())
+}
+
+/// `ingest_outcomes` with a caller-supplied run id: a discovery run shares
+/// one correlation id across all its posting events (and the trailing
+/// `discovery` event), so the whole run is one queryable unit in the log.
+fn ingest_outcomes_correlated(
+    store: &mut impl EventStore,
+    config: &Config,
+    resume_skills: &[String],
+    outcomes: Vec<(String, IngestOutcome)>,
+    run_id: Uuid,
+) -> Result<BatchSummary> {
     let mut summary = BatchSummary::default();
     for (source, mut outcome) in outcomes {
         outcome.source = source;
@@ -127,7 +145,8 @@ pub fn ingest_outcomes(
         // posting's appends must be visible before this one's identity lookup.
         let events = store.replay()?;
         let projection = projections::rebuild(&events)?;
-        let ingested = record_ingest(store, &projection, config, resume_skills, outcome)?;
+        let ingested =
+            record_ingest_correlated(store, &projection, config, resume_skills, outcome, run_id)?;
         if ingested.rejected.is_some() {
             summary.rejected += 1;
         } else {
@@ -140,6 +159,28 @@ pub fn ingest_outcomes(
         }
     }
     Ok(summary)
+}
+
+/// Append the run's `discovery` event: the durable record of the run's
+/// outcome, on a non-lead `discovery/<run_id>` stream (ignored by the lead
+/// projection), sharing the run's correlation id.
+fn append_discovery_event(
+    store: &mut impl EventStore,
+    run_id: Uuid,
+    summary: &BatchSummary,
+) -> Result<()> {
+    let payload = DiscoveryPayload {
+        new: summary.new,
+        updated: summary.updated,
+        suppressed: summary.suppressed,
+        rejected: summary.rejected,
+        failed: summary.failed,
+        failed_sources: summary.failed_sources.clone(),
+    };
+    let pending = PendingEvent::new(event_type::DISCOVERY, None, &payload)?;
+    store.append(&format!("discovery/{run_id}"), 0, &[pending], run_id)?;
+    info!(run_id = %run_id, "discovery run recorded");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -267,5 +308,49 @@ mod tests {
             ingest_outcomes(&mut store, &config, &[], vec![("remotive".into(), again)]).unwrap();
         assert_eq!(summary.suppressed, 1);
         assert_eq!(summary.new, 0);
+    }
+
+    // ── discovery run event ────────────────────────────────────
+
+    #[test]
+    fn run_appends_discovery_event_with_shared_correlation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
+        let config = Config::default();
+        let run_id = Uuid::now_v7();
+
+        let mut a = outcome_with_url("https://example.com/a");
+        a.extracted.remote = Some(true);
+        let mut b = outcome_with_url("https://example.com/b");
+        b.extracted.remote = Some(true);
+
+        let mut summary = ingest_outcomes_correlated(
+            &mut store,
+            &config,
+            &[],
+            vec![("remotive".into(), a), ("remotive".into(), b)],
+            run_id,
+        )
+        .unwrap();
+        summary.failed = 1;
+        summary.failed_sources = vec!["wwr".into()];
+        append_discovery_event(&mut store, run_id, &summary).unwrap();
+
+        let events = store.replay().unwrap();
+        // 2 leads × (ingested + scored) = 4, plus the discovery event = 5.
+        assert_eq!(events.len(), 5);
+        // Every event in the run shares the run's correlation id.
+        for e in &events {
+            assert_eq!(e.correlation_id, run_id);
+        }
+        let discovery = events
+            .iter()
+            .find(|e| e.event_type == event_type::DISCOVERY)
+            .expect("a discovery event");
+        assert_eq!(discovery.stream, format!("discovery/{run_id}"));
+        let payload: DiscoveryPayload = serde_json::from_value(discovery.payload.clone()).unwrap();
+        assert_eq!(payload.new, 2);
+        assert_eq!(payload.failed, 1);
+        assert_eq!(payload.failed_sources, vec!["wwr".to_string()]);
     }
 }

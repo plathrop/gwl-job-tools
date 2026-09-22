@@ -90,6 +90,27 @@ pub fn record_ingest(
     resume_skills: &[String],
     outcome: IngestOutcome,
 ) -> Result<IngestSummary> {
+    record_ingest_correlated(
+        store,
+        projection,
+        config,
+        resume_skills,
+        outcome,
+        Uuid::now_v7(),
+    )
+}
+
+/// `record_ingest` with a caller-supplied correlation id: a discovery run
+/// shares one correlation id across all its posting events and the trailing
+/// `discovery` event, so the whole run is one queryable unit in the log.
+pub fn record_ingest_correlated(
+    store: &mut impl EventStore,
+    projection: &Projection,
+    config: &Config,
+    resume_skills: &[String],
+    outcome: IngestOutcome,
+    correlation_id: Uuid,
+) -> Result<IngestSummary> {
     // Store the canonical URL (tracking params stripped) so re-ingests via
     // differently-tagged links don't record spurious `url` changes.
     let canonical_url = outcome
@@ -106,7 +127,6 @@ pub fn record_ingest(
         &outcome.raw_text,
     );
 
-    let correlation_id = Uuid::now_v7();
     let (lead_id, state) = match projection.lookup(&identity) {
         Some(lead_id) => (lead_id, replay_lead(store, lead_id)?),
         // Lead IDs are UUIDv4 (decision 0008): random, so short prefixes
