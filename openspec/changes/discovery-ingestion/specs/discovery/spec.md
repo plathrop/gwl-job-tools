@@ -85,6 +85,36 @@ re-added to the review queue.
 - **THEN** the posting is recorded as suppressed and does not re-enter the
   review queue
 
+### Requirement: A failed posting does not abort the run
+
+When a single posting's fetch or extraction fails, the `discover` command
+SHALL count it as `failed` and continue with the remaining postings. Store
+or event-log consistency failures SHALL abort the run.
+
+#### Scenario: One posting fails among healthy ones
+
+- **WHEN** one posting's fetch or extraction fails while other postings
+  ingest normally
+- **THEN** the run continues, counts the posting as `failed`, and reports it
+  in the summary
+
+#### Scenario: Store or event-log corruption aborts the run
+
+- **WHEN** a store or event-log consistency failure occurs during a run
+- **THEN** the run aborts rather than continuing with partial state
+
+### Requirement: A failed source does not abort the run
+
+When one enabled source's fetch fails (feed down, malformed response,
+timeout), the `discover` command SHALL report the source failure and
+continue fetching the remaining enabled sources.
+
+#### Scenario: One source fails, others run
+
+- **WHEN** one enabled source's fetch fails while another source is enabled
+- **THEN** the run continues with the remaining sources and reports the
+  failed source in the output or summary
+
 ### Requirement: Discovery reports a batch summary
 
 The `discover` command SHALL report the outcome of the run: how many

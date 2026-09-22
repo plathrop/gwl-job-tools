@@ -56,6 +56,10 @@ adapter.
   that lands on Greenhouse/Ashby/Lever/Workday gets the API-first path and
   records the canonical URL (not the proxy) in `IngestOutcome.url`.
 
+A proxy posting therefore costs two fetches — the HTML fetch that resolves
+the redirect, then the ATS API fetch after re-detection — and both go
+through `PoliteClient`, so each carries the 300ms politeness delay.
+
 *Alternative considered*: a composable `UrlResolver` trait at the adapter
 layer. Rejected — resolution is transport knowledge, and folding it into
 `ingest_url` also fixes the single-URL `ingest` command for any proxy link
@@ -136,11 +140,13 @@ failures, not per-posting noise.
 enabled = true
 ```
 
-Sources default to disabled; `discover` runs all enabled sources, and
-`discover --source remotive` runs one (for debugging). No sources enabled is
-a clean no-op. Paid sources later add credential/env wiring under the same
-table, keeping "never contact a service you haven't approved" as the
-default.
+Sources default to disabled. `discover` with no flag runs all enabled
+sources; `discover --source remotive` runs exactly that source for this
+invocation — explicit naming is itself the opt-in, so it may name a disabled
+source, and an unknown name is an error. No enabled sources (and no
+`--source`) is a clean no-op. Paid sources later add credential/env wiring
+under the same table, keeping "never contact a service you haven't
+approved" as the default.
 
 ## Observability
 

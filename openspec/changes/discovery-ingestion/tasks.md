@@ -1,6 +1,6 @@
 ## 1. Redirect-aware canonicalization (ingest layer)
 
-- [ ] 1.1 Capture the post-redirect final URL in `HttpFetcher::get` (read `Response::url()`) and surface it on the fetch result. Verify: a unit test with a scripted redirect asserts the final URL is returned, and existing `ingest` tests still pass.
+- [ ] 1.1 Capture the post-redirect final URL in `HttpFetcher::get` (read `Response::url()`) and surface it on the fetch result; update the `ScriptedFetcher` test mock and its `response()` helper for the new field. Verify: a unit test with a scripted redirect asserts the final URL is returned, and existing `ingest` tests still pass.
 - [ ] 1.2 Re-run `platforms::detect` on the resolved final URL in `ingest_url` and record the canonical (resolved) URL in `IngestOutcome.url`. Verify: a test that a proxy URL redirecting to `boards.greenhouse.io/...` ingests via the Greenhouse API (`adapter == "greenhouse"`) with the canonical URL recorded, not the proxy.
 
 ## 2. Discovery seam
