@@ -15,7 +15,7 @@ use crate::{
         lead::LeadState,
     },
     event_store::EventStore,
-    projections::{LeadRecord, Projection},
+    projections::LeadRecord,
 };
 
 /// Parse the `--at` flag: an RFC 3339 timestamp (e.g. 2026-08-15T00:00:00Z)
@@ -35,24 +35,23 @@ fn parse_occurred_at(s: &str) -> Result<Timestamp> {
     Ok(zoned.timestamp())
 }
 
-/// Resolve a lead by prefix and append one user-recorded outcome event to its
-/// stream. Returns the lead id.
+/// Append one user-recorded outcome event to `lead_id`'s stream. The caller
+/// resolves the `<lead>` argument once, so a bad prefix is reported by the
+/// command that owns the argument rather than re-resolved here.
 fn record_outcome(
     store: &mut impl EventStore,
-    projection: &Projection,
-    prefix: &str,
+    lead_id: Uuid,
     event_type: &'static str,
     payload: OutcomePayload,
     occurred_at: Option<Timestamp>,
-) -> Result<Uuid> {
-    let lead_id = select_lead(projection, prefix)?.lead_id;
+) -> Result<()> {
     let stream = LeadState::stream_id(lead_id);
     let state = replay_lead(store, lead_id)?;
     let mut pending = PendingEvent::new(event_type, None, &payload)?;
     pending.occurred_at = occurred_at;
     store.append(&stream, state.seq, &[pending], Uuid::now_v7())?;
     info!(%lead_id, event_type, "outcome recorded");
-    Ok(lead_id)
+    Ok(())
 }
 
 #[instrument(skip_all)]
@@ -64,10 +63,9 @@ pub async fn execute_applied(args: AppliedArgs, paths: &AppPaths) -> Result<()> 
     // enough after a review mark. An explicit --method still wins.
     let record = select_lead(&projection, &args.lead)?;
     let method = resolve_apply_method(record, args.method);
-    let lead_id = record_outcome(
+    record_outcome(
         &mut store,
-        &projection,
-        &args.lead,
+        record.lead_id,
         event_type::APPLIED,
         OutcomePayload {
             method,
@@ -76,7 +74,7 @@ pub async fn execute_applied(args: AppliedArgs, paths: &AppPaths) -> Result<()> 
         },
         occurred_at,
     )?;
-    println!("{lead_id}");
+    println!("{}", record.lead_id);
     Ok(())
 }
 
@@ -94,10 +92,10 @@ fn resolve_apply_method(record: &LeadRecord, method: Option<ApplyMethod>) -> Opt
 pub async fn execute_screened(args: ScreenedArgs, paths: &AppPaths) -> Result<()> {
     let (mut store, projection) = open_workspace(paths)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
-    let lead_id = record_outcome(
+    let lead_id = select_lead(&projection, &args.lead)?.lead_id;
+    record_outcome(
         &mut store,
-        &projection,
-        &args.lead,
+        lead_id,
         event_type::SCREENED,
         OutcomePayload {
             contact: args.contact,
@@ -114,10 +112,10 @@ pub async fn execute_screened(args: ScreenedArgs, paths: &AppPaths) -> Result<()
 pub async fn execute_interviewed(args: InterviewedArgs, paths: &AppPaths) -> Result<()> {
     let (mut store, projection) = open_workspace(paths)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
-    let lead_id = record_outcome(
+    let lead_id = select_lead(&projection, &args.lead)?.lead_id;
+    record_outcome(
         &mut store,
-        &projection,
-        &args.lead,
+        lead_id,
         event_type::INTERVIEWED,
         OutcomePayload {
             stage: args.stage,
@@ -134,10 +132,10 @@ pub async fn execute_interviewed(args: InterviewedArgs, paths: &AppPaths) -> Res
 pub async fn execute_offered(args: OfferedArgs, paths: &AppPaths) -> Result<()> {
     let (mut store, projection) = open_workspace(paths)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
-    let lead_id = record_outcome(
+    let lead_id = select_lead(&projection, &args.lead)?.lead_id;
+    record_outcome(
         &mut store,
-        &projection,
-        &args.lead,
+        lead_id,
         event_type::OFFERED,
         OutcomePayload {
             note: args.note,
@@ -159,10 +157,10 @@ pub async fn execute_outcome(args: OutcomeArgs, paths: &AppPaths) -> Result<()> 
     }
     let (mut store, projection) = open_workspace(paths)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
-    let lead_id = record_outcome(
+    let lead_id = select_lead(&projection, &args.lead)?.lead_id;
+    record_outcome(
         &mut store,
-        &projection,
-        &args.lead,
+        lead_id,
         args.outcome.as_str(),
         OutcomePayload {
             note: args.note,
@@ -201,11 +199,9 @@ mod tests {
         let summary =
             record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
 
-        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
-        let lead_id = record_outcome(
+        record_outcome(
             &mut store,
-            &projection,
-            &summary.lead_id.to_string(),
+            summary.lead_id,
             event_type::APPLIED,
             OutcomePayload {
                 method: Some("manual".into()),
@@ -214,7 +210,6 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(lead_id, summary.lead_id);
 
         let events = store.replay().unwrap();
         assert_eq!(events.len(), 3);
@@ -233,12 +228,10 @@ mod tests {
         let summary =
             record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
 
-        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         let at = "2026-08-15T00:00:00Z".parse::<Timestamp>().unwrap();
         record_outcome(
             &mut store,
-            &projection,
-            &summary.lead_id.to_string(),
+            summary.lead_id,
             event_type::APPLIED,
             OutcomePayload::default(),
             Some(at),
@@ -369,11 +362,9 @@ mod tests {
         let summary =
             record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
 
-        let projection = projections::rebuild(&store.replay().unwrap()).unwrap();
         record_outcome(
             &mut store,
-            &projection,
-            &summary.lead_id.to_string(),
+            summary.lead_id,
             event_type::ARCHIVED,
             OutcomePayload {
                 note: Some("dead req".into()),

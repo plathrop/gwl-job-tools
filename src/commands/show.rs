@@ -9,7 +9,7 @@ use crate::{cli::ShowArgs, config::AppPaths, event_store::EventStore, render};
 pub async fn execute_show(args: ShowArgs, paths: &AppPaths, json: bool, color: bool) -> Result<()> {
     let (store, projection) = open_workspace(paths)?;
 
-    let record = select_lead(&projection, &args.id)?;
+    let record = select_lead(&projection, &args.lead)?;
     if args.jd {
         match load_raw_text(&store, record.lead_id)? {
             Some(text) => println!("{text}"),

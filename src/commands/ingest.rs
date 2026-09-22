@@ -166,11 +166,7 @@ pub fn record_ingest(
 
     Ok(IngestSummary {
         lead_id,
-        kind: match &kind {
-            IngestKind::New => "ingested",
-            IngestKind::Updated { .. } => "updated",
-            IngestKind::Suppressed => "reingest_suppressed",
-        },
+        kind: kind.as_str(),
         changed: match &kind {
             IngestKind::Updated { changed } => Some(changed.clone()),
             _ => None,

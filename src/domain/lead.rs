@@ -136,6 +136,18 @@ pub enum IngestKind {
     Suppressed,
 }
 
+impl IngestKind {
+    /// The event-log kind string this decision corresponds to (the `kind`
+    /// field on the `--json` ingest summary).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IngestKind::New => "ingested",
+            IngestKind::Updated { .. } => "updated",
+            IngestKind::Suppressed => "reingest_suppressed",
+        }
+    }
+}
+
 /// Decide the events for an ingest, given the replayed state of the matched
 /// stream (default state = no match, i.e. a new lead).
 ///

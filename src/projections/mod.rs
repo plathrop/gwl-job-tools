@@ -167,6 +167,15 @@ pub struct Projection {
     dedupe_index: HashMap<String, Uuid>,
 }
 
+/// Composite score descending, first-seen ascending — the single ranking
+/// order shared by `ranked_leads` and `pending_queue` (one sort, so the two
+/// cannot drift; PR #16 review).
+fn by_rank(a: &&LeadRecord, b: &&LeadRecord) -> std::cmp::Ordering {
+    let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
+    let sb = b.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
+    sb.cmp(&sa).then_with(|| a.first_seen.cmp(&b.first_seen))
+}
+
 impl Projection {
     /// Match an incoming posting's identity against the index (design doc
     /// §2): `req:` and `url:` hits always match, checked in precedence
@@ -226,11 +235,7 @@ impl Projection {
     /// cannot drift (PR #16 review).
     pub fn ranked_leads(&self) -> Vec<&LeadRecord> {
         let mut leads: Vec<&LeadRecord> = self.leads.values().collect();
-        leads.sort_by(|a, b| {
-            let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
-            let sb = b.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
-            sb.cmp(&sa).then_with(|| a.first_seen.cmp(&b.first_seen))
-        });
+        leads.sort_by(by_rank);
         leads
     }
 
@@ -271,11 +276,7 @@ impl Projection {
                     }
             })
             .collect();
-        pending.sort_by(|a, b| {
-            let sa = a.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
-            let sb = b.latest_score.as_ref().map(|s| s.composite).unwrap_or(0);
-            sb.cmp(&sa).then_with(|| a.first_seen.cmp(&b.first_seen))
-        });
+        pending.sort_by(by_rank);
         pending
     }
 }

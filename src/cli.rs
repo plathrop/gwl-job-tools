@@ -55,7 +55,7 @@ impl LeadSource {
 #[derive(Clone, Debug, Args)]
 pub struct ShowArgs {
     /// Unambiguous UUID prefix of the lead
-    pub id: String,
+    pub lead: String,
     /// Print the raw posting text (the JD) instead of the card
     #[arg(long)]
     pub jd: bool,
@@ -435,23 +435,7 @@ impl Cli {
     }
 
     pub fn command_name(&self) -> &'static str {
-        match self.command.as_ref() {
-            Some(Commands::Ingest(_)) => "ingest",
-            Some(Commands::Show(_)) => "show",
-            Some(Commands::Applied(_)) => "applied",
-            Some(Commands::Screened(_)) => "screened",
-            Some(Commands::Interviewed(_)) => "interviewed",
-            Some(Commands::Offered(_)) => "offered",
-            Some(Commands::Outcome(_)) => "outcome",
-            Some(Commands::Events(_)) => "events",
-            Some(Commands::List(_)) => "list",
-            Some(Commands::Mark(_)) => "mark",
-            Some(Commands::Edit(_)) => "edit",
-            Some(Commands::Package(_)) => "package",
-            Some(Commands::Review) => "review",
-            Some(Commands::Completion(_)) => "completion",
-            None => "none",
-        }
+        cmd_label(&self.command)
     }
 }
 
