@@ -228,6 +228,15 @@ impl AppPaths {
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
+
+    /// The append-only event log path (design doc 0001 §1): the single
+    /// source for where the JSONL source of truth lives. Commands must open
+    /// the log through this rather than constructing
+    /// `<data_dir>/events.jsonl` themselves, so the filename exists in
+    /// exactly one place.
+    pub fn event_log(&self) -> PathBuf {
+        self.data_dir.join("events.jsonl")
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +263,36 @@ mod tests {
         assert_eq!(
             paths.data_dir(),
             Path::new("/home/user/.local/share/gwl-jobs")
+        );
+    }
+
+    #[test]
+    fn event_log_joins_data_dir_with_log_name() {
+        // The event log is the append-only source of truth; its filename
+        // lives here so no command hardcodes it (design doc 0001 §1).
+        let paths = AppPaths::new(
+            PathBuf::from("/home/user/.config/gwl-jobs"),
+            PathBuf::from("/home/user/.local/share/gwl-jobs"),
+        );
+        assert_eq!(
+            paths.event_log(),
+            Path::new("/home/user/.local/share/gwl-jobs/events.jsonl")
+        );
+    }
+
+    #[test]
+    fn event_log_follows_data_dir_override() {
+        // The `--data-dir` override must move the event log with it — the
+        // corpus (log) and the log file live under the data dir, while the
+        // config dir stays put.
+        let paths = AppPaths::new(
+            PathBuf::from("/home/user/.config/gwl-jobs"),
+            PathBuf::from("/home/user/.local/share/gwl-jobs"),
+        );
+        let overridden = paths.with_data_dir(PathBuf::from("/corpus/alt"));
+        assert_eq!(
+            overridden.event_log(),
+            Path::new("/corpus/alt/events.jsonl")
         );
     }
 

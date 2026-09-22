@@ -39,7 +39,17 @@ use crate::{
     resume::{self, Resume},
 };
 
-const EVENT_LOG_NAME: &str = "events.jsonl";
+/// Open the event log and rebuild the projection — the read side every
+/// lead-addressed command shares (design doc 0001 §1). Returns the open
+/// store (bind it `mut` to append) and the freshly rebuilt projection.
+/// `execute_events` is the lone exception: it needs the raw events, not a
+/// projection, so it opens the store directly.
+fn open_workspace(paths: &AppPaths) -> Result<(JsonlEventStore, Projection)> {
+    let store = JsonlEventStore::open(paths.event_log())?;
+    let events = store.replay()?;
+    let projection = projections::rebuild(&events)?;
+    Ok((store, projection))
+}
 
 #[instrument(skip_all)]
 pub async fn execute_ingest(
@@ -77,9 +87,7 @@ pub async fn execute_ingest(
     outcome.source = args.source.unwrap_or_default().as_str().to_string();
 
     // Acquire the lock only for the fast read → decide → append cycle.
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let events = store.replay()?;
-    let projection = projections::rebuild(&events)?;
+    let (mut store, projection) = open_workspace(paths)?;
 
     let summary = record_ingest(&mut store, &projection, config, &resume_skills, outcome)?;
     if json {
@@ -239,9 +247,7 @@ pub struct IngestSummary {
 
 #[instrument(skip_all)]
 pub async fn execute_show(args: ShowArgs, paths: &AppPaths, json: bool, color: bool) -> Result<()> {
-    let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let events = store.replay()?;
-    let projection = projections::rebuild(&events)?;
+    let (store, projection) = open_workspace(paths)?;
 
     let record = select_lead(&projection, &args.id)?;
     if args.jd {
@@ -317,9 +323,9 @@ fn queue_entry(rank: usize, record: &LeadRecord) -> QueueEntry {
 
 #[instrument(skip_all)]
 pub async fn execute_list(args: ListArgs, paths: &AppPaths, json: bool, color: bool) -> Result<()> {
-    let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let events = store.replay()?;
-    let projection = projections::rebuild(&events)?;
+    // `list` only reads the projection, so the store (and its single-writer
+    // lock) can be released as soon as the projection is built.
+    let (_, projection) = open_workspace(paths)?;
 
     // The default view is the active pipeline (design doc 0002): every lead
     // that is neither terminal nor durably ignored — pending, deferred,
@@ -352,9 +358,7 @@ pub async fn execute_list(args: ListArgs, paths: &AppPaths, json: bool, color: b
 
 #[instrument(skip_all)]
 pub async fn execute_mark(args: MarkArgs, config: &Config, paths: &AppPaths) -> Result<()> {
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let events = store.replay()?;
-    let projection = projections::rebuild(&events)?;
+    let (mut store, projection) = open_workspace(paths)?;
 
     let record = select_lead(&projection, &args.lead)?;
     let lead_id = record.lead_id;
@@ -432,9 +436,7 @@ pub async fn execute_edit(
         .map(resume::Resume::keywords)
         .unwrap_or_default();
 
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let events = store.replay()?;
-    let projection = projections::rebuild(&events)?;
+    let (mut store, projection) = open_workspace(paths)?;
 
     let record = select_lead(&projection, &args.lead)?;
     let spec = build_edit_spec(record, &args)?;
@@ -742,9 +744,7 @@ pub async fn execute_package(
     paths: &AppPaths,
     json: bool,
 ) -> Result<()> {
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let events = store.replay()?;
-    let projection = projections::rebuild(&events)?;
+    let (mut store, projection) = open_workspace(paths)?;
 
     let record = select_lead(&projection, &args.lead)?;
     let lead_id = record.lead_id;
@@ -848,9 +848,7 @@ pub async fn execute_review(config: &Config, paths: &AppPaths, color: bool) -> R
     let run_id = Uuid::now_v7();
     tracing::Span::current().record("review.run_id", run_id.to_string());
 
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let events = store.replay()?;
-    let projection = projections::rebuild(&events)?;
+    let (mut store, projection) = open_workspace(paths)?;
     let pending = projection.pending_queue();
     debug!(pending = pending.len(), %run_id, "review session");
 
@@ -1184,8 +1182,7 @@ fn record_outcome(
 
 #[instrument(skip_all)]
 pub async fn execute_applied(args: AppliedArgs, paths: &AppPaths) -> Result<()> {
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let projection = projections::rebuild(&store.replay()?)?;
+    let (mut store, projection) = open_workspace(paths)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
     // The method defaults from the lead's apply mark (design doc 0002): the
     // mark recorded which flow was chosen, so `gwl-jobs applied <lead>` is
@@ -1220,8 +1217,7 @@ fn resolve_apply_method(record: &LeadRecord, method: Option<ApplyMethod>) -> Opt
 
 #[instrument(skip_all)]
 pub async fn execute_screened(args: ScreenedArgs, paths: &AppPaths) -> Result<()> {
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let projection = projections::rebuild(&store.replay()?)?;
+    let (mut store, projection) = open_workspace(paths)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
     let lead_id = record_outcome(
         &mut store,
@@ -1241,8 +1237,7 @@ pub async fn execute_screened(args: ScreenedArgs, paths: &AppPaths) -> Result<()
 
 #[instrument(skip_all)]
 pub async fn execute_interviewed(args: InterviewedArgs, paths: &AppPaths) -> Result<()> {
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let projection = projections::rebuild(&store.replay()?)?;
+    let (mut store, projection) = open_workspace(paths)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
     let lead_id = record_outcome(
         &mut store,
@@ -1262,8 +1257,7 @@ pub async fn execute_interviewed(args: InterviewedArgs, paths: &AppPaths) -> Res
 
 #[instrument(skip_all)]
 pub async fn execute_offered(args: OfferedArgs, paths: &AppPaths) -> Result<()> {
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let projection = projections::rebuild(&store.replay()?)?;
+    let (mut store, projection) = open_workspace(paths)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
     let lead_id = record_outcome(
         &mut store,
@@ -1288,8 +1282,7 @@ pub async fn execute_outcome(args: OutcomeArgs, paths: &AppPaths) -> Result<()> 
     if args.reason.is_some() && args.outcome != OutcomeType::Archived {
         bail!("--reason is only valid for 'archived'");
     }
-    let mut store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
-    let projection = projections::rebuild(&store.replay()?)?;
+    let (mut store, projection) = open_workspace(paths)?;
     let occurred_at = args.at.as_deref().map(parse_occurred_at).transpose()?;
     let lead_id = record_outcome(
         &mut store,
@@ -1310,7 +1303,7 @@ pub async fn execute_outcome(args: OutcomeArgs, paths: &AppPaths) -> Result<()> 
 
 #[instrument(skip_all)]
 pub async fn execute_events(args: EventsArgs, paths: &AppPaths) -> Result<()> {
-    let store = JsonlEventStore::open(paths.data_dir().join(EVENT_LOG_NAME))?;
+    let store = JsonlEventStore::open(paths.event_log())?;
     let events = store.replay()?;
     // Resolve the lead prefix once (unambiguous, like the other lead-addressed
     // commands) so a short/empty prefix can't silently mix unrelated leads.
@@ -1944,7 +1937,7 @@ mod tests {
         // emits all matching streams and silently succeeds on no match.
         // The prefix must resolve once, with the zero/multiple-match errors.
         let dir = tempfile::tempdir().unwrap();
-        let mut store = JsonlEventStore::open(dir.path().join(EVENT_LOG_NAME)).unwrap();
+        let mut store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
         let mut projection = projections::rebuild(&[]).unwrap();
         for _ in 0..2 {
             let mut o = outcome("body");
