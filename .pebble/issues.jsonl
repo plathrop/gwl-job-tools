@@ -337,3 +337,6 @@
 {"type":"update","issueId":"GWLJ-a0ebld","timestamp":"2026-09-22T19:29:44.764Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-4yizte","timestamp":"2026-09-22T19:29:44.764Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
 {"type":"close","issueId":"GWLJ-4png30","timestamp":"2026-09-22T19:33:08.874Z","data":{"reason":"Code audit complete: all 6 execution steps shipped via PRs #27-#33, all 27 findings resolved. H1 split commands/mod.rs into 10 per-command modules; H2/H3 collapsed store+projection boilerplate; M7/M8/M9/L2/L3 consistency; M6 README, M10 mark --json, L1 compile-once regex cache, L7 test gaps. 340 unit + 14 integration tests green; clippy/fmt/dprint clean."},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-5vx5wd","timestamp":"2026-09-22T19:34:48.890Z","data":{"status":"open"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-32p6d0","timestamp":"2026-09-22T19:35:01.787Z","data":{"status":"open"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-xltolc","timestamp":"2026-09-22T19:35:11.277Z","data":{"status":"open"},"source":"gwl-job-tools"}
