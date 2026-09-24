@@ -340,3 +340,6 @@
 {"type":"update","issueId":"GWLJ-5vx5wd","timestamp":"2026-09-22T19:34:48.890Z","data":{"status":"open"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-32p6d0","timestamp":"2026-09-22T19:35:01.787Z","data":{"status":"open"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-xltolc","timestamp":"2026-09-22T19:35:11.277Z","data":{"status":"open"},"source":"gwl-job-tools"}
+{"type":"comment","issueId":"GWLJ-j5ss4c","timestamp":"2026-09-24T18:17:38.643Z","data":{"text":"Done in  17e7aad","timestamp":"2026-09-24T18:17:38.643Z"},"source":"gwl-job-tools"}
+{"type":"close","issueId":"GWLJ-j5ss4c","timestamp":"2026-09-24T18:17:43.144Z","data":{},"source":"gwl-job-tools"}
+{"type":"close","issueId":"GWLJ-a0ebld","timestamp":"2026-09-24T18:27:28.174Z","data":{"reason":"discovery-ingestion implemented and shipped (PRs #34 + #35): discovery layer, Remotive adapter, and the discovery run event with shared correlation id."},"source":"gwl-job-tools"}
