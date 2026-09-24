@@ -174,17 +174,17 @@ Imports must be at the **top level** (top of the file), except:
 
 - `cargo fmt` (rustfmt) for Rust.
 - `dprint fmt` for Markdown, TOML, YAML, and JSON.
-- `cargo clippy -- -D warnings` must pass.
+- `cargo clippy --all-targets -- -D warnings` must pass.
 
 ## Commands
 
-| Command                       | Purpose           |
-| ----------------------------- | ----------------- |
-| `cargo check`                 | Type-check        |
-| `cargo test`                  | Run tests         |
-| `cargo clippy -- -D warnings` | Lint (must pass)  |
-| `cargo fmt --check`           | Verify formatting |
-| `cargo build`                 | Build             |
+| Command                                     | Purpose           |
+| ------------------------------------------- | ----------------- |
+| `cargo check`                               | Type-check        |
+| `cargo test`                                | Run tests         |
+| `cargo clippy --all-targets -- -D warnings` | Lint (must pass)  |
+| `cargo fmt --check`                         | Verify formatting |
+| `cargo build`                               | Build             |
 
 ## OpenSpec
 

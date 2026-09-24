@@ -7,6 +7,7 @@ use std::{future::Future, pin::Pin};
 
 use miette::{Context, IntoDiagnostic, Result, miette};
 use serde_json::Value;
+use tracing::debug;
 use url::Url;
 
 use super::{DiscoverySource, Posting};
@@ -33,11 +34,14 @@ impl Remotive {
             .and_then(Value::as_array)
             .ok_or_else(|| miette!("remotive API response missing jobs array (shape changed?)"))?;
         let mut postings = Vec::with_capacity(jobs.len());
+        let mut skipped = 0;
         for job in jobs {
             let Some(url) = job.get("url").and_then(Value::as_str) else {
+                skipped += 1;
                 continue;
             };
             let Ok(url) = Url::parse(url) else {
+                skipped += 1;
                 continue;
             };
             postings.push(Posting {
@@ -58,6 +62,12 @@ impl Remotive {
                 remote: None,
                 req_id: None,
             });
+        }
+        if skipped > 0 {
+            debug!(
+                skipped,
+                "remotive postings skipped (missing or unparseable url)"
+            );
         }
         Ok(postings)
     }

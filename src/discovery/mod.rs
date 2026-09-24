@@ -12,7 +12,7 @@ pub mod remotive;
 use std::{future::Future, pin::Pin};
 
 use miette::{Result, miette};
-use tracing::{debug, instrument, warn};
+use tracing::{Instrument, debug, instrument, warn};
 use url::Url;
 
 use crate::{
@@ -64,7 +64,8 @@ pub async fn fetch_sources(
 ) -> Vec<SourceFetch> {
     let mut fetches = Vec::with_capacity(sources.len());
     for (name, source) in sources {
-        match source.postings(client).await {
+        let span = tracing::info_span!("source_fetch", source = %name);
+        match source.postings(client).instrument(span).await {
             Ok(postings) => {
                 debug!(source = %name, count = postings.len(), "source fetched");
                 fetches.push(SourceFetch {
@@ -194,7 +195,7 @@ mod tests {
     }
 
     #[test]
-    fn build_sources_runs_only_enabled() {
+    fn build_sources_enabled_unknown_source_errors() {
         let mut config = config_with("remotive", false);
         config.sources.insert(
             "wwr".to_string(),
@@ -220,7 +221,7 @@ mod tests {
             let postings = self.postings.clone();
             Box::pin(async move {
                 if fail {
-                    bail!("feed down")
+                    bail!("feed down");
                 } else {
                     Ok(postings)
                 }
