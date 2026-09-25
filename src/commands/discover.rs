@@ -13,7 +13,7 @@ use crate::{
     config::{AppPaths, Config},
     discovery::{self, Posting},
     domain::events::{DiscoveryPayload, PendingEvent, event_type},
-    event_store::EventStore,
+    event_store::{EventStore, MemStore, read_only_envelopes},
     ingest::{self, IngestOutcome},
     projections, resume,
 };
@@ -80,6 +80,28 @@ pub async fn execute_discover(
     // Fetch + extract postings (no lock); a posting failure is non-fatal.
     let (outcomes, failed_postings) = discovery::fetch_postings(postings, &client).await;
 
+    if args.dry_run {
+        // Dry run: read the corpus WITHOUT the writer lock, seed an
+        // in-memory store, and run the same decide → append loop against it.
+        // Nothing is written; the summary is what a real run would do.
+        let events = read_only_envelopes(paths.event_log())?;
+        let mut store = MemStore::seeded(events);
+        let mut summary =
+            ingest_outcomes_correlated(&mut store, config, &resume_skills, outcomes, run_id)?;
+        summary.failed = failed_postings;
+        summary.failed_sources = failed_sources;
+        print_summary(&summary, json, true)?;
+        info!(
+            new = summary.new,
+            updated = summary.updated,
+            suppressed = summary.suppressed,
+            rejected = summary.rejected,
+            failed = summary.failed,
+            "discovery dry run complete (no events written)"
+        );
+        return Ok(());
+    }
+
     // Acquire the single-writer lock only for the decide → append cycle.
     let (mut store, _projection) = open_workspace(paths)?;
     let mut summary =
@@ -87,23 +109,7 @@ pub async fn execute_discover(
     summary.failed = failed_postings;
     summary.failed_sources = failed_sources;
     append_discovery_event(&mut store, run_id, &summary)?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&summary).into_diagnostic()?
-        );
-    } else {
-        println!("discovery complete");
-        println!("  new:        {}", summary.new);
-        println!("  updated:    {}", summary.updated);
-        println!("  suppressed: {}", summary.suppressed);
-        println!("  rejected:   {}", summary.rejected);
-        println!("  failed:     {}", summary.failed);
-        if !summary.failed_sources.is_empty() {
-            println!("  failed sources: {}", summary.failed_sources.join(", "));
-        }
-    }
+    print_summary(&summary, json, false)?;
     info!(
         new = summary.new,
         updated = summary.updated,
@@ -112,6 +118,35 @@ pub async fn execute_discover(
         failed = summary.failed,
         "discovery complete"
     );
+    Ok(())
+}
+
+/// Render a run summary: the counts plus, on the human path, a dry-run or
+/// real-run header.
+fn print_summary(summary: &BatchSummary, json: bool, dry_run: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(summary).into_diagnostic()?
+        );
+        return Ok(());
+    }
+    println!(
+        "{}",
+        if dry_run {
+            "dry run complete — no events written"
+        } else {
+            "discovery complete"
+        }
+    );
+    println!("  new:        {}", summary.new);
+    println!("  updated:    {}", summary.updated);
+    println!("  suppressed: {}", summary.suppressed);
+    println!("  rejected:   {}", summary.rejected);
+    println!("  failed:     {}", summary.failed);
+    if !summary.failed_sources.is_empty() {
+        println!("  failed sources: {}", summary.failed_sources.join(", "));
+    }
     Ok(())
 }
 
@@ -190,7 +225,7 @@ mod tests {
         cli::Mark,
         commands::{mark_lead, test_support::*},
         config::Config,
-        event_store::JsonlEventStore,
+        event_store::{JsonlEventStore, MemStore, read_only_envelopes},
         ingest::IngestOutcome,
         projections,
     };
@@ -308,6 +343,56 @@ mod tests {
             ingest_outcomes(&mut store, &config, &[], vec![("remotive".into(), again)]).unwrap();
         assert_eq!(summary.suppressed, 1);
         assert_eq!(summary.new, 0);
+    }
+
+    #[test]
+    fn dry_run_core_reports_without_writing_the_real_log() {
+        // The dry-run path: read the corpus read-only, seed an in-memory
+        // store, run the decide loop against it — and leave the real log
+        // untouched (one original lead's ingested + scored events).
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        {
+            let mut store = JsonlEventStore::open(&log_path).unwrap();
+            let mut existing = outcome_with_url("https://example.com/existing");
+            existing.extracted.remote = Some(true);
+            ingest_outcomes(
+                &mut store,
+                &Config::default(),
+                &[],
+                vec![("remotive".into(), existing)],
+            )
+            .unwrap();
+        }
+
+        let events = read_only_envelopes(&log_path).unwrap();
+        let mut mem = MemStore::seeded(events);
+
+        let mut new_posting = outcome_with_url("https://example.com/new");
+        new_posting.extracted.remote = Some(true);
+        let mut duplicate = outcome_with_url("https://example.com/existing");
+        duplicate.extracted.remote = Some(true);
+
+        let summary = ingest_outcomes_correlated(
+            &mut mem,
+            &Config::default(),
+            &[],
+            vec![
+                ("remotive".into(), new_posting),
+                ("remotive".into(), duplicate),
+            ],
+            Uuid::now_v7(),
+        )
+        .unwrap();
+
+        // One new lead, one re-ingest of the existing lead.
+        assert_eq!(summary.new, 1);
+        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.suppressed, 0);
+        assert_eq!(summary.rejected, 0);
+
+        // The real log is unchanged: still just the original lead's events.
+        assert_eq!(read_only_envelopes(&log_path).unwrap().len(), 2);
     }
 
     // ── discovery run event ────────────────────────────────────

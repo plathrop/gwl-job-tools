@@ -348,6 +348,11 @@ pub struct DiscoverArgs {
     /// the opt-in)
     #[arg(long)]
     pub source: Option<String>,
+    /// Preview the run: fetch, resolve, gate, and score every posting and
+    /// print the summary, but write nothing (no event-log writes, no
+    /// discovery event, no writer lock)
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Clone, Debug, Subcommand)]
@@ -571,6 +576,25 @@ mod tests {
     fn parse_discover_source_flag() {
         let cli = Cli::try_parse_from(["gwl-jobs", "discover", "--source", "remotive"]).unwrap();
         assert_eq!(cli.command_name(), "discover");
+    }
+
+    #[test]
+    fn parse_discover_dry_run_flag() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "discover", "--dry-run"]).unwrap();
+        assert_eq!(cli.command_name(), "discover");
+        let Some(Commands::Discover(args)) = cli.command else {
+            panic!("expected discover command");
+        };
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn parse_discover_dry_run_defaults_false() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "discover"]).unwrap();
+        let Some(Commands::Discover(args)) = cli.command else {
+            panic!("expected discover command");
+        };
+        assert!(!args.dry_run);
     }
 
     #[test]
