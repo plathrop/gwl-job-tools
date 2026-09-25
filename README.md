@@ -58,11 +58,15 @@ event-sourced log:
    cover letter + ATS answer cheat sheet + resume) and open the posting. The
    final submit click is always yours.
 
+`gwl-jobs discover` runs this pipeline in batch over configured feed
+sources (e.g. Remotive), resolving each posting to its canonical URL first.
+
 ## Commands
 
 | Command                                                   | Purpose                                                                                                              |
 | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `gwl-jobs ingest <url>` or `--file <path>`                | Fetch, extract, dedupe, gate, score a posting.                                                                       |
+| `gwl-jobs discover [--source <name>]`                     | Batch-ingest postings from enabled feed sources (same pipeline as `ingest`).                                         |
 | `gwl-jobs list [--all]`                                   | Print the active pipeline (non-terminal, non-ignored), ranked.                                                       |
 | `gwl-jobs review`                                         | Interactive review queue (§5 of the design doc).                                                                     |
 | `gwl-jobs mark <lead> <mark> [--note]`                    | Non-interactive mark; `apply-automatically` runs the full prepare → open flow.                                       |
@@ -106,6 +110,9 @@ ideological_red_lines = [] # mechanism ships in v0; content is vNext
 log_level = "error" # error | warn | info | debug | trace
 log_file = "/path/to/gwl-jobs.log"
 telemetry = "off" # opt-in OTLP traces to Honeycomb
+
+[sources.remotive] # opt-in feed sources for `discover` (default disabled)
+enabled = true
 ```
 
 ## How it works
