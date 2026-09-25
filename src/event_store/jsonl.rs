@@ -14,14 +14,13 @@ use std::{
 };
 
 use fs2::FileExt;
-use jiff::Timestamp;
 use miette::{Context, IntoDiagnostic, Result, bail, miette};
 use tracing::{instrument, warn};
 use uuid::Uuid;
 
 use crate::{
     domain::events::{ENVELOPE_VERSION, EventEnvelope, PendingEvent},
-    event_store::{EventStore, upcast::upcast},
+    event_store::{EventStore, build_batch, upcast::upcast},
 };
 
 pub struct JsonlEventStore {
@@ -72,68 +71,16 @@ impl JsonlEventStore {
         let bytes = std::fs::read(&self.path)
             .into_diagnostic()
             .wrap_err_with(|| format!("reading event log {}", self.path.display()))?;
-
-        // Commit policy: every appended batch ends with '\n' and is fsync'd,
-        // so a file that does not end with a newline has a torn tail — the
-        // final record was never committed, whether or not its bytes happen
-        // to parse. It is discarded and truncated; only complete,
-        // newline-terminated, parseable events are sacred (design doc §1).
-        let terminated = bytes.last() == Some(&b'\n');
-
-        // Split on newlines at the byte level (never decoding the whole log
-        // up front): a short write can split a multibyte UTF-8 character in
-        // `raw_text`, and that must not turn into a hard UTF-8 error — the
-        // torn final slice is recoverable, everything before it is not.
-        let mut offset = 0usize;
-        let mut lines: Vec<(usize, &[u8])> = Vec::new();
-        for slice in bytes.split(|b| *b == b'\n') {
-            lines.push((offset, slice));
-            offset += slice.len() + 1;
-        }
-
-        let line_count = lines.len();
-        let mut envelopes = Vec::new();
-        for (idx, (line_offset, slice)) in lines.into_iter().enumerate() {
-            if slice.iter().all(u8::is_ascii_whitespace) {
-                continue;
-            }
-            let is_last = idx == line_count - 1;
-            if is_last && !terminated {
-                warn!(
-                    line = idx + 1,
-                    "discarding and truncating uncommitted trailing record in event log \
-                     (crash mid-write?)"
-                );
-                self.truncate_at(line_offset)?;
-                break;
-            }
-            // Syntax-level parse failure on a committed (newline-terminated)
-            // line is corruption, as is any validation failure (envelope
-            // version, upcast path) — hard errors wherever they appear.
-            let mut envelope: EventEnvelope = serde_json::from_slice(slice)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!(
-                        "malformed event at {} line {} (refusing to replay a corrupt log)",
-                        self.path.display(),
-                        idx + 1
-                    )
-                })?;
-            envelope.payload = upcast(
-                &envelope.event_type,
-                envelope.schema_version,
-                envelope.payload.take(),
-            )
-            .wrap_err_with(|| format!("event {} ({})", envelope.id, envelope.event_type))?;
-            if envelope.envelope_version != ENVELOPE_VERSION {
-                bail!(
-                    "unsupported envelope_version {} on event {} (this build understands \
-                     {ENVELOPE_VERSION})",
-                    envelope.envelope_version,
-                    envelope.id
-                );
-            }
-            envelopes.push(envelope);
+        let (envelopes, torn) = parse_envelopes(&bytes, &self.path)?;
+        if let Some(offset) = torn {
+            // Commit policy (design doc §1): a torn tail was never committed.
+            // The store holds the single-writer lock, so truncating it here
+            // is safe and lets the next append start at a clean offset.
+            warn!(
+                "discarding and truncating uncommitted trailing record in event log \
+                 (crash mid-write?)"
+            );
+            self.truncate_at(offset)?;
         }
         Ok(envelopes)
     }
@@ -151,6 +98,97 @@ impl JsonlEventStore {
         file.sync_all().into_diagnostic()?;
         Ok(())
     }
+}
+
+/// Parse envelopes from raw log bytes (design doc §1). `path` is for error
+/// messages only. Returns the envelopes plus the byte offset of a torn
+/// trailing line (`Some` when the final record is unterminated — never
+/// committed). The caller decides whether to truncate: the store does
+/// (it holds the lock); a read-only view does not.
+fn parse_envelopes(bytes: &[u8], path: &Path) -> Result<(Vec<EventEnvelope>, Option<usize>)> {
+    // Commit policy: every appended batch ends with '\n' and is fsync'd, so
+    // a file that does not end with a newline has a torn tail — the final
+    // record was never committed, whether or not its bytes happen to parse.
+    // Only complete, newline-terminated, parseable events are sacred.
+    let terminated = bytes.last() == Some(&b'\n');
+
+    // Split on newlines at the byte level (never decoding the whole log up
+    // front): a short write can split a multibyte UTF-8 character in
+    // `raw_text`, and that must not turn into a hard UTF-8 error — the torn
+    // final slice is recoverable, everything before it is not.
+    let mut offset = 0usize;
+    let mut lines: Vec<(usize, &[u8])> = Vec::new();
+    for slice in bytes.split(|b| *b == b'\n') {
+        lines.push((offset, slice));
+        offset += slice.len() + 1;
+    }
+
+    let line_count = lines.len();
+    let mut envelopes = Vec::new();
+    for (idx, (line_offset, slice)) in lines.into_iter().enumerate() {
+        if slice.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let is_last = idx == line_count - 1;
+        if is_last && !terminated {
+            return Ok((envelopes, Some(line_offset)));
+        }
+        // Syntax-level parse failure on a committed (newline-terminated)
+        // line is corruption, as is any validation failure (envelope
+        // version, upcast path) — hard errors wherever they appear.
+        let mut envelope: EventEnvelope = serde_json::from_slice(slice)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "malformed event at {} line {} (refusing to replay a corrupt log)",
+                    path.display(),
+                    idx + 1
+                )
+            })?;
+        envelope.payload = upcast(
+            &envelope.event_type,
+            envelope.schema_version,
+            envelope.payload.take(),
+        )
+        .wrap_err_with(|| format!("event {} ({})", envelope.id, envelope.event_type))?;
+        if envelope.envelope_version != ENVELOPE_VERSION {
+            bail!(
+                "unsupported envelope_version {} on event {} (this build understands \
+                 {ENVELOPE_VERSION})",
+                envelope.envelope_version,
+                envelope.id
+            );
+        }
+        envelopes.push(envelope);
+    }
+    Ok((envelopes, None))
+}
+
+/// Read the log WITHOUT the single-writer lock: a read-only view for preview
+/// paths (`discover --dry-run`) and, later, read-only commands. A missing log
+/// is an empty corpus (the store's `open` would create it; a read-only view
+/// must not). A torn trailing line is discarded but NOT truncated — this
+/// holder has no lock, so writing back would race a live writer.
+pub(crate) fn read_only_envelopes(path: impl AsRef<Path>) -> Result<Vec<EventEnvelope>> {
+    let path = path.as_ref();
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("reading event log {}", path.display()));
+        }
+    };
+    let (envelopes, torn) = parse_envelopes(&bytes, path)?;
+    if torn.is_some() {
+        warn!(
+            "ignoring uncommitted trailing record in read-only view of {} \
+             (not truncating — no writer lock)",
+            path.display()
+        );
+    }
+    Ok(envelopes)
 }
 
 impl EventStore for JsonlEventStore {
@@ -173,32 +211,11 @@ impl EventStore for JsonlEventStore {
             );
         }
 
-        let now = Timestamp::now();
+        let envelopes = build_batch(stream, expected_seq, events, correlation_id);
         let mut batch = String::new();
-        let mut envelopes = Vec::with_capacity(events.len());
-        for (i, pending) in events.iter().enumerate() {
-            // Causation chaining within a batch: an event without an
-            // explicit cause is caused by the event it follows (e.g. a
-            // `rejected` caused by its `ingested`).
-            let causation_id = pending
-                .causation_id
-                .or_else(|| envelopes.last().map(|e: &EventEnvelope| e.id));
-            let envelope = EventEnvelope {
-                envelope_version: ENVELOPE_VERSION,
-                id: Uuid::now_v7(),
-                stream: stream.to_string(),
-                seq: expected_seq + 1 + i as u64,
-                event_type: pending.event_type.to_string(),
-                schema_version: pending.schema_version,
-                occurred_at: pending.occurred_at.unwrap_or(now),
-                recorded_at: now,
-                causation_id,
-                correlation_id,
-                payload: pending.payload.clone(),
-            };
-            batch.push_str(&serde_json::to_string(&envelope).into_diagnostic()?);
+        for envelope in &envelopes {
+            batch.push_str(&serde_json::to_string(envelope).into_diagnostic()?);
             batch.push('\n');
-            envelopes.push(envelope);
         }
 
         if !batch.is_empty() {
@@ -537,5 +554,62 @@ mod tests {
             .unwrap();
         assert_eq!(store.load(a).unwrap().len(), 1);
         assert_eq!(store.replay().unwrap().len(), 2);
+    }
+
+    // ── read-only view (discover --dry-run) ──────────────────
+
+    #[test]
+    fn read_only_does_not_require_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut store = JsonlEventStore::open(&path).unwrap();
+        store
+            .append(
+                "lead/00000000-0000-7000-8000-000000000009",
+                0,
+                &[pending(serde_json::json!({"ok": true}))],
+                Uuid::now_v7(),
+            )
+            .unwrap();
+        // The store above still holds the single-writer lock; the read-only
+        // view must succeed anyway (it never takes the lock).
+        let envelopes = read_only_envelopes(&path).unwrap();
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].payload["ok"], true);
+    }
+
+    #[test]
+    fn read_only_missing_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        assert!(read_only_envelopes(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_only_does_not_truncate_a_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let mut store = JsonlEventStore::open(&path).unwrap();
+        store
+            .append(
+                "lead/00000000-0000-7000-8000-000000000010",
+                0,
+                &[pending(serde_json::json!({"ok": true}))],
+                Uuid::now_v7(),
+            )
+            .unwrap();
+        let good_len = std::fs::metadata(&path).unwrap().len();
+        // Simulate a torn tail (partial record, no newline).
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"envelope_version\":1,\"id\":").unwrap();
+        drop(file);
+
+        let envelopes = read_only_envelopes(&path).unwrap();
+        assert_eq!(envelopes.len(), 1);
+        // Read-only view must NOT truncate the torn tail (no lock held).
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > good_len,
+            "read-only view must not truncate the torn tail"
+        );
     }
 }
