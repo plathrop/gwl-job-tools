@@ -63,6 +63,12 @@ struct SourceBatch {
 trait DiscoverySource {
     fn fetch<'a>(&'a self, client: &'a HttpClient)
         -> Pin<Box<dyn Future<Output = Result<SourceBatch>> + Send + 'a>>;
+
+    /// Whether fetching this source spends credits (default: no). Drives the
+    /// `--dry-run` gate on paid sources (Decision 7).
+    fn charges_per_record(&self) -> bool {
+        false
+    }
 }
 ```
 
@@ -108,8 +114,13 @@ and the `ingest` path regardless of server-side behavior. Where a source can
 exclude companies, the blacklist is *additionally* pushed server-side
 (`company_name_not` / `company_domain_not`) as a credit-saving pre-filter:
 excluding a blacklisted company from the fetch is cheaper than fetching →
-rejecting, but the gate is the backstop, not the filter. Remote-only and
-comp-floor stay client-side on the fetched records.
+rejecting, but the gate is the backstop, not the filter. This pre-filter is
+best-effort: `company_name_not` is exact and case-sensitive, so variant or
+fuzzy blacklist entries under-exclude server-side (safe — the client gate
+still rejects them; the credits are spent, the match is not missed). The
+fuzzier `company_name_partial_match_not` is deferred until a variant-name miss
+is observed. Remote-only and comp-floor stay client-side on the fetched
+records.
 
 The strict-vs-client-side question for the permissive gates is left to the
 data, not settled here: a per-source `strict_filtering` toggle (default off)
@@ -130,8 +141,14 @@ Observability) shows the dropped population is negligible.
   first-run backfill; subsequent runs use the watermark instead.
 - **Limit**: page size 500 (TheirStack's max), serial pagination — the 300ms
   politeness delay already sits under the 4 req/sec ceiling.
-- `include_total_results` stays off (slow); `metadata.truncated_results` is
-  read from the response.
+- `include_total_results` stays off (slow).
+- **Credit exhaustion**: `metadata.truncated_results` reports results not
+  returned because credits ran out (TheirStack's Job Search API reference,
+  response `metadata` table). A compatible-schema product reads the same
+  field the opposite way, so the semantics are re-confirmed against a live
+  near-exhausted response before increment C's fixture relies on them. A
+  **402** (no credits at all) is a fetch error → the source is reported
+  failed and the run continues, per the failed-source requirement.
 
 ### 5. The watermark lives on the discovery run event
 
@@ -146,15 +163,31 @@ source of truth" invariant.
 
 - The source's config block carries the credential as a **reference, not a
   secret**: `[sources.theirstack]` with `api_key = "${THEIRSTACK_API_KEY}"`.
-  The config loader resolves `${VAR}` references from the environment at load
-  (a step alongside the existing tilde expansion), so the secret stays in env
-  and the config file is safe to commit. A missing env var resolves to empty;
-  the adapter treats an empty key as "no key" → the source is reported failed
-  (run continues), never a silent skip or a hard abort of other sources.
+  The config loader resolves `${VAR}` references **config-wide** — a single
+  pass over the parsed TOML value tree before deserializing into `Config`,
+  not per-field plumbing — so any string field may reference an env var, and
+  the secret stays in env while the config file stays safe to commit. A
+  missing env var resolves to empty; the adapter treats an empty key as "no
+  key" → the source is reported failed (run continues), never a silent skip
+  or a hard abort of other sources.
 - Config: `[sources.theirstack] enabled = true` plus optional
   `posted_at_max_age_days` and `strict_filtering` on `SourceConfig` (ignored
   by Remotive). The "never contact a service you haven't approved" guardrail
   holds: enabled + a non-empty key is the approval.
+
+### 7. Paid sources under `--dry-run` are gated
+
+`discover --dry-run` performs the real fetch and skips only the writes, so a
+dry-run of a paid source spends the same credits as a real run while appending
+no run event (and therefore advancing no watermark). To make that spend a
+choice rather than a surprise, the driver asks before fetching a source that
+charges per record: `DiscoverySource` gains `charges_per_record()` (default
+`false`; `true` for TheirStack), and `--dry-run` prompts on stderr ("will
+spend <source> credits, 1 per record — proceed? [y/N]", default no) when any
+enabled source is paid. A `--yes` flag skips the prompt for scripts, and the
+command refuses rather than prompts when stdin is not a terminal or under
+`--json` (a prompt would corrupt the JSON contract). A real (non-dry) run
+spends credits by definition and is not gated.
 
 ## Risks / Trade-offs
 
@@ -169,6 +202,17 @@ source of truth" invariant.
 - **Watermark boundary re-fetch** → `discovered_at_gte` is inclusive, so the
   boundary job may be re-fetched once; corpus dedup suppresses the re-ingest
   (safe, one credit).
+- **Truncation tail-loss** → a truncated backfill (credits ran out mid-window)
+  advances the watermark past the unfetched older tail, which is then never
+  fetched. Forward-flow trade-off: aged jobs age out; `truncated_results`
+  surfaces the gap so the operator can re-run with a smaller recency window.
+- **Watermark durability** → the watermark becomes durable only when the run
+  event is appended at run end; an aborted run (store corruption) records no
+  watermark, so the next run re-fetches the window (re-spend). Acceptable —
+  abort is rare and the re-fetch is dedup-suppressed.
+- **Naive `discovered_at`** → TheirStack records carry naive timestamps; the
+  adapter SHALL normalize to UTC before storing the watermark and before
+  passing it as `discovered_at_gte`.
 - **Re-projection cost at batch scale** → the driver re-projects per posting
   (O(M·N)); TheirStack's 500/page makes M large for the first time.
   Incremental fold (or SQLite, GWLJ-oujjs3) is the scaling path — measured,

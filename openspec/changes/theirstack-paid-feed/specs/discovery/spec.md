@@ -31,8 +31,8 @@ fetching and extracting the posting again.
 
 Re-running discovery over postings already ingested SHALL NOT create new
 leads for unchanged postings. For a paid source, a re-run SHALL fetch only
-jobs the source discovered after the previous run (a `discovered_at`
-watermark), so already-seen jobs are not re-fetched at cost.
+jobs the source discovered after a run that recorded a `discovered_at`
+watermark, so already-seen jobs are not re-fetched at cost.
 
 #### Scenario: Re-running an unchanged feed
 
