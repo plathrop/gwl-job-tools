@@ -355,14 +355,91 @@ pub struct DiscoverArgs {
     pub dry_run: bool,
 }
 
+/// The version string (pebble GWLJ-4c0qq3): `gwl-jobs $VERSION
+/// [$commit(-dirty)?]`. This function returns the `$VERSION [$commit…]`
+/// part — clap's `--version` and the `version` subcommand both prepend
+/// the binary name. The commit info is baked in by the build script and
+/// omitted when git is unavailable (e.g. a tarball).
+pub fn version_string() -> String {
+    let mut s = env!("CARGO_PKG_VERSION").to_string();
+    if let Some(commit) = option_env!("BUILD_GIT_COMMIT") {
+        s.push_str(&format!(" [{commit}"));
+        if option_env!("BUILD_GIT_DIRTY").is_some() {
+            s.push_str("-dirty");
+        }
+        s.push(']');
+    }
+    s
+}
+
+/// The version string as a `&'static str` for clap's `--version`: leaking
+/// ~30 bytes once at startup is the standard way to hand a runtime-built
+/// string to `Command::version` (which wants `Into<Str>`, not `String`).
+fn version_static() -> &'static str {
+    version_string().leak()
+}
+
 #[derive(Clone, Debug, Subcommand)]
+// The four workflow groups flatten into one flat command surface
+// (`gwl-jobs list`, never `gwl-jobs triage list`); the grouping shows up
+// as ordering in the help. clap 4.6 cannot render flat subcommands under
+// multiple headings (`Command::flatten_help` gives headings only to
+// *nested* commands, changing invocation), so per-group headings are not
+// available — pebble GWLJ-m0kpx1.
 pub enum Commands {
+    /// Lead ingestion: get postings into the pipeline
+    #[command(flatten)]
+    Ingest(IngestCommands),
+
+    /// Triage: work the review queue
+    #[command(flatten)]
+    Triage(TriageCommands),
+
+    /// Application progress: record the journey
+    #[command(flatten)]
+    Progress(ProgressCommands),
+
+    /// Corpus and tooling
+    #[command(flatten)]
+    Maintenance(MaintenanceCommands),
+}
+
+/// Getting postings into the pipeline (pebble GWLJ-m0kpx1: subcommands
+/// grouped by workflow stage).
+#[derive(Clone, Debug, Subcommand)]
+pub enum IngestCommands {
     /// Fetch and ingest a job posting (URL or local file)
     Ingest(IngestArgs),
+
+    /// Discover and ingest postings from enabled feed sources
+    Discover(DiscoverArgs),
+}
+
+/// Working the review queue: see, judge, and correct leads.
+#[derive(Clone, Debug, Subcommand)]
+pub enum TriageCommands {
+    /// Print the active pipeline: every lead not terminal or ignored
+    List(ListArgs),
+
+    /// Interactively review the pending queue
+    Review,
 
     /// Show a lead's projected state
     Show(ShowArgs),
 
+    /// Mark a lead (apply-automatically, apply-manual, defer, ignore)
+    Mark(MarkArgs),
+
+    /// Manually correct or enrich a lead's fields
+    Edit(Box<EditArgs>),
+
+    /// (Re)build and re-open the apply package for an apply-automatically lead
+    Package(PackageArgs),
+}
+
+/// Recording the application journey on a lead.
+#[derive(Clone, Debug, Subcommand)]
+pub enum ProgressCommands {
     /// Record that you applied to a lead
     Applied(AppliedArgs),
 
@@ -377,34 +454,23 @@ pub enum Commands {
 
     /// Record a terminal outcome (accepted, rejected, withdrawn, …)
     Outcome(OutcomeArgs),
+}
 
+/// Inspecting the event log and tooling niceties.
+#[derive(Clone, Debug, Subcommand)]
+pub enum MaintenanceCommands {
     /// Dump/filter the raw event log
     Events(EventsArgs),
 
-    /// Print the active pipeline: every lead not terminal or ignored
-    List(ListArgs),
-
-    /// Mark a lead (apply-automatically, apply-manual, defer, ignore)
-    Mark(MarkArgs),
-
-    /// Manually correct or enrich a lead's fields
-    Edit(EditArgs),
-
-    /// (Re)build and re-open the apply package for an apply-automatically lead
-    Package(PackageArgs),
-
-    /// Interactively review the pending queue
-    Review,
-
-    /// Discover and ingest postings from enabled feed sources
-    Discover(DiscoverArgs),
-
     /// Generate shell completions (bash, zsh, fish)
     Completion(CompletionArgs),
+
+    /// Print version information
+    Version,
 }
 
 #[derive(Debug, Parser)]
-#[command(name = APP_NAME, version, about)]
+#[command(name = APP_NAME, version = version_static(), about)]
 // (Probably) temporary until I decide what the default command should do.
 #[command(arg_required_else_help = true)]
 pub struct Cli {
@@ -466,27 +532,55 @@ pub async fn execute(
     color: bool,
 ) -> Result<()> {
     match command {
-        Some(Commands::Ingest(args)) => {
+        Some(Commands::Ingest(IngestCommands::Ingest(args))) => {
             commands::execute_ingest(args, config, paths, json, color).await
         }
-        Some(Commands::Show(args)) => commands::execute_show(args, paths, json, color).await,
-        Some(Commands::Applied(args)) => commands::execute_applied(args, paths).await,
-        Some(Commands::Screened(args)) => commands::execute_screened(args, paths).await,
-        Some(Commands::Interviewed(args)) => commands::execute_interviewed(args, paths).await,
-        Some(Commands::Offered(args)) => commands::execute_offered(args, paths).await,
-        Some(Commands::Outcome(args)) => commands::execute_outcome(args, paths).await,
-        Some(Commands::Events(args)) => commands::execute_events(args, paths).await,
-        Some(Commands::List(args)) => commands::execute_list(args, paths, json, color).await,
-        Some(Commands::Mark(args)) => commands::execute_mark(args, config, paths, json).await,
-        Some(Commands::Edit(args)) => {
-            commands::execute_edit(args, config, paths, json, color).await
-        }
-        Some(Commands::Package(args)) => commands::execute_package(args, config, paths, json).await,
-        Some(Commands::Review) => commands::execute_review(config, paths, color).await,
-        Some(Commands::Discover(args)) => {
+        Some(Commands::Ingest(IngestCommands::Discover(args))) => {
             commands::execute_discover(args, config, paths, json).await
         }
-        Some(Commands::Completion(args)) => commands::execute_completion(args),
+        Some(Commands::Triage(TriageCommands::List(args))) => {
+            commands::execute_list(args, paths, json, color).await
+        }
+        Some(Commands::Triage(TriageCommands::Review)) => {
+            commands::execute_review(config, paths, color).await
+        }
+        Some(Commands::Triage(TriageCommands::Show(args))) => {
+            commands::execute_show(args, paths, json, color).await
+        }
+        Some(Commands::Triage(TriageCommands::Mark(args))) => {
+            commands::execute_mark(args, config, paths, json).await
+        }
+        Some(Commands::Triage(TriageCommands::Edit(args))) => {
+            commands::execute_edit(*args, config, paths, json, color).await
+        }
+        Some(Commands::Triage(TriageCommands::Package(args))) => {
+            commands::execute_package(args, config, paths, json).await
+        }
+        Some(Commands::Progress(ProgressCommands::Applied(args))) => {
+            commands::execute_applied(args, paths).await
+        }
+        Some(Commands::Progress(ProgressCommands::Screened(args))) => {
+            commands::execute_screened(args, paths).await
+        }
+        Some(Commands::Progress(ProgressCommands::Interviewed(args))) => {
+            commands::execute_interviewed(args, paths).await
+        }
+        Some(Commands::Progress(ProgressCommands::Offered(args))) => {
+            commands::execute_offered(args, paths).await
+        }
+        Some(Commands::Progress(ProgressCommands::Outcome(args))) => {
+            commands::execute_outcome(args, paths).await
+        }
+        Some(Commands::Maintenance(MaintenanceCommands::Events(args))) => {
+            commands::execute_events(args, paths).await
+        }
+        Some(Commands::Maintenance(MaintenanceCommands::Completion(args))) => {
+            commands::execute_completion(args)
+        }
+        Some(Commands::Maintenance(MaintenanceCommands::Version)) => {
+            println!("{APP_NAME} {}", version_string());
+            Ok(())
+        }
         None => Err(miette::miette!(
             "no command provided; run `{APP_NAME} --help`"
         )),
@@ -495,21 +589,22 @@ pub async fn execute(
 
 fn cmd_label(command: &Option<Commands>) -> &'static str {
     match command {
-        Some(Commands::Ingest(_)) => "ingest",
-        Some(Commands::Show(_)) => "show",
-        Some(Commands::Applied(_)) => "applied",
-        Some(Commands::Screened(_)) => "screened",
-        Some(Commands::Interviewed(_)) => "interviewed",
-        Some(Commands::Offered(_)) => "offered",
-        Some(Commands::Outcome(_)) => "outcome",
-        Some(Commands::Events(_)) => "events",
-        Some(Commands::List(_)) => "list",
-        Some(Commands::Mark(_)) => "mark",
-        Some(Commands::Edit(_)) => "edit",
-        Some(Commands::Package(_)) => "package",
-        Some(Commands::Review) => "review",
-        Some(Commands::Discover(_)) => "discover",
-        Some(Commands::Completion(_)) => "completion",
+        Some(Commands::Ingest(IngestCommands::Ingest(_))) => "ingest",
+        Some(Commands::Ingest(IngestCommands::Discover(_))) => "discover",
+        Some(Commands::Triage(TriageCommands::List(_))) => "list",
+        Some(Commands::Triage(TriageCommands::Review)) => "review",
+        Some(Commands::Triage(TriageCommands::Show(_))) => "show",
+        Some(Commands::Triage(TriageCommands::Mark(_))) => "mark",
+        Some(Commands::Triage(TriageCommands::Edit(_))) => "edit",
+        Some(Commands::Triage(TriageCommands::Package(_))) => "package",
+        Some(Commands::Progress(ProgressCommands::Applied(_))) => "applied",
+        Some(Commands::Progress(ProgressCommands::Screened(_))) => "screened",
+        Some(Commands::Progress(ProgressCommands::Interviewed(_))) => "interviewed",
+        Some(Commands::Progress(ProgressCommands::Offered(_))) => "offered",
+        Some(Commands::Progress(ProgressCommands::Outcome(_))) => "outcome",
+        Some(Commands::Maintenance(MaintenanceCommands::Events(_))) => "events",
+        Some(Commands::Maintenance(MaintenanceCommands::Completion(_))) => "completion",
+        Some(Commands::Maintenance(MaintenanceCommands::Version)) => "version",
         None => "none",
     }
 }
@@ -518,7 +613,7 @@ fn cmd_label(command: &Option<Commands>) -> &'static str {
 mod tests {
     use std::path::Path;
 
-    use clap::ColorChoice;
+    use clap::{ColorChoice, CommandFactory};
 
     use super::*;
 
@@ -582,7 +677,7 @@ mod tests {
     fn parse_discover_dry_run_flag() {
         let cli = Cli::try_parse_from(["gwl-jobs", "discover", "--dry-run"]).unwrap();
         assert_eq!(cli.command_name(), "discover");
-        let Some(Commands::Discover(args)) = cli.command else {
+        let Some(Commands::Ingest(IngestCommands::Discover(args))) = cli.command else {
             panic!("expected discover command");
         };
         assert!(args.dry_run);
@@ -591,7 +686,7 @@ mod tests {
     #[test]
     fn parse_discover_dry_run_defaults_false() {
         let cli = Cli::try_parse_from(["gwl-jobs", "discover"]).unwrap();
-        let Some(Commands::Discover(args)) = cli.command else {
+        let Some(Commands::Ingest(IngestCommands::Discover(args))) = cli.command else {
             panic!("expected discover command");
         };
         assert!(!args.dry_run);
@@ -865,5 +960,35 @@ mod tests {
         let cli = Cli::try_parse_from(["gwl-jobs", "list"]).unwrap();
         assert!(cli.data_dir.is_none());
         assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn parse_version_subcommand() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "version"]).unwrap();
+        assert_eq!(cli.command_name(), "version");
+    }
+
+    #[test]
+    fn version_flag_matches_version_command_output() {
+        // GWLJ-4c0qq3: `--version` and the `version` subcommand print the
+        // same string.
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(version_string().as_str())
+        );
+    }
+
+    #[test]
+    fn version_string_carries_name_and_version() {
+        // `gwl-jobs $VERSION [$commit(-dirty)?]`: the fn returns the version
+        // part only (the callers prepend the binary name), and the commit
+        // bracket is present only when the build script saw a git checkout.
+        let v = version_string();
+        assert!(v.starts_with(env!("CARGO_PKG_VERSION")));
+        if option_env!("BUILD_GIT_COMMIT").is_some() {
+            assert!(v.contains('['), "v: {v}");
+        } else {
+            assert!(!v.contains('['), "v: {v}");
+        }
     }
 }
