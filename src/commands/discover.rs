@@ -28,6 +28,9 @@ pub struct BatchSummary {
     pub rejected: u64,
     pub failed: u64,
     pub failed_sources: Vec<String>,
+    /// True when this summary is a `--dry-run` preview (no events written),
+    /// so a scripted `--json` consumer can tell a preview from a real run.
+    pub dry_run: bool,
 }
 
 #[instrument(skip_all)]
@@ -90,7 +93,8 @@ pub async fn execute_discover(
             ingest_outcomes_correlated(&mut store, config, &resume_skills, outcomes, run_id)?;
         summary.failed = failed_postings;
         summary.failed_sources = failed_sources;
-        print_summary(&summary, json, true)?;
+        summary.dry_run = true;
+        print_summary(&summary, json)?;
         info!(
             new = summary.new,
             updated = summary.updated,
@@ -109,7 +113,7 @@ pub async fn execute_discover(
     summary.failed = failed_postings;
     summary.failed_sources = failed_sources;
     append_discovery_event(&mut store, run_id, &summary)?;
-    print_summary(&summary, json, false)?;
+    print_summary(&summary, json)?;
     info!(
         new = summary.new,
         updated = summary.updated,
@@ -123,7 +127,7 @@ pub async fn execute_discover(
 
 /// Render a run summary: the counts plus, on the human path, a dry-run or
 /// real-run header.
-fn print_summary(summary: &BatchSummary, json: bool, dry_run: bool) -> Result<()> {
+fn print_summary(summary: &BatchSummary, json: bool) -> Result<()> {
     if json {
         println!(
             "{}",
@@ -133,7 +137,7 @@ fn print_summary(summary: &BatchSummary, json: bool, dry_run: bool) -> Result<()
     }
     println!(
         "{}",
-        if dry_run {
+        if summary.dry_run {
             "dry run complete — no events written"
         } else {
             "discovery complete"
@@ -393,6 +397,21 @@ mod tests {
 
         // The real log is unchanged: still just the original lead's events.
         assert_eq!(read_only_envelopes(&log_path).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn summary_json_marks_dry_runs() {
+        // A scripted --json consumer must be able to tell a preview from a
+        // real run: the dry_run marker is part of the machine contract.
+        let preview = BatchSummary {
+            dry_run: true,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&preview).unwrap();
+        assert_eq!(value["dry_run"], true);
+
+        let real = BatchSummary::default();
+        assert_eq!(serde_json::to_value(&real).unwrap()["dry_run"], false);
     }
 
     // ── discovery run event ────────────────────────────────────
