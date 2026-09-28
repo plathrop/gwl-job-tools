@@ -67,7 +67,7 @@ sources (e.g. Remotive), resolving each posting to its canonical URL first.
 | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `gwl-jobs ingest <url>` or `--file <path>`                | Fetch, extract, dedupe, gate, score a posting.                                                                       |
 | `gwl-jobs discover [--source <name>]`                     | Batch-ingest postings from enabled feed sources (same pipeline as `ingest`).                                         |
-| `gwl-jobs list [--all]`                                   | Print the active pipeline (non-terminal, non-ignored), ranked.                                                       |
+| `gwl-jobs list [--all]`                                   | Print the active pipeline (non-terminal, non-ignored, not gate-rejected), ranked.                                    |
 | `gwl-jobs review`                                         | Interactive review queue (§5 of the design doc).                                                                     |
 | `gwl-jobs mark <lead> <mark> [--note]`                    | Non-interactive mark; `apply-automatically` runs the full prepare → open flow.                                       |
 | `gwl-jobs edit <lead> [flags]`                            | Correct fields extraction missed (title, company, comp, remote, …).                                                  |

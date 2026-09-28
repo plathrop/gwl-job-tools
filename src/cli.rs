@@ -323,8 +323,9 @@ pub struct EventsArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct ListArgs {
-    /// Show all leads, including terminal and ignored ones (default: the
-    /// active pipeline — every non-terminal, non-ignored lead)
+    /// Show all leads, including terminal, ignored, and gate-rejected ones
+    /// (default: the active pipeline — every lead not terminal, ignored,
+    /// or gate-rejected)
     #[arg(long)]
     pub all: bool,
 }
@@ -421,7 +422,8 @@ pub enum IngestCommands {
 /// Working the review queue: see, judge, and correct leads.
 #[derive(Clone, Debug, Subcommand)]
 pub enum TriageCommands {
-    /// Print the active pipeline: every lead not terminal or ignored
+    /// Print the active pipeline: every lead not terminal, ignored, or
+    /// gate-rejected
     List(ListArgs),
 
     /// Interactively review the pending queue

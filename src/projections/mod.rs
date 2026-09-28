@@ -153,6 +153,20 @@ impl LeadRecord {
             )
         )
     }
+
+    /// Whether the lead's latest evaluation failed a gate — the state
+    /// `lifecycle_status` reports as `rejected (gate)`. The condition is
+    /// the same (`lifecycle_status` simply prefers a mark when one stands:
+    /// a `defer`-marked lead that a later re-ingest gate-rejects reads
+    /// `deferred` but still leaves this view — its mark does not undo the
+    /// machine's latest answer). A snapshot event clears the rejection,
+    /// and a passing re-evaluation appends `scored` — so an `edit`-revived
+    /// lead leaves this state and re-enters the default view. Excluded
+    /// from the default `list` view (decision record 0013); `list --all`
+    /// reveals.
+    pub fn is_gate_rejected(&self) -> bool {
+        self.latest_rejection.is_some() && self.latest_score.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -239,21 +253,23 @@ impl Projection {
         leads
     }
 
-    /// The active pipeline (design doc 0002, decision record 0010): every
-    /// lead that has neither reached a terminal state nor been durably
-    /// ignored. This is `list`'s default view — the pending review queue
-    /// (§7) remains what `review` steps through, and remains a subset of
-    /// this. Same ranking as `--all` (via `ranked_leads`). Ignored leads
-    /// are excluded because the ignore mark exists to bury leads
-    /// permanently (`--all` reveals them). Gate-rejected leads ARE
-    /// included: a machine rejection is not a terminal state, the leads
-    /// sort to the bottom with a `[rejected (gate)]` tag, and they are
-    /// `edit`-revivable (decision record 0010). The `(gate)` qualifier
-    /// distinguishes the machine's content filter from the
-    /// user-recorded `rejected_by_employer` terminal outcome.
+    /// The active pipeline (design doc 0002, decision records 0010 and
+    /// 0013): every lead that is neither terminal, durably ignored, nor
+    /// currently gate-rejected. This is `list`'s default view — the pending
+    /// review queue (§7) remains what `review` steps through, and remains a
+    /// subset of this. Same ranking as `--all` (via `ranked_leads`).
+    /// Ignored leads are excluded because the ignore mark exists to bury
+    /// leads permanently (`--all` reveals them). Gate-rejected leads are
+    /// excluded by decision record 0013: a machine rejection is a settled
+    /// answer, not work, so it has no place in the view that answers "what
+    /// should I look at?" — `--all` reveals them at the bottom (dash score,
+    /// `[rejected (gate)]` tag), and they stay `edit`-revivable (a passing
+    /// re-evaluation restores them to this view). The `(gate)` qualifier
+    /// distinguishes the machine's content filter from the user-recorded
+    /// `rejected_by_employer` terminal outcome.
     pub fn active_leads(&self) -> Vec<&LeadRecord> {
         let mut active = self.ranked_leads();
-        active.retain(|r| !r.is_terminal() && !r.is_buried());
+        active.retain(|r| !r.is_terminal() && !r.is_buried() && !r.is_gate_rejected());
         active
     }
 
@@ -1569,6 +1585,70 @@ mod tests {
         let ids: Vec<Uuid> = active.iter().map(|r| r.lead_id).collect();
         // Terminal c and ignored d are excluded; b (90) ranks above a (75).
         assert_eq!(ids, vec![b, a]);
+    }
+
+    #[test]
+    fn active_leads_excludes_gate_rejected_leads() {
+        // Decision record 0013 (supersedes a 0010 clause): a gate rejection
+        // is a settled answer, not work — excluded from the default view,
+        // revealed by `--all` (ranked_leads), still edit-revivable (a
+        // passing re-evaluation restores the default view).
+        let a = Uuid::now_v7(); // scored, pending
+        let e = Uuid::now_v7(); // gate-rejected
+        let mut events = scored_lead(a);
+        events.extend([
+            envelope(
+                e,
+                1,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/e"), None),
+            ),
+            envelope(
+                e,
+                2,
+                event_type::REJECTED,
+                serde_json::json!({"gate": "remote-only", "reason": "x", "revision": 1}),
+            ),
+        ]);
+
+        let projection = rebuild(&events).unwrap();
+        let active: Vec<Uuid> = projection
+            .active_leads()
+            .iter()
+            .map(|r| r.lead_id)
+            .collect();
+        assert_eq!(active, vec![a], "gate-rejected e is hidden by default");
+        assert!(projection.leads[&e].is_gate_rejected());
+        // `--all` is the union view: ranked_leads still reveals e.
+        let all: Vec<Uuid> = projection
+            .ranked_leads()
+            .iter()
+            .map(|r| r.lead_id)
+            .collect();
+        assert!(all.contains(&e), "--all must reveal gate-rejected leads");
+
+        // Revival: a later snapshot clears the standing rejection and a
+        // passing evaluation scores the lead back into the default view.
+        events.extend([
+            envelope(
+                e,
+                3,
+                event_type::INGESTED,
+                ingested_payload(None, Some("url:https://example.com/e"), None),
+            ),
+            envelope(e, 4, event_type::SCORED, scored_payload(60, 2)),
+        ]);
+        let projection = rebuild(&events).unwrap();
+        assert!(!projection.leads[&e].is_gate_rejected());
+        let active: Vec<Uuid> = projection
+            .active_leads()
+            .iter()
+            .map(|r| r.lead_id)
+            .collect();
+        assert!(
+            active.contains(&e),
+            "a revived lead re-enters the default view"
+        );
     }
 
     #[test]

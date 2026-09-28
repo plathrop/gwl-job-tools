@@ -60,13 +60,15 @@ Rules:
 the first thing `review` does. Now:
 
 - **`gwl-jobs list`** (default) prints the **active pipeline**: every
-  lead that has neither reached a terminal state (`accepted`,
+  lead that is neither terminal (`accepted`,
   `rejected_by_employer`, `withdrawn`, `declined`, `unresponsive`,
-  `archived`) nor been durably ignored, ranked by composite score
-  descending, first-seen as the tie-breaker — the same ranking as
-  `--all`.
-- **`gwl-jobs list --all`** adds terminal and ignored leads back in
-  (unchanged set: all leads).
+  `archived`), nor durably ignored, nor currently gate-rejected
+  (decision record 0013 supersedes 0010's include-by-default: a
+  machine rejection is a settled answer, not work), ranked by
+  composite score descending, first-seen as the tie-breaker — the
+  same ranking as `--all`.
+- **`gwl-jobs list --all`** adds terminal, ignored, and gate-rejected
+  leads back in (unchanged set: all leads).
 - The **pending review queue is unchanged** and remains what `review`
   steps through (§7); it is a subset of the active pipeline.
 
@@ -78,7 +80,10 @@ Notes:
 - **Ignored leads are excluded from the default view** (settled with
   Grey, 2026-08-31): the ignore mark exists to bury leads permanently,
   and durable-ignore means out of sight — `list --all` is the only view
-  that reveals them. Excluded-set = terminal outcomes ∪ ignored marks.
+  that reveals them. **Gate-rejected leads too** (decision record
+  0013, 2026-09-28): they stay `edit`-revivable and `--all`-visible.
+  Excluded-set = terminal outcomes ∪ ignored marks ∪ standing gate
+  rejections.
 
 ## Review-loop hints
 

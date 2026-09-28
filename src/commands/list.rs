@@ -44,13 +44,13 @@ pub async fn execute_list(args: ListArgs, paths: &AppPaths, json: bool, color: b
     // lock) can be released as soon as the projection is built.
     let (_, projection) = open_workspace(paths)?;
 
-    // The default view is the active pipeline (design doc 0002): every lead
-    // that is neither terminal nor durably ignored — pending, deferred,
-    // applying, applied, screened, … (and gate-rejected, at the bottom,
-    // `edit`-revivable) — ranked by score. `--all` adds the terminal and
-    // ignored leads back in. The pending review queue itself remains what
-    // `review` steps through; `list` no longer duplicates it. One shared
-    // sort (PR #16 review).
+    // The default view is the active pipeline (design doc 0002, decision
+    // records 0010 + 0013): every lead that is not terminal, durably
+    // ignored, or currently gate-rejected — pending, deferred, applying,
+    // applied, … ranked by score. `--all` adds the terminal, ignored, and
+    // gate-rejected leads back in. The pending review queue itself remains
+    // what `review` steps through; `list` no longer duplicates it. One
+    // shared sort (PR #16 review).
     let records: Vec<&LeadRecord> = if args.all {
         projection.ranked_leads()
     } else {
