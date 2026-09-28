@@ -1,6 +1,7 @@
 # discovery Specification
 
 ## Purpose
+
 Batch discovery of job postings from pluggable feed sources, resolving each
 discovered posting to its canonical URL and feeding it through the existing
 ingest/dedupe pipeline.
