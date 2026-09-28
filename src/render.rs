@@ -5,7 +5,7 @@ use std::io::Write;
 
 use crossterm::style::Color;
 use miette::{IntoDiagnostic, Result};
-use termimad::MadSkin;
+use termimad::{Alignment, MadSkin};
 use tracing::instrument;
 
 use crate::{domain::events::CheatSheetEntry, projections::LeadRecord};
@@ -46,17 +46,17 @@ pub fn card_markdown(record: &LeadRecord) -> String {
     // company is omitted when the title already ends with it (some boards
     // keep the full "Title — Company" string in the title).
     let title = sanitize(record.extracted.title.as_deref().unwrap_or("Untitled"));
-    let lead_prefix: String = record.lead_id.to_string().chars().take(8).collect();
+    let prefix = lead_prefix(record);
     match record.extracted.company.as_deref() {
         Some(company) => {
             let company = sanitize(company);
             if title.to_lowercase().ends_with(&company.to_lowercase()) {
-                md.push_str(&format!("# {title} - {lead_prefix}\n\n"));
+                md.push_str(&format!("# {title} - {prefix}\n\n"));
             } else {
-                md.push_str(&format!("# {title} - {company} - {lead_prefix}\n\n"));
+                md.push_str(&format!("# {title} - {company} - {prefix}\n\n"));
             }
         }
-        None => md.push_str(&format!("# {title} - {lead_prefix}\n\n")),
+        None => md.push_str(&format!("# {title} - {prefix}\n\n")),
     }
 
     // Score or rejection.
@@ -106,24 +106,35 @@ pub fn card_markdown(record: &LeadRecord) -> String {
     md
 }
 
-/// Render a lead's card to stdout.
-#[instrument(skip_all, fields(lead_id = %record.lead_id))]
-pub fn render_card(record: &LeadRecord, color: bool) -> Result<()> {
-    let md = card_markdown(record);
+/// The card's skin: the header left-aligned (termimad centers H1s by
+/// default, which is hard to scan), and the score line bold, colored by
+/// score when color is on.
+fn card_skin(record: &LeadRecord, color: bool) -> MadSkin {
     let mut skin = if color {
         MadSkin::default()
     } else {
         MadSkin::no_style()
     };
+    // Set for both paths so the card renders the same on a terminal and
+    // piped to a file.
+    skin.headers[0].align = Alignment::Left;
     if color && let Some(score) = &record.latest_score {
         skin.bold.set_fg(score_color(score.composite));
     }
-    skin.write_text(&md).into_diagnostic()?;
+    skin
+}
+
+/// Render a lead's card to stdout.
+#[instrument(skip_all, fields(lead_id = %record.lead_id))]
+pub fn render_card(record: &LeadRecord, color: bool) -> Result<()> {
+    let md = card_markdown(record);
+    card_skin(record, color).write_text(&md).into_diagnostic()?;
     Ok(())
 }
 
-/// Render the ranked queue to stdout (rank, colored score, title @ company,
-/// deferral count, derived status, lead prefix).
+/// Render the ranked queue to stdout (rank, colored score, lead prefix,
+/// title @ company, deferral count, derived status).
+#[instrument(skip_all, fields(leads = records.len()))]
 pub fn render_list(records: &[&LeadRecord], color: bool) -> Result<()> {
     let mut out = std::io::stdout().lock();
     for (i, record) in records.iter().enumerate() {
@@ -142,8 +153,14 @@ fn list_line(rank: usize, record: &LeadRecord, color: bool) -> String {
         None => "  -".to_string(),
     };
 
-    let mut line = format!("{rank:>3}  {score}  {title}");
-    if !company.is_empty() {
+    // The 8-char lead prefix is the addressing handle for `mark`/`show`:
+    // a plain column right after the score, unbracketed so a double-click
+    // selects exactly the id.
+    let prefix = lead_prefix(record);
+    let mut line = format!("{rank:>3}  {score}  {prefix}  {title}");
+    // Some boards keep the full "Title @ Company" string in the title; the
+    // company is not appended again (same rule as the card header).
+    if !company.is_empty() && !title.to_lowercase().ends_with(&company.to_lowercase()) {
         line.push_str(&format!(" @ {company}"));
     }
     if record.deferral_count > 0 {
@@ -152,10 +169,12 @@ fn list_line(rank: usize, record: &LeadRecord, color: bool) -> String {
     // One derived status tag (design doc 0002) — not the mark and the
     // outcome as coequal parallel tags.
     line.push_str(&format!("  [{}]", sanitize(&record.lifecycle_status())));
-    // The 8-char lead prefix is the addressing handle for `mark`/`show`.
-    let lead_prefix: String = record.lead_id.to_string().chars().take(8).collect();
-    line.push_str(&format!("  [{lead_prefix}]"));
     line
+}
+
+/// The 8-char lead prefix (decision 0008) — the human-addressing handle.
+fn lead_prefix(record: &LeadRecord) -> String {
+    record.lead_id.to_string().chars().take(8).collect()
 }
 
 /// A score rendered with a 24-bit RGB foreground when color is on.
@@ -337,12 +356,44 @@ mod tests {
     }
 
     #[test]
-    fn list_line_includes_lead_prefix() {
-        // The 8-char prefix is the addressing handle for `mark`/`show`.
+    fn list_line_puts_lead_prefix_after_score_unbracketed() {
+        // The 8-char prefix is the addressing handle for `mark`/`show`: a
+        // plain column right after the score, no brackets (a double-click
+        // selects exactly the id).
         let record = lead_record();
-        let prefix: String = record.lead_id.to_string().chars().take(8).collect();
+        let prefix = lead_prefix(&record);
         let line = list_line(1, &record, false);
-        assert!(line.contains(&format!("[{prefix}]")), "line: {line}");
+        assert!(
+            line.starts_with(&format!("  1   75  {prefix}  ")),
+            "line: {line}"
+        );
+        assert!(!line.contains(&format!("[{prefix}]")), "line: {line}");
+    }
+
+    #[test]
+    fn list_line_omits_company_when_title_ends_with_it() {
+        // Parity with the card header: a board that keeps "Title @ Company"
+        // in the title must not get the company appended twice.
+        let mut record = lead_record();
+        record.extracted.title = Some("Senior DevOps Engineer @Lemon.io".into());
+        record.extracted.company = Some("Lemon.io".into());
+        let line = list_line(1, &record, false);
+        assert!(line.contains("@Lemon.io  [pending]"), "line: {line}");
+        assert!(!line.contains("Lemon.io @ Lemon.io"), "line: {line}");
+    }
+
+    #[test]
+    fn card_skin_left_aligns_the_header() {
+        // termimad centers H1s by default (MadSkin::default), which is hard
+        // to scan; the card header renders flush left in both color modes.
+        assert_eq!(
+            card_skin(&lead_record(), true).headers[0].align,
+            Alignment::Left
+        );
+        assert_eq!(
+            card_skin(&lead_record(), false).headers[0].align,
+            Alignment::Left
+        );
     }
 
     #[test]

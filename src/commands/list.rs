@@ -12,8 +12,8 @@ use crate::{cli::ListArgs, config::AppPaths, projections::LeadRecord, render};
 #[derive(Clone, Debug, Serialize)]
 pub struct QueueEntry {
     pub rank: usize,
-    pub lead_id: Uuid,
     pub composite: Option<u64>,
+    pub lead_id: Uuid,
     pub title: Option<String>,
     pub company: Option<String>,
     pub deferral_count: u64,
