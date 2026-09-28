@@ -142,13 +142,15 @@ Observability) shows the dropped population is negligible.
 - **Limit**: page size 500 (TheirStack's max), serial pagination — the 300ms
   politeness delay already sits under the 4 req/sec ceiling.
 - `include_total_results` stays off (slow).
-- **Credit exhaustion**: `metadata.truncated_results` reports results not
-  returned because credits ran out (TheirStack's Job Search API reference,
-  response `metadata` table). A compatible-schema product reads the same
-  field the opposite way, so the semantics are re-confirmed against a live
-  near-exhausted response before increment C's fixture relies on them. A
-  **402** (no credits at all) is a fetch error → the source is reported
-  failed and the run continues, per the failed-source requirement.
+- **Credit exhaustion**: the raw markdown API reference
+  (`search_jobs_v1.md`) defines `metadata.truncated_results` as "results not
+  returned because the user doesn't have enough credits", but that definition
+  is not surfaced in the rendered docs and a compatible-schema product reads
+  the field the opposite way — so the semantics are **inferred, not
+  verified**, and task 3.3's live near-exhausted check is the gate that
+  settles them. A **402** (no credits at all) is a fetch error → the source
+  is reported failed and the run continues, per the failed-source
+  requirement.
 
 ### 5. The watermark lives on the discovery run event
 

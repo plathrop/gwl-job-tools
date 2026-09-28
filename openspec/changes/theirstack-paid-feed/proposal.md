@@ -40,8 +40,7 @@ record returned), or every re-run re-spends money on jobs already seen.
   discovery run event and passed back as `discovered_at_gte` next run, so
   re-runs fetch only newly-discovered jobs.
 - **Credit observability**: `metadata.truncated_results` (credit exhaustion)
-  and remaining credits from `GET /v0/billing/credit-balance` surface in the
-  run summary.
+  surfaces in the run summary.
 
 ## Capabilities
 
@@ -68,7 +67,7 @@ None.
   prove parity); `discover` with no TheirStack config is unaffected.
 - **Observability** (decision 0011): per-source and per-posting spans gain
   TheirStack-specific fields; trust-but-verify mismatch spans/logs; and
-  credit-exhaustion/balance fields in the summary. The strict-vs-client-side
+  credit-exhaustion field in the summary. The strict-vs-client-side
   question is answered by data, not argument: source spans and the summary
   record the null-rate facts (unknown workplace type / salary, and the count
   strict mode would drop), and the review path records the mark alongside the
