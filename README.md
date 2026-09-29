@@ -59,14 +59,15 @@ event-sourced log:
    final submit click is always yours.
 
 `gwl-jobs discover` runs this pipeline in batch over configured feed
-sources (e.g. Remotive), resolving each posting to its canonical URL first.
+sources — free curated feeds (Remotive) or the paid TheirStack Jobs API —
+resolving each posting to its canonical URL first.
 
 ## Commands
 
 | Command                                                   | Purpose                                                                                                              |
 | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `gwl-jobs ingest <url>` or `--file <path>`                | Fetch, extract, dedupe, gate, score a posting.                                                                       |
-| `gwl-jobs discover [--source <name>]`                     | Batch-ingest postings from enabled feed sources (same pipeline as `ingest`).                                         |
+| `gwl-jobs discover [--source <name>] [--dry-run] [--yes]` | Batch-ingest postings from enabled feed sources (same pipeline as `ingest`).                                         |
 | `gwl-jobs list [--all]`                                   | Print the active pipeline (non-terminal, non-ignored, not gate-rejected), ranked.                                    |
 | `gwl-jobs review`                                         | Interactive review queue (§5 of the design doc).                                                                     |
 | `gwl-jobs mark <lead> <mark> [--note]`                    | Non-interactive mark; `apply-automatically` runs the full prepare → open flow.                                       |
@@ -114,7 +115,22 @@ telemetry = "off" # opt-in OTLP traces to Honeycomb
 
 [sources.remotive] # opt-in feed sources for `discover` (default disabled)
 enabled = true
+
+[sources.theirstack] # paid TheirStack Jobs API (1 credit per returned job)
+enabled = true
+api_key = "${THEIRSTACK_API_KEY}" # env-var reference, resolved config-wide
+posted_at_max_age_days = 30 # recency window for the first backfill
+strict_filtering = false # opt-in: push remote/comp gates server-side
 ```
+
+Discovery sources are opt-in and fetched only when `enabled = true`. The
+TheirStack source charges one API credit per returned job, so `discover`
+records a per-source `discovered_at` watermark on each run and re-runs fetch
+only newly-discovered jobs. A `--dry-run` that would spend credits prompts on
+stderr (`--yes` to skip; it refuses under `--json` or when stdin isn't a
+terminal). The configured blacklist is additionally pushed server-side as a
+credit-saving pre-filter, but the client-side blacklist gate remains the
+authoritative backstop.
 
 ## How it works
 
