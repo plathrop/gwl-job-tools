@@ -387,19 +387,22 @@ fn version_static() -> &'static str {
 // *nested* commands, changing invocation), so per-group headings are not
 // available — pebble GWLJ-m0kpx1.
 pub enum Commands {
-    /// Lead ingestion: get postings into the pipeline
+    // The four wrapper variants below never render in help output (a
+    // flattened variant is not itself a subcommand), so these are plain
+    // source comments, not doc comments:
+    // Lead ingestion: get postings into the pipeline
     #[command(flatten)]
     Ingest(IngestCommands),
 
-    /// Triage: work the review queue
+    // Triage: work the review queue
     #[command(flatten)]
     Triage(TriageCommands),
 
-    /// Application progress: record the journey
+    // Application progress: record the journey
     #[command(flatten)]
     Progress(ProgressCommands),
 
-    /// Corpus and tooling
+    // Corpus and tooling
     #[command(flatten)]
     Maintenance(MaintenanceCommands),
 }
@@ -979,10 +982,10 @@ mod tests {
     }
 
     #[test]
-    fn version_string_carries_name_and_version() {
-        // `gwl-jobs $VERSION [$commit(-dirty)?]`: the fn returns the version
-        // part only (the callers prepend the binary name), and the commit
-        // bracket is present only when the build script saw a git checkout.
+    fn version_string_carries_version_and_optional_commit() {
+        // The fn returns the version part only (callers prepend the binary
+        // name); the commit bracket is present only when the build script
+        // saw a git checkout.
         let v = version_string();
         assert!(v.starts_with(env!("CARGO_PKG_VERSION")));
         if option_env!("BUILD_GIT_COMMIT").is_some() {
