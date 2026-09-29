@@ -5,6 +5,8 @@
 //! not bump the version, anything else requires an upcaster (see
 //! `event_store::upcast`).
 
+use std::collections::HashMap;
+
 use jiff::Timestamp;
 use miette::IntoDiagnostic;
 use serde::{Deserialize, Serialize};
@@ -267,6 +269,12 @@ pub struct DiscoveryPayload {
     pub rejected: u64,
     pub failed: u64,
     pub failed_sources: Vec<String>,
+    /// Per-source `discovered_at` watermark (theirstack-paid-feed): the max
+    /// `discovered_at` fetched from each source, so the next run can pass it
+    /// back as `discovered_at_gte`. Additive, optional — absent on older
+    /// events and on runs with no watermark-bearing sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovered_at: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

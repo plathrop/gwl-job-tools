@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::LazyLock,
 };
 
 use directories::ProjectDirs;
@@ -20,6 +21,41 @@ fn expand_tilde(path: &Path) -> PathBuf {
         return path.to_path_buf();
     };
     PathBuf::from(home).join(rest)
+}
+
+/// A `${VAR}` environment reference in a config string value.
+static ENV_REF_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("static regex compiles")
+});
+
+/// Resolve `${VAR}` references in every string of the parsed TOML value tree
+/// (config-wide, a single pass before deserialization — theirstack-paid-feed
+/// design decision 6). A missing env var resolves to empty, so the secret
+/// stays in env while the config file stays safe to commit.
+fn interpolate_env(value: toml::Value) -> toml::Value {
+    match value {
+        toml::Value::String(s) => toml::Value::String(interpolate_string(&s)),
+        toml::Value::Array(items) => {
+            toml::Value::Array(items.into_iter().map(interpolate_env).collect())
+        }
+        toml::Value::Table(table) => toml::Value::Table(
+            table
+                .into_iter()
+                .map(|(key, value)| (key, interpolate_env(value)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Replace every `${VAR}` in a string with the environment variable's value
+/// (empty when unset).
+fn interpolate_string(s: &str) -> String {
+    ENV_REF_RE
+        .replace_all(s, |caps: &regex::Captures| {
+            std::env::var(&caps[1]).unwrap_or_default()
+        })
+        .into_owned()
 }
 
 /// Log verbosity. Config key `log_level` (default `error`); the CLI
@@ -114,13 +150,34 @@ impl Default for ScoringWeights {
 }
 
 /// One discovery feed source's config (OpenSpec change
-/// `discovery-ingestion`). Sources are opt-in: fetched only when
-/// `enabled = true`. Per-source parameters (URL overrides, filters) land
+/// `discovery-ingestion`; extended by `theirstack-paid-feed`). Sources are
+/// opt-in: fetched only when `enabled = true`. Per-source parameters land
 /// here as later adapters need them.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SourceConfig {
     pub enabled: bool,
+    /// Credential reference, not a secret: `api_key = "${THEIRSTACK_API_KEY}"`
+    /// resolves from env via config-wide interpolation (a missing var
+    /// resolves to empty). The adapter treats an empty key as "no key".
+    pub api_key: String,
+    /// Recency bound for the first-run backfill (TheirStack requires one of
+    /// `posted_at_*`/company filters). Ignored by Remotive.
+    pub posted_at_max_age_days: u64,
+    /// Opt-in strict filtering: push the permissive gates into the source
+    /// query (documented per adapter). Ignored by Remotive.
+    pub strict_filtering: bool,
+}
+
+impl Default for SourceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: String::new(),
+            posted_at_max_age_days: 30,
+            strict_filtering: false,
+        }
+    }
 }
 
 impl Config {
@@ -146,9 +203,19 @@ impl Config {
     #[instrument]
     fn load_from(path: PathBuf, required: bool) -> Result<Self> {
         let mut config = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("parsing {}", path.display()))?,
+            Ok(text) => {
+                // Parse to a `toml::Value` first so `${VAR}` references can be
+                // resolved config-wide (a single pass over the value tree),
+                // then deserialize into `Config` (deny_unknown_fields still
+                // applies).
+                let value: toml::Value = toml::from_str(&text)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("parsing {}", path.display()))?;
+                interpolate_env(value)
+                    .try_into()
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("parsing {}", path.display()))?
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 if required {
                     bail!("config file {} not found", path.display());
@@ -581,6 +648,91 @@ compensation = 0.4
         .unwrap();
         let paths = AppPaths::new(config_dir, dir.path().join("data"));
         assert!(Config::load(&paths).is_err());
+    }
+
+    // ── Sources: TheirStack fields (theirstack-paid-feed) ────────
+
+    #[test]
+    fn theirstack_source_fields_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(Config::FILE_NAME),
+            "[sources.theirstack]\nenabled = true\napi_key = \"k123\"\nposted_at_max_age_days = 7\nstrict_filtering = true\n",
+        )
+        .unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        let source = &config.sources["theirstack"];
+        assert!(source.enabled);
+        assert_eq!(source.api_key, "k123");
+        assert_eq!(source.posted_at_max_age_days, 7);
+        assert!(source.strict_filtering);
+    }
+
+    #[test]
+    fn theirstack_source_fields_default() {
+        // A bare `[sources.theirstack]` block: `api_key` empty, recency 30,
+        // strict off.
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join(Config::FILE_NAME), "[sources.theirstack]\n").unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        let source = &config.sources["theirstack"];
+        assert!(!source.enabled);
+        assert_eq!(source.api_key, "");
+        assert_eq!(source.posted_at_max_age_days, 30);
+        assert!(!source.strict_filtering);
+    }
+
+    #[test]
+    fn interpolation_resolves_set_env_var() {
+        // `PATH` is set in any normal environment; interpolation must
+        // substitute its value. (Avoids `set_var`, which is process-global
+        // and unsafe under the parallel test harness.)
+        let path = std::env::var("PATH").unwrap_or_default();
+        if path.is_empty() {
+            return;
+        }
+        assert_eq!(
+            interpolate_string("before ${PATH} after"),
+            format!("before {path} after")
+        );
+    }
+
+    #[test]
+    fn interpolation_missing_var_is_empty() {
+        const UNSET: &str = "GWL_JOB_TOOLS_UNSET_VAR_9f3k2m";
+        assert!(std::env::var(UNSET).is_err());
+        assert_eq!(interpolate_string(&format!("x-${{{UNSET}}}-y")), "x--y");
+    }
+
+    #[test]
+    fn interpolation_passes_through_without_ref() {
+        assert_eq!(interpolate_string("no ref here"), "no ref here");
+    }
+
+    #[test]
+    fn api_key_ref_missing_var_resolves_to_empty_in_load() {
+        // The whole load path: a `${VAR}` reference in `api_key` resolves
+        // to empty when the var is unset (the adapter treats empty as
+        // "no key", never a silent skip of other sources).
+        const UNSET: &str = "GWL_JOB_TOOLS_UNSET_VAR_9f3k2m";
+        assert!(std::env::var(UNSET).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(Config::FILE_NAME),
+            format!("[sources.theirstack]\nenabled = true\napi_key = \"${{{UNSET}}}\"\n"),
+        )
+        .unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        assert_eq!(config.sources["theirstack"].api_key, "");
     }
 
     // ── LogLevel ────────────────────────────────────────────────

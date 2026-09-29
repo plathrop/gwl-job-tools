@@ -2,6 +2,8 @@
 //! `discovery-ingestion`) — fetch postings from feed sources and ingest them
 //! through the existing pipeline.
 
+use std::{collections::HashMap, io::IsTerminal};
+
 use miette::{IntoDiagnostic, Result, miette};
 use serde::Serialize;
 use tracing::{info, instrument};
@@ -11,7 +13,7 @@ use super::{open_workspace, record_ingest_correlated};
 use crate::{
     cli::DiscoverArgs,
     config::{AppPaths, Config},
-    discovery::{self, Posting},
+    discovery,
     domain::events::{DiscoveryPayload, PendingEvent, event_type},
     event_store::{EventStore, MemStore, read_only_envelopes},
     ingest::{self, IngestOutcome},
@@ -28,9 +30,77 @@ pub struct BatchSummary {
     pub rejected: u64,
     pub failed: u64,
     pub failed_sources: Vec<String>,
+    /// Credit exhaustion: results a paid source could not return.
+    pub truncated_results: u64,
+    /// Fetched records with no workplace-type signal.
+    pub unknown_workplace: u64,
+    /// Fetched records with no salary signal.
+    pub unknown_salary: u64,
+    /// Fetched records strict mode would have dropped (unknown workplace or
+    /// salary).
+    pub strict_would_drop: u64,
     /// True when this summary is a `--dry-run` preview (no events written),
     /// so a scripted `--json` consumer can tell a preview from a real run.
     pub dry_run: bool,
+}
+
+/// Decision for gating a paid `--dry-run`: proceed, prompt, or refuse.
+enum DryRunGate {
+    Proceed,
+    Prompt,
+    Refuse { reason: String },
+}
+
+/// The paid `--dry-run` gate (design decision 7): a dry-run performs the
+/// real fetch and skips only the writes, so it spends credits. Before
+/// fetching a source that charges per record, the driver asks — unless `--yes`
+/// skips the prompt, or the session cannot prompt (`--json` / non-TTY), in
+/// which case it refuses rather than corrupt the output or hang.
+fn dry_run_gate(
+    dry_run: bool,
+    yes: bool,
+    json: bool,
+    stdin_tty: bool,
+    paid_sources: &[&str],
+) -> DryRunGate {
+    if !dry_run || paid_sources.is_empty() {
+        return DryRunGate::Proceed;
+    }
+    let names = paid_sources.join(", ");
+    if json {
+        return DryRunGate::Refuse {
+            reason: format!(
+                "--dry-run with a paid source ({names}) would spend credits; \
+                 a prompt would corrupt --json output — pass --yes to proceed"
+            ),
+        };
+    }
+    if yes {
+        return DryRunGate::Proceed;
+    }
+    if !stdin_tty {
+        return DryRunGate::Refuse {
+            reason: format!(
+                "--dry-run with a paid source ({names}) would spend credits; \
+                 refusing to prompt in a non-interactive session — pass --yes to proceed"
+            ),
+        };
+    }
+    DryRunGate::Prompt
+}
+
+/// Derive each source's prior `discovered_at` watermark from the most recent
+/// `discovery` run event (read-only; no writer lock).
+fn prior_watermark(paths: &AppPaths) -> Result<HashMap<String, String>> {
+    let events = read_only_envelopes(paths.event_log())?;
+    for event in events.iter().rev() {
+        if event.event_type == event_type::DISCOVERY {
+            let payload: DiscoveryPayload =
+                serde_json::from_value(event.payload.clone()).into_diagnostic()?;
+            return Ok(payload.discovered_at.unwrap_or_default());
+        }
+    }
+    Ok(HashMap::new())
 }
 
 #[instrument(skip_all)]
@@ -49,7 +119,10 @@ pub async fn execute_discover(
 
     let client = ingest::default_client()?;
     let run_id = Uuid::now_v7();
-    let sources = discovery::build_sources(config, args.source.as_deref())?;
+    // Derive prior watermarks BEFORE fetching: a paid source's query needs
+    // its last `discovered_at` as the `discovered_at_gte` lower bound.
+    let prior = prior_watermark(paths)?;
+    let sources = discovery::build_sources(config, args.source.as_deref(), &prior)?;
 
     if sources.is_empty() {
         if json {
@@ -63,25 +136,64 @@ pub async fn execute_discover(
         return Ok(());
     }
 
+    // Gate a paid --dry-run BEFORE any credits are spent.
+    let paid: Vec<&str> = sources
+        .iter()
+        .filter(|(_, s)| s.charges_per_record())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    match dry_run_gate(
+        args.dry_run,
+        args.yes,
+        json,
+        std::io::stdin().is_terminal(),
+        &paid,
+    ) {
+        DryRunGate::Proceed => {}
+        DryRunGate::Refuse { reason } => return Err(miette!(reason)),
+        DryRunGate::Prompt => {
+            eprint!(
+                "will spend credits for {} (1 per record) — proceed? [y/N] ",
+                paid.join(", ")
+            );
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).into_diagnostic()?;
+            if !(answer.trim().eq_ignore_ascii_case("y")
+                || answer.trim().eq_ignore_ascii_case("yes"))
+            {
+                eprintln!("aborted");
+                return Ok(());
+            }
+        }
+    }
+
     // Fetch sources (no writer lock); a source failure is non-fatal.
     let fetches = discovery::fetch_sources(&sources, &client).await;
 
-    // Flatten into (source, posting) pairs, collecting failed sources.
-    let mut postings: Vec<(String, Posting)> = Vec::new();
+    // Flatten into (source, outcome) pairs, collecting failed sources,
+    // per-posting failures, truncation, and the new per-source watermarks.
+    let mut outcomes: Vec<(String, IngestOutcome)> = Vec::new();
     let mut failed_sources: Vec<String> = Vec::new();
+    let mut failed_postings = 0u64;
+    let mut truncated_results = 0u64;
+    let mut new_watermark: HashMap<String, String> = HashMap::new();
     for fetch in fetches {
-        match fetch.postings {
-            Ok(ps) => {
-                for p in ps {
-                    postings.push((fetch.source.clone(), p));
+        match fetch.batch {
+            Ok(batch) => {
+                for o in batch.outcomes {
+                    outcomes.push((fetch.source.clone(), o));
+                }
+                failed_postings += batch.failed;
+                truncated_results += batch.truncated_results;
+                if let Some(ts) = batch.discovered_at {
+                    new_watermark.insert(fetch.source, ts);
                 }
             }
             Err(_) => failed_sources.push(fetch.source),
         }
     }
 
-    // Fetch + extract postings (no lock); a posting failure is non-fatal.
-    let (outcomes, failed_postings) = discovery::fetch_postings(postings, &client).await;
+    let rates = discovery::null_rates(outcomes.iter().map(|(_, o)| o));
 
     if args.dry_run {
         // Dry run: read the corpus WITHOUT the writer lock, seed an
@@ -93,6 +205,10 @@ pub async fn execute_discover(
             ingest_outcomes_correlated(&mut store, config, &resume_skills, outcomes, run_id)?;
         summary.failed = failed_postings;
         summary.failed_sources = failed_sources;
+        summary.truncated_results = truncated_results;
+        summary.unknown_workplace = rates.unknown_workplace;
+        summary.unknown_salary = rates.unknown_salary;
+        summary.strict_would_drop = rates.strict_would_drop;
         summary.dry_run = true;
         print_summary(&summary, json)?;
         info!(
@@ -112,7 +228,11 @@ pub async fn execute_discover(
         ingest_outcomes_correlated(&mut store, config, &resume_skills, outcomes, run_id)?;
     summary.failed = failed_postings;
     summary.failed_sources = failed_sources;
-    append_discovery_event(&mut store, run_id, &summary)?;
+    summary.truncated_results = truncated_results;
+    summary.unknown_workplace = rates.unknown_workplace;
+    summary.unknown_salary = rates.unknown_salary;
+    summary.strict_would_drop = rates.strict_would_drop;
+    append_discovery_event(&mut store, run_id, &summary, new_watermark)?;
     print_summary(&summary, json)?;
     info!(
         new = summary.new,
@@ -148,6 +268,13 @@ fn print_summary(summary: &BatchSummary, json: bool) -> Result<()> {
     println!("  suppressed: {}", summary.suppressed);
     println!("  rejected:   {}", summary.rejected);
     println!("  failed:     {}", summary.failed);
+    println!("  truncated:  {}", summary.truncated_results);
+    if summary.unknown_workplace > 0 || summary.unknown_salary > 0 || summary.strict_would_drop > 0
+    {
+        println!("  unknown workplace: {}", summary.unknown_workplace);
+        println!("  unknown salary:    {}", summary.unknown_salary);
+        println!("  strict would drop: {}", summary.strict_would_drop);
+    }
     if !summary.failed_sources.is_empty() {
         println!("  failed sources: {}", summary.failed_sources.join(", "));
     }
@@ -202,11 +329,13 @@ fn ingest_outcomes_correlated(
 
 /// Append the run's `discovery` event: the durable record of the run's
 /// outcome, on a non-lead `discovery/<run_id>` stream (ignored by the lead
-/// projection), sharing the run's correlation id.
+/// projection), sharing the run's correlation id. `discovered_at` records the
+/// per-source watermark for the next run's cursor.
 fn append_discovery_event(
     store: &mut impl EventStore,
     run_id: Uuid,
     summary: &BatchSummary,
+    discovered_at: HashMap<String, String>,
 ) -> Result<()> {
     let payload = DiscoveryPayload {
         new: summary.new,
@@ -215,6 +344,11 @@ fn append_discovery_event(
         rejected: summary.rejected,
         failed: summary.failed,
         failed_sources: summary.failed_sources.clone(),
+        discovered_at: if discovered_at.is_empty() {
+            None
+        } else {
+            Some(discovered_at)
+        },
     };
     let pending = PendingEvent::new(event_type::DISCOVERY, None, &payload)?;
     store.append(&format!("discovery/{run_id}"), 0, &[pending], run_id)?;
@@ -228,7 +362,7 @@ mod tests {
     use crate::{
         cli::Mark,
         commands::{mark_lead, test_support::*},
-        config::Config,
+        config::{AppPaths, Config},
         event_store::{JsonlEventStore, MemStore, read_only_envelopes},
         ingest::IngestOutcome,
         projections,
@@ -438,7 +572,7 @@ mod tests {
         .unwrap();
         summary.failed = 1;
         summary.failed_sources = vec!["wwr".into()];
-        append_discovery_event(&mut store, run_id, &summary).unwrap();
+        append_discovery_event(&mut store, run_id, &summary, HashMap::new()).unwrap();
 
         let events = store.replay().unwrap();
         // 2 leads × (ingested + scored) = 4, plus the discovery event = 5.
@@ -456,5 +590,118 @@ mod tests {
         assert_eq!(payload.new, 2);
         assert_eq!(payload.failed, 1);
         assert_eq!(payload.failed_sources, vec!["wwr".to_string()]);
+    }
+
+    // ── watermark cursor (theirstack-paid-feed increment 3) ─────
+
+    #[test]
+    fn discovery_event_roundtrips_watermark() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
+        let run_id = Uuid::now_v7();
+        let summary = BatchSummary {
+            new: 1,
+            ..Default::default()
+        };
+        let mut watermark = HashMap::new();
+        watermark.insert("theirstack".to_string(), "2024-01-01T00:00:00Z".to_string());
+        append_discovery_event(&mut store, run_id, &summary, watermark).unwrap();
+
+        let events = store.replay().unwrap();
+        let discovery = events
+            .iter()
+            .find(|e| e.event_type == event_type::DISCOVERY)
+            .unwrap();
+        let payload: DiscoveryPayload = serde_json::from_value(discovery.payload.clone()).unwrap();
+        assert_eq!(
+            payload
+                .discovered_at
+                .as_ref()
+                .and_then(|m| m.get("theirstack"))
+                .map(String::as_str),
+            Some("2024-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn prior_watermark_derives_from_last_discovery_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let paths = AppPaths::new(dir.path().join("config"), data_dir);
+
+        {
+            let mut store = JsonlEventStore::open(paths.event_log()).unwrap();
+            let mut watermark = HashMap::new();
+            watermark.insert("theirstack".to_string(), "2024-01-02T00:00:00Z".to_string());
+            append_discovery_event(
+                &mut store,
+                Uuid::now_v7(),
+                &BatchSummary::default(),
+                watermark,
+            )
+            .unwrap();
+        }
+
+        let prior = prior_watermark(&paths).unwrap();
+        assert_eq!(
+            prior.get("theirstack").map(String::as_str),
+            Some("2024-01-02T00:00:00Z")
+        );
+    }
+
+    // ── paid --dry-run gate (increment 2, task 2.8) ─────────────
+
+    #[test]
+    fn dry_run_gate_paths() {
+        let paid = ["theirstack"];
+        // A real run spends credits by definition; no gate.
+        assert!(matches!(
+            dry_run_gate(false, false, false, false, &paid),
+            DryRunGate::Proceed
+        ));
+        // No paid sources: nothing to gate.
+        assert!(matches!(
+            dry_run_gate(true, false, false, true, &[]),
+            DryRunGate::Proceed
+        ));
+        // --json refuses rather than prompt (a prompt corrupts the JSON).
+        assert!(matches!(
+            dry_run_gate(true, false, true, true, &paid),
+            DryRunGate::Refuse { .. }
+        ));
+        // --yes skips the prompt, even in a non-TTY session.
+        assert!(matches!(
+            dry_run_gate(true, true, false, false, &paid),
+            DryRunGate::Proceed
+        ));
+        // TTY without --yes: prompt.
+        assert!(matches!(
+            dry_run_gate(true, false, false, true, &paid),
+            DryRunGate::Prompt
+        ));
+        // Non-TTY without --yes: refuse rather than hang.
+        assert!(matches!(
+            dry_run_gate(true, false, false, false, &paid),
+            DryRunGate::Refuse { .. }
+        ));
+    }
+
+    // ── summary null-rate / truncation fields (tasks 2.7, 3.3) ──
+
+    #[test]
+    fn summary_serializes_null_rate_and_truncation_fields() {
+        let summary = BatchSummary {
+            truncated_results: 7,
+            unknown_workplace: 1,
+            unknown_salary: 2,
+            strict_would_drop: 3,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(value["truncated_results"], 7);
+        assert_eq!(value["unknown_workplace"], 1);
+        assert_eq!(value["unknown_salary"], 2);
+        assert_eq!(value["strict_would_drop"], 3);
     }
 }

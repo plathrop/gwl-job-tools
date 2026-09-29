@@ -375,6 +375,9 @@ pub struct DiscoverArgs {
     /// discovery event, no writer lock)
     #[arg(long)]
     pub dry_run: bool,
+    /// Skip the paid-source `--dry-run` confirmation prompt (scripts)
+    #[arg(long)]
+    pub yes: bool,
 }
 
 /// The version string (pebble GWLJ-4c0qq3): `gwl-jobs $VERSION
@@ -723,6 +726,16 @@ mod tests {
             panic!("expected discover command");
         };
         assert!(!args.dry_run);
+    }
+
+    #[test]
+    fn parse_discover_yes_flag() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "discover", "--dry-run", "--yes"]).unwrap();
+        let Some(Commands::Ingest(IngestCommands::Discover(args))) = cli.command else {
+            panic!("expected discover command");
+        };
+        assert!(args.dry_run);
+        assert!(args.yes);
     }
 
     #[test]

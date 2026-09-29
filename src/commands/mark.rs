@@ -53,6 +53,7 @@ pub async fn execute_mark(
 /// Mark a lead: prepare the package (for apply-automatically), decide the
 /// events, append them, and open the URL. Returns the prepared package so the
 /// caller can surface the cheat sheet.
+#[instrument(skip_all, fields(mark, remote_known, comp_known))]
 pub(crate) fn mark_lead(
     store: &mut impl EventStore,
     config: &Config,
@@ -61,6 +62,13 @@ pub(crate) fn mark_lead(
     note: Option<String>,
 ) -> Result<Option<ApplyQueuedPayload>> {
     let lead_id = record.lead_id;
+    // Decision telemetry (theirstack-paid-feed): the mark span carries the
+    // mark plus the lead's ingest-time status, so Honeycomb can correlate the
+    // operator's action with whether the lead's remote/comp were known.
+    tracing::Span::current().record("mark", mark.as_str());
+    tracing::Span::current().record("remote_known", record.extracted.remote.is_some());
+    tracing::Span::current().record("comp_known", record.extracted.comp.is_some());
+
     // Prepare the apply package for apply-automatically (the mark IS the
     // approval; the package is assembled before the batch append so a
     // preparation failure leaves the lead unmarked).
@@ -91,6 +99,10 @@ pub(crate) fn mark_lead(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing_subscriber::layer::SubscriberExt;
+
     use super::*;
     use crate::{
         commands::{record_ingest, test_support::*},
@@ -117,5 +129,91 @@ mod tests {
         let last = events.last().unwrap();
         assert_eq!(last.event_type, "reviewed");
         assert_eq!(last.payload["mark"], "defer");
+    }
+
+    // ── decision telemetry: the mark span carries status ────────
+
+    /// A minimal tracing `Layer` that captures every recorded span field as
+    /// `(name, debug-value)`, so tests can assert what a span carried.
+    struct CapturingLayer {
+        fields: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    struct CaptureVisitor<'a> {
+        out: &'a mut Vec<(String, String)>,
+    }
+
+    impl tracing::field::Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.out
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for CapturingLayer {
+        fn on_record(
+            &self,
+            _id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut out = Vec::new();
+            let mut visitor = CaptureVisitor { out: &mut out };
+            values.record(&mut visitor);
+            self.fields.lock().unwrap().extend(out);
+        }
+    }
+
+    #[test]
+    fn mark_span_carries_mark_and_ingest_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, projection) = store_and_projection(&dir);
+        // A lead whose remote and comp are both unknown at ingest time.
+        let mut outcome = outcome("body");
+        outcome.url = Some("https://example.com/job/14".into());
+        outcome.extracted.title = Some("Staff Engineer".into());
+        outcome.extracted.company = Some("Acme".into());
+        record_ingest(&mut store, &projection, &Config::default(), &[], outcome).unwrap();
+
+        let events = store.replay().unwrap();
+        let projection = projections::rebuild(&events).unwrap();
+        let record = projection.leads.values().next().unwrap();
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let layer = CapturingLayer {
+            fields: captured.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            mark_lead(&mut store, &Config::default(), record, Mark::Defer, None).unwrap();
+        });
+
+        let fields = captured.lock().unwrap();
+        let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"mark"),
+            "mark span should carry mark: {fields:?}"
+        );
+        assert!(
+            names.contains(&"remote_known"),
+            "mark span should carry remote_known: {fields:?}"
+        );
+        assert!(
+            names.contains(&"comp_known"),
+            "mark span should carry comp_known: {fields:?}"
+        );
+        // The mark value is the defer mark; both statuses are unknown (false).
+        assert!(
+            fields
+                .iter()
+                .any(|(n, v)| n == "mark" && v.contains("defer")),
+            "mark value: {fields:?}"
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|(n, v)| n == "remote_known" && v.contains("false")),
+            "remote_known should be false: {fields:?}"
+        );
     }
 }

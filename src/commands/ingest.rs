@@ -103,6 +103,7 @@ pub fn record_ingest(
 /// `record_ingest` with a caller-supplied correlation id: a discovery run
 /// shares one correlation id across all its posting events and the trailing
 /// `discovery` event, so the whole run is one queryable unit in the log.
+#[instrument(skip_all, fields(remote_known, comp_known))]
 pub fn record_ingest_correlated(
     store: &mut impl EventStore,
     projection: &Projection,
@@ -111,6 +112,12 @@ pub fn record_ingest_correlated(
     outcome: IngestOutcome,
     correlation_id: Uuid,
 ) -> Result<IngestSummary> {
+    // Decision telemetry (theirstack-paid-feed): the ingest span carries
+    // whether the lead's status was known at ingest time, so Honeycomb can
+    // correlate "does the operator pursue unknown-status leads?"
+    tracing::Span::current().record("remote_known", outcome.extracted.remote.is_some());
+    tracing::Span::current().record("comp_known", outcome.extracted.comp.is_some());
+
     // Store the canonical URL (tracking params stripped) so re-ingests via
     // differently-tagged links don't record spurious `url` changes.
     let canonical_url = outcome

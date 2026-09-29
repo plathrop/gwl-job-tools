@@ -59,6 +59,15 @@ pub enum FetchError {
 /// server.
 pub trait Fetcher {
     fn get(&self, url: &Url) -> impl Future<Output = Result<FetchResponse>> + Send;
+
+    /// POST a JSON body with optional bearer auth (the TheirStack search
+    /// endpoint). Same politeness/retry contract as `get`.
+    fn post(
+        &self,
+        url: &Url,
+        body: String,
+        bearer: Option<String>,
+    ) -> impl Future<Output = Result<FetchResponse>> + Send;
 }
 
 /// Production transport: reqwest with a bounded timeout and an honest UA.
@@ -94,24 +103,51 @@ impl Fetcher for HttpFetcher {
             .send()
             .await
             .map_err(|e| miette::Report::new(transport(e)))?;
-        let status = response.status().as_u16();
-        let final_url = Some(response.url().to_string());
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let body = response
-            .text()
+        into_fetch_response(response)
+            .await
+            .map_err(|e| miette::Report::new(transport(e)))
+    }
+
+    async fn post(&self, url: &Url, body: String, bearer: Option<String>) -> Result<FetchResponse> {
+        let transport = |e: reqwest::Error| FetchError::Transport {
+            url: url.to_string(),
+            message: e.to_string(),
+        };
+        let mut request = self
+            .client
+            .post(url.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let response = request
+            .send()
             .await
             .map_err(|e| miette::Report::new(transport(e)))?;
-        Ok(FetchResponse {
-            status,
-            retry_after,
-            final_url,
-            body,
-        })
+        into_fetch_response(response)
+            .await
+            .map_err(|e| miette::Report::new(transport(e)))
     }
+}
+
+/// Collapse a `reqwest::Response` into the reduced [`FetchResponse`] shape
+/// shared by GET and POST (status, Retry-After, final URL, body).
+async fn into_fetch_response(response: reqwest::Response) -> Result<FetchResponse, reqwest::Error> {
+    let status = response.status().as_u16();
+    let final_url = Some(response.url().to_string());
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = response.text().await?;
+    Ok(FetchResponse {
+        status,
+        retry_after,
+        final_url,
+        body,
+    })
 }
 
 /// HTTP client with good-citizen behavior baked in: politeness delay
@@ -142,12 +178,46 @@ impl<F: Fetcher> PoliteClient<F> {
     }
 
     async fn get(&self, url: &Url) -> Result<FetchResponse> {
+        let owned = url.clone();
+        self.request(&owned, || self.fetcher.get(&owned)).await
+    }
+
+    /// POST a JSON body (with optional bearer auth) and parse the JSON
+    /// response. Shares the politeness/retry loop with `get`.
+    pub async fn post_json(
+        &self,
+        url: &Url,
+        body: &serde_json::Value,
+        bearer: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let owned = url.clone();
+        let body = serde_json::to_string(body).into_diagnostic()?;
+        let bearer = bearer.map(str::to_string);
+        let response = self
+            .request(&owned, || {
+                self.fetcher.post(&owned, body.clone(), bearer.clone())
+            })
+            .await?;
+        serde_json::from_str(&response.body)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("parsing JSON from {owned}"))
+    }
+
+    /// The shared politeness + retry loop: sleep the politeness delay,
+    /// run the request, honor `Retry-After` on 429/503 once, and fail on
+    /// any non-2xx status. `make` returns a fresh future on each call so a
+    /// retry re-issues the request.
+    async fn request<R, Fut>(&self, url: &Url, make: R) -> Result<FetchResponse>
+    where
+        R: Fn() -> Fut,
+        Fut: Future<Output = Result<FetchResponse>> + Send,
+    {
         let mut attempt = 0;
         loop {
             // Be a good citizen: fixed delay before every request.
             tokio::time::sleep(self.politeness_delay).await;
             debug!(%url, attempt, "fetching");
-            let response = self.fetcher.get(url).await?;
+            let response = make().await?;
             let status = response.status;
             if (status == 429 || status == 503) && attempt < MAX_RETRIES {
                 // Obey control headers: seconds or HTTP-date forms.
@@ -458,6 +528,20 @@ mod tests {
 
     impl Fetcher for ScriptedFetcher {
         async fn get(&self, url: &Url) -> Result<FetchResponse> {
+            self.calls.lock().unwrap().push(url.to_string());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| miette!("scripted fetcher ran out of responses"))
+        }
+
+        async fn post(
+            &self,
+            url: &Url,
+            _body: String,
+            _bearer: Option<String>,
+        ) -> Result<FetchResponse> {
             self.calls.lock().unwrap().push(url.to_string());
             self.responses
                 .lock()

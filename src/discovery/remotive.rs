@@ -1,7 +1,7 @@
 //! Remotive: a free, deterministic JSON feed of remote job postings
 //! (OpenSpec change `discovery-ingestion`). The feed URL is a proxy that
-//! redirects to the underlying ATS; the driver resolves it via
-//! [`crate::ingest::ingest_url`].
+//! redirects to the underlying ATS; the adapter resolves each URL via
+//! [`crate::ingest::ingest_url`] — the thin (re-extract) case.
 
 use std::{future::Future, pin::Pin};
 
@@ -10,8 +10,8 @@ use serde_json::Value;
 use tracing::debug;
 use url::Url;
 
-use super::{DiscoverySource, Posting};
-use crate::ingest::{HttpClient, extract};
+use super::{DiscoverySource, SourceBatch, ingest_postings};
+use crate::ingest::HttpClient;
 
 const REMOTIVE_API: &str = "https://remotive.com/api/remote-jobs";
 
@@ -26,14 +26,14 @@ impl Remotive {
         }
     }
 
-    /// Parse a Remotive API response body into postings (pure, testable).
-    pub fn parse(body: &str) -> Result<Vec<Posting>> {
+    /// Parse a Remotive API response body into posting URLs (pure, testable).
+    pub fn parse(body: &str) -> Result<Vec<Url>> {
         let json: Value = serde_json::from_str(body).into_diagnostic()?;
         let jobs = json
             .get("jobs")
             .and_then(Value::as_array)
             .ok_or_else(|| miette!("remotive API response missing jobs array (shape changed?)"))?;
-        let mut postings = Vec::with_capacity(jobs.len());
+        let mut urls = Vec::with_capacity(jobs.len());
         let mut skipped = 0;
         for job in jobs {
             let Some(url) = job.get("url").and_then(Value::as_str) else {
@@ -44,24 +44,7 @@ impl Remotive {
                 skipped += 1;
                 continue;
             };
-            postings.push(Posting {
-                url,
-                title: job.get("title").and_then(Value::as_str).map(str::to_string),
-                company: job
-                    .get("company_name")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                comp: job
-                    .get("salary")
-                    .and_then(Value::as_str)
-                    .and_then(extract::extract_comp),
-                location: job
-                    .get("candidate_required_location")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                remote: None,
-                req_id: None,
-            });
+            urls.push(url);
         }
         if skipped > 0 {
             debug!(
@@ -69,7 +52,7 @@ impl Remotive {
                 "remotive postings skipped (missing or unparseable url)"
             );
         }
-        Ok(postings)
+        Ok(urls)
     }
 }
 
@@ -80,17 +63,18 @@ impl Default for Remotive {
 }
 
 impl DiscoverySource for Remotive {
-    fn postings<'a>(
+    fn fetch<'a>(
         &'a self,
         client: &'a HttpClient,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Posting>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<SourceBatch>> + Send + 'a>> {
         Box::pin(async move {
             let url = Url::parse(&self.api_url).expect("static API URL parses");
             let body = client
                 .get_text(&url)
                 .await
                 .wrap_err_with(|| format!("fetching Remotive feed {url}"))?;
-            Self::parse(&body)
+            let postings = Self::parse(&body)?;
+            Ok(ingest_postings(postings, client).await)
         })
     }
 }
@@ -115,24 +99,23 @@ mod tests {
                     "salary": "$150,000 - $200,000 USD",
                     "description": "<p>Build things.</p>",
                     "tags": []
+                },
+                {
+                    "id": 124,
+                    "url": "not-a-url",
+                    "title": "Broken"
                 }
             ]
         }"#;
 
-        let postings = Remotive::parse(body).unwrap();
+        let urls = Remotive::parse(body).unwrap();
 
-        assert_eq!(postings.len(), 1);
-        let p = &postings[0];
-        assert_eq!(p.title.as_deref(), Some("Senior Rust Engineer"));
-        assert_eq!(p.company.as_deref(), Some("Acme"));
-        assert_eq!(p.location.as_deref(), Some("Worldwide"));
+        // The broken entry is skipped (not fatal); the valid one parses.
+        assert_eq!(urls.len(), 1);
         assert_eq!(
-            p.url.as_str(),
+            urls[0].as_str(),
             "https://remotive.com/remote-jobs/software-dev/123"
         );
-        let comp = p.comp.as_ref().unwrap();
-        assert_eq!(comp.min, Some(150_000));
-        assert_eq!(comp.max, Some(200_000));
     }
 
     #[test]
