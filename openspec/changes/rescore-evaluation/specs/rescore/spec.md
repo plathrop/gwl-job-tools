@@ -14,8 +14,8 @@ batch over the visible pipeline.
 The `rescore` command SHALL re-run gates and scoring for one lead,
 using the current configuration against the lead's latest stored
 snapshot (including the stored posting text, without refetching), and
-append exactly one evaluation to the event log: a `rejected` event if
-any gate fails, otherwise a `scored` event. No snapshot event is
+append one evaluation to the event log: one `rejected` event per
+failed gate, otherwise a single `scored` event. No snapshot event is
 appended, and the lead's marks and outcomes are untouched.
 
 #### Scenario: A lead re-scores to a new composite

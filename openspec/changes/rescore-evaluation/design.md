@@ -41,25 +41,50 @@ whose `adapter: "user"` provenance asserts a user correction — both
 wrong for rescore. The new decide path takes the replayed `LeadState`
 plus fresh `gate_failures`/`score` computed by the command layer, and
 appends `rejection_events` / `scored_event` with `revision + 1` — the
-existing helpers, unchanged. The pass-marker invariant (decision 0006:
-`scored` present ⟺ latest evaluation passed) holds by construction: a
-gate-passing re-evaluation appends `scored`, a failing one appends
-`rejected`, and the projection's snapshot-event handler already clears
-stale rejection/score state — evaluation events resolve latest-wins.
+existing helpers, unchanged. A gate-passing re-evaluation appends one
+`scored`; a failing one appends one `rejected` per failed gate (that is
+`rejection_events`' existing shape).
+
+**The pass-marker invariant needs a projection fix, not just a claim.**
+Decision 0006 (`scored` is the pass-marker) reads "latest evaluation
+wins", but the projection implements that only *implicitly*: the
+snapshot handler clears both `latest_rejection` and `latest_score`, so
+an evaluation event arriving after a snapshot lands on cleared state.
+Evaluation events set their own field and do **not** clear the
+counterpart. Today every evaluation follows a snapshot in the same
+batch, so the discipline holds — but `decide_reevaluate` appends
+evaluation events with *no* snapshot, and without a fix the
+newly-rejected direction (the case this change exists for) breaks: a
+lead with a stale `latest_score` that re-evaluates into `rejected` would
+keep the stale score, read `is_gate_rejected() == false`, and linger in
+the default list, mis-tagged, with a ghost score. The fix makes
+latest-wins explicit at the projection layer: the `REJECTED` handler
+clears `latest_score`, the `SCORED` handler clears `latest_rejection`.
+With that, both directions are sound (a revived lead's stale rejection
+is cleared too, so no consumer reading `latest_rejection` directly
+sees a ghost), and `is_gate_rejected()` (decision 0013) stays correct
+under the new no-snapshot discipline.
 
 *Alternative*: reuse `decide_edit` with a no-op field diff — rejected
 because the `edited` event would fabricate user provenance, and the
 "nothing to edit" bail exists precisely to keep edits honest.
+*Alternative considered*: emitting a snapshot event alongside the
+evaluation (keeping today's discipline intact) — rejected because it
+would fabricate a re-ingest provenance and double the log growth for
+no information gain.
 
 ### 2. Single-lead form works on any lead; batch is the visible universe
 
 `rescore <lead>` is an explicit operator action on a named lead — any
 state, including ignored and terminal (mirrors `edit`, which also does
 not suppress ignored leads). `rescore --all` is the sweep, and its
-scope is the same universe `list` shows: non-terminal ∧ non-ignored,
-gate-rejected included (the revival case). Rescoring terminal leads in
-bulk would rewrite history; rescoring ignored leads in bulk is work
-nobody can see.
+scope is the complement of decision 0013's exclusion minus the
+gate-rejected clause: non-terminal ∧ non-ignored leads, **gate-rejected
+included** (the revival case). Note this is *not* the `list` default
+view (which after DR 0013 hides gate-rejected) — the batch iterator is
+`ranked_leads()` filtered `!is_terminal() && !is_buried()`, not
+`active_leads()`. Rescoring terminal leads in bulk would rewrite
+history; rescoring ignored leads in bulk is work nobody can see.
 
 ### 3. Always append; report the delta, don't suppress no-ops
 
