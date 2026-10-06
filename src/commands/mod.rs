@@ -13,6 +13,7 @@ mod list;
 mod mark;
 mod outcome;
 mod package;
+mod rescore;
 mod review;
 mod show;
 
@@ -39,6 +40,7 @@ pub use outcome::{
 };
 pub use package::execute_package;
 pub(crate) use package::{cheat_sheet, prepare_package};
+pub use rescore::{RescoreDelta, RescoreOutcome, RescoreSummary, execute_rescore};
 pub use review::execute_review;
 pub use show::execute_show;
 #[cfg(test)]

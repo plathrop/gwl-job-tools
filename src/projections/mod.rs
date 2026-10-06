@@ -432,6 +432,13 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                         reason: payload.reason,
                         revision: payload.revision,
                     });
+                    // Latest-wins (rescore-evaluation): an evaluation event
+                    // is authoritative on its own — with no preceding
+                    // snapshot to pre-clear, it must invalidate the
+                    // counterpart itself, or a newly-rejected lead keeps
+                    // its stale score and lingers in the default view,
+                    // mis-tagged (and `is_gate_rejected` stays false).
+                    record.latest_score = None;
                     record.event_count += 1;
                     record.last_event = event.recorded_at;
                 }
@@ -477,6 +484,11 @@ pub fn rebuild(events: &[EventEnvelope]) -> Result<Projection> {
                     })?;
                 if let Some(record) = projection.leads.get_mut(&lead_id) {
                     record.latest_score = Some(payload);
+                    // Latest-wins (rescore-evaluation), the scored direction:
+                    // clear the standing rejection so a revived lead shows
+                    // no ghost rejection to direct readers
+                    // (`is_gate_rejected` goes false with a score present).
+                    record.latest_rejection = None;
                     record.event_count += 1;
                     record.last_event = event.recorded_at;
                 }
@@ -1648,6 +1660,82 @@ mod tests {
         assert!(
             active.contains(&e),
             "a revived lead re-enters the default view"
+        );
+    }
+
+    #[test]
+    fn rescore_evaluation_events_are_latest_wins() {
+        // Tasks 1.0/1.2 (rescore-evaluation): evaluation events with no
+        // preceding snapshot must be authoritative on their own — REJECTED
+        // clears the stale score (a newly-rejected lead leaves the default
+        // view, correctly tagged as gate-rejected), SCORED clears the
+        // standing rejection (a revived lead shows no ghost rejection to
+        // a direct reader of latest_rejection).
+        let a = Uuid::now_v7(); // scored -> rescore-fail (no snapshot)
+        let b = Uuid::now_v7(); // gate-rejected -> rescore-pass (no snapshot)
+
+        let mut events = scored_lead(a); // ingested + scored(rev 1)
+        events.push(envelope(
+            a,
+            3,
+            event_type::REJECTED,
+            serde_json::json!({"gate": "remote-only", "reason": "x", "revision": 2}),
+        ));
+
+        events.push(envelope(
+            b,
+            1,
+            event_type::INGESTED,
+            ingested_payload(None, Some("url:https://example.com/b"), None),
+        ));
+        events.push(envelope(
+            b,
+            2,
+            event_type::REJECTED,
+            serde_json::json!({
+                "gate": "compensation-floor",
+                "reason": "x",
+                "revision": 1
+            }),
+        ));
+        events.push(envelope(b, 3, event_type::SCORED, scored_payload(80, 2)));
+
+        let projection = rebuild(&events).unwrap();
+
+        // The newly-rejected direction: the stale score must not survive.
+        let a_record = &projection.leads[&a];
+        assert!(
+            a_record.latest_score.is_none(),
+            "stale score must not survive a no-snapshot rejection"
+        );
+        assert!(a_record.is_gate_rejected());
+        assert_eq!(a_record.lifecycle_status(), "rejected (gate)");
+        let active: Vec<Uuid> = projection
+            .active_leads()
+            .iter()
+            .map(|r| r.lead_id)
+            .collect();
+        assert!(
+            !active.contains(&a),
+            "newly-rejected lead must leave the default view"
+        );
+
+        // The revival direction: no ghost rejection for direct readers.
+        let b_record = &projection.leads[&b];
+        assert!(
+            b_record.latest_rejection.is_none(),
+            "revived lead must show no ghost rejection"
+        );
+        assert!(!b_record.is_gate_rejected());
+        assert_eq!(b_record.latest_score.as_ref().unwrap().composite, 80);
+        let active: Vec<Uuid> = projection
+            .active_leads()
+            .iter()
+            .map(|r| r.lead_id)
+            .collect();
+        assert!(
+            active.contains(&b),
+            "revived lead re-enters the default view"
         );
     }
 

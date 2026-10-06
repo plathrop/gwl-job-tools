@@ -71,6 +71,7 @@ sources (e.g. Remotive), resolving each posting to its canonical URL first.
 | `gwl-jobs review`                                         | Interactive review queue (§5 of the design doc).                                                                     |
 | `gwl-jobs mark <lead> <mark> [--note]`                    | Non-interactive mark; `apply-automatically` runs the full prepare → open flow.                                       |
 | `gwl-jobs edit <lead> [flags]`                            | Correct fields extraction missed (title, company, comp, remote, …).                                                  |
+| `gwl-jobs rescore <lead> \| --all [--dry-run]`            | Re-run gates + scoring with the current config over the stored snapshot (e.g. after a config fix); no refetch.       |
 | `gwl-jobs package <lead>`                                 | Rebuild and reopen the apply package for an apply-automatically lead.                                                |
 | `gwl-jobs show <lead> [--jd]`                             | Show a lead's projected state, or the raw posting text with `--jd`.                                                  |
 | `gwl-jobs applied\|screened\|interviewed\|offered <lead>` | Record a non-terminal transition.                                                                                    |

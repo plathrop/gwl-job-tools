@@ -330,6 +330,27 @@ pub struct ListArgs {
     pub all: bool,
 }
 
+/// `gwl-jobs rescore` (OpenSpec change rescore-evaluation): re-run gates
+/// and scoring with the current config over the stored snapshot. A lead
+/// prefix or `--all` is required.
+#[derive(Clone, Debug, Args)]
+pub struct RescoreArgs {
+    /// Unambiguous UUID prefix of the lead (any state; explicit operator
+    /// action, like `edit`)
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    pub lead: Option<String>,
+
+    /// Re-evaluate every non-terminal, non-ignored lead (gate-rejected
+    /// leads included — the revival case)
+    #[arg(long)]
+    pub all: bool,
+
+    /// Preview: evaluate against the current config but append nothing (no
+    /// event-log writes, no writer lock)
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
 #[derive(Clone, Debug, Args)]
 pub struct MarkArgs {
     /// Unambiguous UUID prefix of the lead
@@ -437,6 +458,9 @@ pub enum TriageCommands {
 
     /// Manually correct or enrich a lead's fields
     Edit(Box<EditArgs>),
+
+    /// Re-run gates and scoring with the current config
+    Rescore(RescoreArgs),
 
     /// (Re)build and re-open the apply package for an apply-automatically lead
     Package(PackageArgs),
@@ -558,6 +582,9 @@ pub async fn execute(
         Some(Commands::Triage(TriageCommands::Edit(args))) => {
             commands::execute_edit(*args, config, paths, json, color).await
         }
+        Some(Commands::Triage(TriageCommands::Rescore(args))) => {
+            commands::execute_rescore(args, config, paths, json, color).await
+        }
         Some(Commands::Triage(TriageCommands::Package(args))) => {
             commands::execute_package(args, config, paths, json).await
         }
@@ -601,6 +628,7 @@ fn cmd_label(command: &Option<Commands>) -> &'static str {
         Some(Commands::Triage(TriageCommands::Show(_))) => "show",
         Some(Commands::Triage(TriageCommands::Mark(_))) => "mark",
         Some(Commands::Triage(TriageCommands::Edit(_))) => "edit",
+        Some(Commands::Triage(TriageCommands::Rescore(_))) => "rescore",
         Some(Commands::Triage(TriageCommands::Package(_))) => "package",
         Some(Commands::Progress(ProgressCommands::Applied(_))) => "applied",
         Some(Commands::Progress(ProgressCommands::Screened(_))) => "screened",
@@ -965,6 +993,31 @@ mod tests {
         let cli = Cli::try_parse_from(["gwl-jobs", "list"]).unwrap();
         assert!(cli.data_dir.is_none());
         assert!(cli.config.is_none());
+    }
+
+    #[test]
+    fn parse_rescore_single_lead() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "rescore", "0192f8a1"]).unwrap();
+        assert_eq!(cli.command_name(), "rescore");
+    }
+
+    #[test]
+    fn parse_rescore_all_and_dry_run() {
+        let cli = Cli::try_parse_from(["gwl-jobs", "rescore", "--all", "--dry-run"]).unwrap();
+        assert_eq!(cli.command_name(), "rescore");
+        let Some(Commands::Triage(TriageCommands::Rescore(args))) = cli.command else {
+            panic!("expected rescore command");
+        };
+        assert!(args.all);
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn parse_rescore_requires_a_target() {
+        // The spec: bare `rescore` fails loudly with a usage error.
+        assert!(Cli::try_parse_from(["gwl-jobs", "rescore"]).is_err());
+        // A lead and --all conflict: the sweep is not per-lead.
+        assert!(Cli::try_parse_from(["gwl-jobs", "rescore", "abc", "--all"]).is_err());
     }
 
     #[test]

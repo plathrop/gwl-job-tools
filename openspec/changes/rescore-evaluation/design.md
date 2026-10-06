@@ -65,6 +65,8 @@ is cleared too, so no consumer reading `latest_rejection` directly
 sees a ghost), and `is_gate_rejected()` (decision 0013) stays correct
 under the new no-snapshot discipline.
 
+**The revision counter needs the aggregate-side counterpart.** `LeadState::eval_revision` counts snapshot events (an evaluation failing multiple gates emits several `rejected` events at one revision, so counting events would over-count), which means a no-snapshot rescore would not advance it on replay — a second rescore would reuse the revision. `evolve` therefore takes the payload's `revision` as a floor on `rejected`/`scored` (snapshot events keep it exact), and both directions are tested.
+
 *Alternative*: reuse `decide_edit` with a no-op field diff — rejected
 because the `edited` event would fabricate user provenance, and the
 "nothing to edit" bail exists precisely to keep edits honest.

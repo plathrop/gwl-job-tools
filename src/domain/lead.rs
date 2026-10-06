@@ -116,7 +116,26 @@ pub fn evolve(state: &mut LeadState, event: &EventEnvelope) -> Result<()> {
                         event.id, event.seq
                     ))
                 })?;
+            // No-snapshot re-evaluations (rescore) advance the revision via
+            // the event payload: take the payload's revision as a floor so
+            // replaying rescore events keeps the counter correct across
+            // repeated rescores. Snapshot events keep it exact (the +1 in
+            // `rejection_events`/`scored_event` reads this counter).
+            state.eval_revision = state.eval_revision.max(score.revision);
             state.latest_score = Some(score);
+        }
+        event_type::REJECTED => {
+            let payload: RejectedPayload = serde_json::from_value(event.payload.clone())
+                .into_diagnostic()
+                .map_err(|e| {
+                    e.wrap_err(format!(
+                        "decoding rejected payload of event {} (seq {})",
+                        event.id, event.seq
+                    ))
+                })?;
+            // Same revision floor as SCORED: with no snapshot event to
+            // count, the revision travels in the event payload.
+            state.eval_revision = state.eval_revision.max(payload.revision);
         }
         _ => {}
     }
@@ -365,6 +384,37 @@ fn rejection_events(
             )
         })
         .collect()
+}
+
+/// Decide the events for a no-snapshot re-evaluation (`gwl-jobs rescore`,
+/// OpenSpec change rescore-evaluation): re-run gates and scoring with the
+/// current config over the stored snapshot. Unlike `decide_edit` there is
+/// no user correction and no snapshot event — only the evaluation events
+/// (`rejected` XOR `scored`, decision 0006) at the next revision. Marks
+/// and outcomes are untouched: a rescore is not a review decision. Like
+/// `edit`, the single-lead form does not suppress ignored leads (explicit
+/// operator action on a named lead); the `--all` sweep excludes them at
+/// the command layer.
+pub fn decide_reevaluate(
+    state: &LeadState,
+    gate_failures: Vec<GateFailure>,
+    score: Option<ScoreResult>,
+) -> Result<Vec<PendingEvent>> {
+    if !state.exists {
+        bail!("cannot rescore a lead that does not exist");
+    }
+    // Pass-marker invariant (decision 0006), as on the ingest/edit paths.
+    if !gate_failures.is_empty() && score.is_some() {
+        bail!("evaluation cannot be both rejected and scored");
+    }
+    if gate_failures.is_empty() && score.is_none() {
+        bail!("a gate-passing evaluation must carry a score");
+    }
+    let mut events = rejection_events(state, gate_failures)?;
+    if let Some(score) = score {
+        events.push(scored_event(state, score)?);
+    }
+    Ok(events)
 }
 
 /// Decide the events for a user mark (design doc 0001 §3, §5). Marks are
@@ -1423,6 +1473,102 @@ mod tests {
         .unwrap();
         assert_eq!(kind, IngestKind::Suppressed);
         assert_eq!(events[0].event_type, event_type::REINGEST_SUPPRESSED);
+    }
+
+    // ── decide_reevaluate ───────────────────────────────
+
+    #[test]
+    fn rescore_pass_appends_scored_at_next_revision() {
+        // No snapshot, no `edited` — just the evaluation event, at the
+        // revision after the last one (existing_state has one evaluation).
+        let state = existing_state();
+        let events = decide_reevaluate(&state, vec![], Some(score_result())).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, event_type::SCORED);
+        assert_eq!(events[0].payload["revision"], 2);
+        assert_eq!(events[0].payload["composite"], 50);
+    }
+
+    #[test]
+    fn rescore_fail_appends_one_rejected_per_failed_gate() {
+        let state = existing_state();
+        let failures = vec![
+            GateFailure {
+                gate: crate::domain::gates::Gate::RemoteOnly,
+                reason: "on-site".into(),
+            },
+            GateFailure {
+                gate: crate::domain::gates::Gate::Blacklist,
+                reason: "blacklisted".into(),
+            },
+        ];
+        let events = decide_reevaluate(&state, failures, None).unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.event_type == event_type::REJECTED));
+        assert_eq!(events[0].payload["revision"], 2);
+        assert_eq!(events[1].payload["revision"], 2);
+    }
+
+    #[test]
+    fn rescore_nonexistent_lead_bails() {
+        let result = decide_reevaluate(&LeadState::default(), vec![], Some(score_result()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rescore_evaluation_cannot_be_both_rejected_and_scored() {
+        let failure = GateFailure {
+            gate: crate::domain::gates::Gate::RemoteOnly,
+            reason: "on-site".into(),
+        };
+        let result = decide_reevaluate(&existing_state(), vec![failure], Some(score_result()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rescore_passing_evaluation_requires_a_score() {
+        let result = decide_reevaluate(&existing_state(), vec![], None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn repeated_rescores_advance_the_revision_on_replay() {
+        // The aggregate's revision floor: replaying a no-snapshot rescore's
+        // events raises eval_revision to the payload's revision, so a
+        // second rescore emits the NEXT revision instead of reusing one.
+        let mut state = existing_state(); // eval_revision 1
+        let scored = EventEnvelope {
+            event_type: event_type::SCORED.into(),
+            seq: 2,
+            payload: serde_json::json!({
+                "composite": 60,
+                "revision": 2,
+                "dimensions": [],
+                "breakdown": "60"
+            }),
+            ..ingested_envelope()
+        };
+        evolve(&mut state, &scored).unwrap();
+        assert_eq!(state.eval_revision, 2);
+
+        let events = decide_reevaluate(&state, vec![], Some(score_result())).unwrap();
+        assert_eq!(events[0].payload["revision"], 3);
+    }
+
+    #[test]
+    fn evolve_rejected_advances_the_revision_floor() {
+        // The rejected direction of the same floor: without it, a rescore
+        // that rejects would not advance the counter on replay, and a
+        // second rescore would reuse the revision.
+        let mut state = existing_state();
+        let rejected = EventEnvelope {
+            event_type: event_type::REJECTED.into(),
+            seq: 2,
+            payload: serde_json::json!({"gate": "remote-only", "reason": "x", "revision": 2}),
+            ..ingested_envelope()
+        };
+        evolve(&mut state, &rejected).unwrap();
+        assert_eq!(state.eval_revision, 2);
     }
 
     // ── decide_mark ──────────────────────────────────────────────
