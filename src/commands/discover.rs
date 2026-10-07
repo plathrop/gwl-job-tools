@@ -52,6 +52,10 @@ pub struct BatchSummary {
     /// level (the incident this fixes: a 402 mid-pagination whose only trace
     /// was a warn! beneath the default error file-sink level).
     pub failed_source_reasons: BTreeMap<String, String>,
+    /// Credits spent per paid source (`theirstack-spend-control`): records
+    /// returned = credits, per TheirStack's pricing. Free sources report
+    /// nothing here. The operator's answer to "what did this run cost".
+    pub credits_spent_by_source: BTreeMap<String, u64>,
     /// True when this summary is a `--dry-run` preview (no events written),
     /// so a scripted `--json` consumer can tell a preview from a real run.
     pub dry_run: bool,
@@ -69,6 +73,7 @@ struct Flattened {
     truncated_results: u64,
     failed_sources: Vec<String>,
     failed_source_reasons: BTreeMap<String, String>,
+    credits_spent_by_source: BTreeMap<String, u64>,
     new_watermark: HashMap<String, String>,
 }
 
@@ -88,6 +93,10 @@ fn flatten_fetches(fetches: Vec<discovery::SourceFetch>) -> Flattened {
                 }
                 flat.failed_postings += batch.failed;
                 flat.truncated_results += batch.truncated_results;
+                if batch.credits_spent > 0 {
+                    flat.credits_spent_by_source
+                        .insert(source.clone(), batch.credits_spent);
+                }
                 if let Some(ts) = batch.discovered_at {
                     flat.new_watermark.insert(source.clone(), ts);
                 }
@@ -114,6 +123,7 @@ fn apply_fetch_facts(summary: &mut BatchSummary, flat: &Flattened) {
     summary.failed_sources = flat.failed_sources.clone();
     summary.failed_source_reasons = flat.failed_source_reasons.clone();
     summary.truncated_results = flat.truncated_results;
+    summary.credits_spent_by_source = flat.credits_spent_by_source.clone();
 }
 
 /// Decision for gating a paid `--dry-run`: proceed, prompt, or refuse.
@@ -365,6 +375,14 @@ fn print_summary(summary: &BatchSummary, json: bool) -> Result<()> {
         for (source, reason) in &summary.failed_source_reasons {
             println!("    {source}: {reason}");
         }
+    }
+    if !summary.credits_spent_by_source.is_empty() {
+        let spend: Vec<String> = summary
+            .credits_spent_by_source
+            .iter()
+            .map(|(source, credits)| format!("{source} {credits}"))
+            .collect();
+        println!("  credits spent: {}", spend.join(", "));
     }
     Ok(())
 }
@@ -881,6 +899,7 @@ mod tests {
             truncated_results: 301,
             discovered_at: Some("2024-01-02T00:00:00Z".into()),
             partial_error,
+            credits_spent: 301,
         }
     }
 
@@ -905,6 +924,7 @@ mod tests {
         assert_eq!(flat.truncated_results, 301);
         assert_eq!(flat.failed_sources, vec!["theirstack".to_string()]);
         assert!(flat.failed_source_reasons["theirstack"].contains("402"));
+        assert_eq!(flat.credits_spent_by_source["theirstack"], 301);
         assert_eq!(
             flat.new_watermark.get("theirstack").map(String::as_str),
             Some("2024-01-02T00:00:00Z")
@@ -958,6 +978,7 @@ mod tests {
             "status 402: out of credits"
         );
         assert_eq!(value["truncated_results"], 301);
+        assert_eq!(value["credits_spent_by_source"]["theirstack"], 301);
     }
 
     #[test]

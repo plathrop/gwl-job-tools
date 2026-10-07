@@ -121,6 +121,12 @@ enabled = true
 api_key = "${THEIRSTACK_API_KEY}" # env-var reference, resolved config-wide
 posted_at_max_age_days = 30 # recency window for the first backfill
 strict_filtering = false # opt-in: push remote/comp gates server-side
+max_credits_per_run = 750 # optional: cap one run's spend (records = credits)
+
+[sources.theirstack.query] # optional: any documented TheirStack filter
+job_seniority_or = ["senior", "staff"]
+job_technology_slug_or = ["kubernetes", "terraform"]
+job_country_code_or = ["US", "CA"]
 ```
 
 Discovery sources are opt-in and fetched only when `enabled = true`. The
@@ -134,6 +140,26 @@ authoritative backstop. A paid fetch that fails partway (e.g. credits
 exhausted mid-pagination, a 402) keeps the records already paid for — they
 are ingested and the watermark advances — while the source is still reported
 as failed, with the reason, in the summary and the run event.
+
+The `[sources.theirstack.query]` table spends credits only on postings you
+chose: every entry is merged into the TheirStack search request, so you can
+narrow the feed server-side (titles, technologies, seniority, countries,
+salary, workplace type — any parameter TheirStack documents; build a search
+in their app UI and copy the cURL). Keys the adapter itself owns (`limit`,
+`page`, `posted_at_max_age_days`, `discovered_at_gte`, `company_name_not`,
+`company_domain_not`) are rejected at load time; `workplace_types_or` and
+`min_salary_usd` are rejected only when `strict_filtering` is on (with it
+off, they're yours — e.g. `workplace_types_or = ["remote", "hybrid"]`).
+Everything a narrowed feed returns still passes through every client-side
+gate and the scoring pipeline — filtering is a spend decision, not a gate.
+
+Paid fetches are bounded: before each page the adapter checks the free
+credit-balance endpoint and caps the page to what the balance can pay for,
+so a small balance is a small fetch instead of a rejected one — and
+`max_credits_per_run` bounds a single run's spend regardless of balance.
+When either bound stops the run, already-paid records are ingested and the
+stop is reported with its reason. The summary reports credits spent per
+paid source (`credits spent: theirstack 750`).
 
 ## How it works
 

@@ -41,6 +41,10 @@ pub struct SourceBatch {
     /// — the driver ingests them, records the watermark, and reports the
     /// source as failed with this reason.
     pub partial_error: Option<String>,
+    /// Credits this fetch spent: records a paid source returned (one credit
+    /// per record is TheirStack's pricing, so the count IS the spend).
+    /// `0` for free sources — spend is a paid-source fact.
+    pub credits_spent: u64,
 }
 
 /// A feed source: fetch its already-extracted postings. Feed-agnostic — free
@@ -128,6 +132,7 @@ pub async fn fetch_sources(
             unknown_salary = tracing::field::Empty,
             strict_would_drop = tracing::field::Empty,
             truncated_results = tracing::field::Empty,
+            credits_spent = tracing::field::Empty,
         );
         match source.fetch(client).instrument(span.clone()).await {
             Ok(batch) => {
@@ -140,6 +145,7 @@ pub async fn fetch_sources(
                 span.record("unknown_salary", rates.unknown_salary);
                 span.record("strict_would_drop", rates.strict_would_drop);
                 span.record("truncated_results", batch.truncated_results);
+                span.record("credits_spent", batch.credits_spent);
                 debug!(
                     source = %name,
                     count = batch.outcomes.len(),
@@ -202,6 +208,7 @@ pub(crate) async fn ingest_postings<F: Fetcher>(
         truncated_results: 0,
         discovered_at: None,
         partial_error: None,
+        credits_spent: 0,
     }
 }
 
@@ -257,7 +264,7 @@ fn make_source(
                 .unwrap_or_default();
             Ok(Box::new(theirstack::Theirstack::new(
                 &source, config, watermark,
-            )))
+            )?))
         }
         other => Err(miette!(
             "unknown source '{other}' (known: remotive, theirstack)"
@@ -383,6 +390,7 @@ mod tests {
                         truncated_results: 0,
                         discovered_at: None,
                         partial_error,
+                        credits_spent: 0,
                     })
                 }
             })
@@ -404,6 +412,7 @@ mod tests {
                         truncated_results: 0,
                         discovered_at: None,
                         partial_error: None,
+                        credits_spent: 0,
                     },
                 }),
             ),
@@ -418,6 +427,7 @@ mod tests {
                         truncated_results: 0,
                         discovered_at: None,
                         partial_error: None,
+                        credits_spent: 0,
                     },
                 }),
             ),
@@ -520,6 +530,7 @@ mod tests {
                     truncated_results: 0,
                     discovered_at: None,
                     partial_error: None,
+                    credits_spent: 0,
                 },
             }),
         )];
@@ -566,6 +577,7 @@ mod tests {
                         truncated_results: 301,
                         discovered_at: Some("2024-01-02T00:00:00Z".into()),
                         partial_error: None,
+                        credits_spent: 301,
                     },
                 }),
             ),
@@ -653,6 +665,10 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| miette::miette!("scripted fetcher ran out of responses"))
+        }
+
+        async fn get_bearer(&self, _url: &Url, _bearer: Option<String>) -> Result<FetchResponse> {
+            self.get(_url).await
         }
 
         async fn post(

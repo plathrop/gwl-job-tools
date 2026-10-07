@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -167,6 +167,19 @@ pub struct SourceConfig {
     /// Opt-in strict filtering: push the permissive gates into the source
     /// query (documented per adapter). Ignored by Remotive.
     pub strict_filtering: bool,
+    /// Optional per-run spend bound for a paid source
+    /// (`theirstack-spend-control`): the maximum number of credits one
+    /// `discover` run may spend on this source (records returned = credits).
+    /// Absent = the account balance is the only bound. Ignored by Remotive.
+    pub max_credits_per_run: Option<u64>,
+    /// Generic server-side query filters (`theirstack-spend-control`
+    /// design decision 1): merged into the paid source's search request
+    /// body, so credits are spent only on postings the operator chose.
+    /// Keys the adapter itself owns (pagination, recency, the watermark
+    /// cursor, the blacklist pre-filter — and, when strict mode is on, the
+    /// strict gates) are rejected at adapter construction, before any
+    /// network I/O. Ignored by Remotive.
+    pub query: Option<BTreeMap<String, toml::Value>>,
 }
 
 impl Default for SourceConfig {
@@ -176,6 +189,8 @@ impl Default for SourceConfig {
             api_key: String::new(),
             posted_at_max_age_days: 30,
             strict_filtering: false,
+            max_credits_per_run: None,
+            query: None,
         }
     }
 }
@@ -686,6 +701,80 @@ compensation = 0.4
         assert_eq!(source.api_key, "");
         assert_eq!(source.posted_at_max_age_days, 30);
         assert!(!source.strict_filtering);
+    }
+
+    // ── Sources: spend-control fields (theirstack-spend-control) ─
+
+    #[test]
+    fn theirstack_spend_control_fields_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(Config::FILE_NAME),
+            "[sources.theirstack]\nenabled = true\nmax_credits_per_run = 750\n\n[sources.theirstack.query]\njob_seniority_or = [\"senior\", \"staff\"]\njob_country_code_or = [\"US\"]\neasy_apply = true\n",
+        )
+        .unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        let source = &config.sources["theirstack"];
+        assert_eq!(source.max_credits_per_run, Some(750));
+        let query = source.query.as_ref().expect("query table parses");
+        assert_eq!(
+            query.get("job_seniority_or").and_then(|v| v.as_array()),
+            Some(&vec![
+                toml::Value::from("senior"),
+                toml::Value::from("staff"),
+            ])
+        );
+        assert_eq!(
+            query.get("easy_apply").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn theirstack_spend_control_fields_default() {
+        // Absent = current behavior: no budget (the balance is the only
+        // bound) and no query table (the default query).
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join(Config::FILE_NAME), "[sources.theirstack]\n").unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        let source = &config.sources["theirstack"];
+        assert_eq!(source.max_credits_per_run, None);
+        assert!(source.query.is_none());
+    }
+
+    #[test]
+    fn query_values_get_env_interpolation() {
+        // Config-wide `${VAR}` interpolation runs over the whole TOML tree,
+        // so query-table values reference env vars like any other string.
+        const UNSET: &str = "GWL_JOB_TOOLS_UNSET_VAR_9f3k2m";
+        assert!(std::env::var(UNSET).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join(Config::FILE_NAME),
+            format!(
+                "[sources.theirstack.query]\njob_description_pattern_or = [\"x-${{{UNSET}}}-y\"]\n"
+            ),
+        )
+        .unwrap();
+        let paths = AppPaths::new(config_dir, dir.path().join("data"));
+        let config = Config::load(&paths).unwrap();
+        let query = config.sources["theirstack"]
+            .query
+            .as_ref()
+            .expect("query table parses");
+        let patterns = query
+            .get("job_description_pattern_or")
+            .and_then(|v| v.as_array())
+            .expect("filter is an array");
+        assert_eq!(patterns.first().and_then(|v| v.as_str()), Some("x--y"));
     }
 
     #[test]

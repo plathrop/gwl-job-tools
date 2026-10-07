@@ -60,6 +60,15 @@ pub enum FetchError {
 pub trait Fetcher {
     fn get(&self, url: &Url) -> impl Future<Output = Result<FetchResponse>> + Send;
 
+    /// GET with optional bearer auth (the TheirStack credit-balance
+    /// endpoint). Production transports must honor the bearer — there is no
+    /// default, so an implementation cannot silently drop authentication.
+    fn get_bearer(
+        &self,
+        url: &Url,
+        bearer: Option<String>,
+    ) -> impl Future<Output = Result<FetchResponse>> + Send;
+
     /// POST a JSON body with optional bearer auth (the TheirStack search
     /// endpoint). Same politeness/retry contract as `get`.
     fn post(
@@ -100,6 +109,24 @@ impl Fetcher for HttpFetcher {
         let response = self
             .client
             .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| miette::Report::new(transport(e)))?;
+        into_fetch_response(response)
+            .await
+            .map_err(|e| miette::Report::new(transport(e)))
+    }
+
+    async fn get_bearer(&self, url: &Url, bearer: Option<String>) -> Result<FetchResponse> {
+        let transport = |e: reqwest::Error| FetchError::Transport {
+            url: url.to_string(),
+            message: e.to_string(),
+        };
+        let mut request = self.client.get(url.clone());
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| miette::Report::new(transport(e)))?;
@@ -294,6 +321,24 @@ impl<F: Fetcher> PoliteClient<F> {
         serde_json::from_str(&body)
             .into_diagnostic()
             .wrap_err_with(|| format!("parsing JSON from {url}"))
+    }
+
+    /// GET with optional bearer auth, returning parsed JSON (non-2xx
+    /// fails). The credit-balance endpoints of paid sources are the
+    /// current user (theirstack-spend-control design decision 2).
+    pub async fn get_json_auth(
+        &self,
+        url: &Url,
+        bearer: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let owned = url.clone();
+        let bearer = bearer.map(str::to_string);
+        let response = self
+            .request(&owned, || self.fetcher.get_bearer(&owned, bearer.clone()))
+            .await?;
+        serde_json::from_str(&response.body)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("parsing JSON from {owned}"))
     }
 }
 
@@ -571,6 +616,10 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| miette!("scripted fetcher ran out of responses"))
+        }
+
+        async fn get_bearer(&self, url: &Url, _bearer: Option<String>) -> Result<FetchResponse> {
+            self.get(url).await
         }
 
         async fn post(
