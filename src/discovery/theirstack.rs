@@ -4,9 +4,10 @@
 //! the adapter maps records directly to [`IngestOutcome`] — no re-fetch of the
 //! canonical page (the snapshot path).
 
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, sync::LazyLock};
 
 use miette::{Result, bail};
+use regex::Regex;
 use serde_json::{Value, json};
 use tracing::debug;
 use url::Url;
@@ -171,19 +172,19 @@ impl DiscoverySource for Theirstack {
             }
             let query = self.build_query();
             let api_url = Url::parse(&self.api_url).expect("static API URL parses");
-            let (jobs, truncated_results) =
-                fetch_jobs(client, &api_url, &query, &self.api_key).await?;
-            let discovered_at = max_discovered_at(&jobs);
-            let mut outcomes = Vec::with_capacity(jobs.len());
-            for job in jobs {
+            let fetched = fetch_jobs(client, &api_url, &query, &self.api_key).await?;
+            let discovered_at = max_discovered_at(&fetched.jobs);
+            let mut outcomes = Vec::with_capacity(fetched.jobs.len());
+            for job in fetched.jobs {
                 emit_mismatches(&job);
                 outcomes.push(job.into_outcome());
             }
             Ok(SourceBatch {
                 outcomes,
                 failed: 0,
-                truncated_results,
+                truncated_results: fetched.truncated_results,
                 discovered_at,
+                partial_error: fetched.partial_error,
             })
         })
     }
@@ -193,36 +194,108 @@ impl DiscoverySource for Theirstack {
     }
 }
 
+/// The outcome of a paginated fetch: the jobs (possibly partial), the
+/// credit-exhaustion count, and — when the fetch ended early after records
+/// were already paid for — why it ended (design decision 8).
+#[derive(Debug, Default)]
+struct FetchedJobs {
+    jobs: Vec<TheirstackJob>,
+    truncated_results: u64,
+    partial_error: Option<String>,
+}
+
 /// Paginate the search endpoint (serial, `page`-based) until a page returns
 /// fewer than the page size. Generic over the transport seam so tests can
-/// script the responses.
+/// script the responses. A failure AFTER records have been fetched salvages
+/// them — they are paid for — and returns the partial batch with the
+/// failure's reason; a failure before any record is fetched is a hard
+/// `Err` (the whole-source failure contract is unchanged).
 async fn fetch_jobs<F: Fetcher>(
     client: &PoliteClient<F>,
     api_url: &Url,
     query: &Value,
     api_key: &str,
-) -> Result<(Vec<TheirstackJob>, u64)> {
-    let mut jobs = Vec::new();
-    let mut truncated_results = 0u64;
+) -> Result<FetchedJobs> {
+    let mut fetched = FetchedJobs::default();
     let mut page = 0u64;
     loop {
         let mut page_query = query.clone();
         if let Value::Object(ref mut map) = page_query {
             map.insert("page".into(), json!(page));
         }
-        let response = client
-            .post_json(api_url, &page_query, Some(api_key))
-            .await?;
-        let parsed = Theirstack::parse_response(&response)?;
-        truncated_results = truncated_results.max(parsed.truncated_results);
-        let count = parsed.jobs.len();
-        jobs.extend(parsed.jobs);
-        if count < PAGE_SIZE as usize {
-            break;
+        // One page: 2xx parses; every other outcome becomes a reason
+        // string. The 402 body is mined BEFORE the salvage decision — its
+        // "Required: N API credits" is the unreturned-record count the
+        // credit-exhaustion contract needs.
+        let step: std::result::Result<TheirstackResponse, String> = match client
+            .post_json_status(api_url, &page_query, Some(api_key))
+            .await
+        {
+            Ok((status, value)) if (200..300).contains(&status) => match value {
+                Some(value) => Theirstack::parse_response(&value)
+                    .map_err(|e| format!("parsing theirstack page {page} response: {e}")),
+                None => Err(format!(
+                    "theirstack page {page}: response body is not valid JSON"
+                )),
+            },
+            Ok((status, value)) => {
+                let mut reason = format!("fetching {api_url} failed with status {status}");
+                if let Some(detail) = value
+                    .as_ref()
+                    .and_then(|v| v.get("error"))
+                    .and_then(|e| e.get("description"))
+                    .and_then(Value::as_str)
+                {
+                    reason.push_str(&format!(": {detail}"));
+                }
+                if status == 402 {
+                    fetched.truncated_results += unreturned_from_402(value.as_ref());
+                }
+                Err(reason)
+            }
+            Err(err) => Err(err.to_string()),
+        };
+        match step {
+            Ok(parsed) => {
+                fetched.truncated_results = fetched.truncated_results.max(parsed.truncated_results);
+                let count = parsed.jobs.len();
+                fetched.jobs.extend(parsed.jobs);
+                if count < PAGE_SIZE as usize {
+                    return Ok(fetched);
+                }
+                page += 1;
+            }
+            Err(reason) => {
+                if fetched.jobs.is_empty() {
+                    bail!("{reason}");
+                }
+                fetched.partial_error = Some(reason);
+                return Ok(fetched);
+            }
         }
-        page += 1;
     }
-    Ok((jobs, truncated_results))
+}
+
+/// TheirStack's 402 credit-exhaustion body states how many credits the
+/// rejected results required — one credit per record, so that number IS
+/// the unreturned-record count (live-verified 2026-10-07, GWLJ-2yflze).
+/// Best-effort: any shape change just yields 0, and the failure reason
+/// string still carries the full error text.
+fn unreturned_from_402(value: Option<&Value>) -> u64 {
+    let description = value
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    // Live body: "...Required: 301 API credits. You currently have 199 API
+    // credits. You need 301 more API credits."
+    static REQUIRED_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"Required: (\d+) API credits").expect("static regex compiles")
+    });
+    REQUIRED_RE
+        .captures(description)
+        .and_then(|caps| caps[1].parse().ok())
+        .unwrap_or(0)
 }
 
 fn parse_job(record: &Value) -> TheirstackJob {
@@ -910,8 +983,11 @@ mod tests {
     /// A captured POST: the serialized JSON body and optional bearer token.
     type CapturedRequest = (String, Option<String>);
 
+    /// A scripted POST response: HTTP status plus the JSON body.
+    type ScriptedResponse = (u16, Value);
+
     struct ScriptedFetcher {
-        responses: Arc<Mutex<VecDeque<Value>>>,
+        responses: Arc<Mutex<VecDeque<ScriptedResponse>>>,
         requests: Arc<Mutex<Vec<CapturedRequest>>>,
     }
 
@@ -927,14 +1003,14 @@ mod tests {
             bearer: Option<String>,
         ) -> Result<FetchResponse> {
             self.requests.lock().unwrap().push((body, bearer));
-            let value = self
+            let (status, value) = self
                 .responses
                 .lock()
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| miette::miette!("scripted fetcher ran out of responses"))?;
             Ok(FetchResponse {
-                status: 200,
+                status,
                 retry_after: None,
                 final_url: None,
                 body: serde_json::to_string(&value).unwrap(),
@@ -967,17 +1043,18 @@ mod tests {
         });
         let requests = Arc::new(Mutex::new(Vec::new()));
         let fetcher = ScriptedFetcher {
-            responses: Arc::new(Mutex::new(VecDeque::from([page0, page1]))),
+            responses: Arc::new(Mutex::new(VecDeque::from([(200, page0), (200, page1)]))),
             requests: requests.clone(),
         };
         let client = PoliteClient::new(fetcher);
         let url = Url::parse(THEIRSTACK_API).unwrap();
         let query = serde_json::json!({"posted_at_max_age_days": 30, "limit": PAGE_SIZE});
 
-        let (jobs, truncated) = fetch_jobs(&client, &url, &query, "secret").await.unwrap();
+        let fetched = fetch_jobs(&client, &url, &query, "secret").await.unwrap();
 
-        assert_eq!(jobs.len(), 501);
-        assert_eq!(truncated, 5);
+        assert_eq!(fetched.jobs.len(), 501);
+        assert_eq!(fetched.truncated_results, 5);
+        assert_eq!(fetched.partial_error, None);
 
         let reqs = requests.lock().unwrap();
         assert_eq!(reqs.len(), 2);
@@ -986,5 +1063,117 @@ mod tests {
         assert!(reqs[1].0.contains("\"page\":1"));
         assert_eq!(reqs[0].1.as_deref(), Some("secret"));
         assert_eq!(reqs[1].1.as_deref(), Some("secret"));
+    }
+
+    // ── mid-pagination salvage (design decision 8) ────────────
+
+    /// TheirStack's live 402 body (E-007, observed 2026-10-07): the
+    /// "Required: N API credits" clause is the unreturned-record count.
+    fn credit_402_body(required: u64, available: u64) -> Value {
+        serde_json::json!({
+            "request_id": 58596504,
+            "error": {
+                "code": "E-007",
+                "title": "Not enough credits to perform this action",
+                "description": format!(
+                    "You need to upgrade your plan to perform this action. \
+                     Required: {required} API credits. You currently have \
+                     {available} API credits. You need {required} more API credits."
+                )
+            }
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mid_pagination_402_salvages_fetched_jobs() {
+        // The live incident: page 0 returns a full paid page, page 1 hits
+        // 402 with 199 credits left and 301 still required. The fetched
+        // records must survive (they are paid for), the unreturned count
+        // must surface as truncation, and the reason must carry the error.
+        fn job(i: usize) -> Value {
+            serde_json::json!({
+                "job_title": "Engineer",
+                "description": "Remote job.",
+                "final_url": format!("https://example.com/job/{i}"),
+                "discovered_at": "2024-01-01T00:00:00"
+            })
+        }
+        let page0 = serde_json::json!({
+            "data": (0..PAGE_SIZE as usize).map(job).collect::<Vec<_>>(),
+            "metadata": {"truncated_results": 0}
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let fetcher = ScriptedFetcher {
+            responses: Arc::new(Mutex::new(VecDeque::from([
+                (200, page0),
+                (402, credit_402_body(301, 199)),
+            ]))),
+            requests,
+        };
+        let client = PoliteClient::new(fetcher);
+        let url = Url::parse(THEIRSTACK_API).unwrap();
+        let query = serde_json::json!({"posted_at_max_age_days": 30, "limit": PAGE_SIZE});
+
+        let fetched = fetch_jobs(&client, &url, &query, "secret").await.unwrap();
+
+        assert_eq!(fetched.jobs.len(), PAGE_SIZE as usize);
+        assert_eq!(fetched.truncated_results, 301);
+        let reason = fetched
+            .partial_error
+            .expect("partial fetch carries its reason");
+        assert!(reason.contains("status 402"), "reason: {reason}");
+        assert!(
+            reason.contains("Required: 301 API credits"),
+            "reason: {reason}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_page_402_fails_the_whole_source() {
+        // Nothing fetched yet — the whole-source failure contract is
+        // unchanged, but the error must carry the 402 and its detail.
+        let fetcher = ScriptedFetcher {
+            responses: Arc::new(Mutex::new(VecDeque::from([(
+                402,
+                credit_402_body(500, 199),
+            )]))),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        };
+        let client = PoliteClient::new(fetcher);
+        let url = Url::parse(THEIRSTACK_API).unwrap();
+        let query = serde_json::json!({"posted_at_max_age_days": 30, "limit": PAGE_SIZE});
+
+        let err = fetch_jobs(&client, &url, &query, "secret")
+            .await
+            .expect_err("page-0 failure must Err");
+        let message = err.to_string();
+        assert!(message.contains("status 402"), "message: {message}");
+        assert!(
+            message.contains("E-007") || message.contains("credits"),
+            "message: {message}"
+        );
+    }
+
+    #[test]
+    fn unreturned_count_parses_the_live_402_body() {
+        let body = credit_402_body(301, 199);
+        assert_eq!(unreturned_from_402(Some(&body)), 301);
+    }
+
+    #[test]
+    fn unreturned_count_is_best_effort_on_unknown_shapes() {
+        // Shape drift or a non-JSON body yields 0 — the reason string, not
+        // the count, is the contract that must always hold.
+        assert_eq!(unreturned_from_402(None), 0);
+        assert_eq!(
+            unreturned_from_402(Some(&serde_json::json!({"error": {}}))),
+            0
+        );
+        assert_eq!(
+            unreturned_from_402(Some(&serde_json::json!({
+                "error": {"description": "something else entirely"}
+            }))),
+            0
+        );
     }
 }

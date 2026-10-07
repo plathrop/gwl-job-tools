@@ -14,7 +14,7 @@ pub mod theirstack;
 use std::{collections::HashMap, future::Future, pin::Pin};
 
 use miette::{Result, miette};
-use tracing::{Instrument, debug, instrument, warn};
+use tracing::{Instrument, debug, error, instrument, warn};
 use url::Url;
 
 use crate::{
@@ -35,6 +35,12 @@ pub struct SourceBatch {
     /// The max `discovered_at` (UTC-normalized) seen in this fetch, for the
     /// watermark cursor. `None` for sources without one (Remotive).
     pub discovered_at: Option<String>,
+    /// Why a fetch ended early AFTER records were fetched (design decision
+    /// 8: mid-pagination failure on a paid source). `None` on a complete
+    /// fetch; `Some(reason)` means the outcomes are a paid-for partial batch
+    /// — the driver ingests them, records the watermark, and reports the
+    /// source as failed with this reason.
+    pub partial_error: Option<String>,
 }
 
 /// A feed source: fetch its already-extracted postings. Feed-agnostic — free
@@ -140,13 +146,27 @@ pub async fn fetch_sources(
                     failed = batch.failed,
                     "source fetched"
                 );
+                if let Some(reason) = &batch.partial_error {
+                    // The batch is partial but real: its records are paid
+                    // for and WILL be ingested — the error level makes the
+                    // shortfall visible in the default (error) file sink.
+                    error!(
+                        source = %name,
+                        salvaged = batch.outcomes.len(),
+                        error = %reason,
+                        "source fetch ended early; salvaging fetched records"
+                    );
+                }
                 fetches.push(SourceFetch {
                     source: name.clone(),
                     batch: Ok(batch),
                 });
             }
             Err(err) => {
-                warn!(error = %err, source = %name, "source fetch failed");
+                // A whole-source failure is significant: error, not warn —
+                // the default file-sink level is `error`, and a warn here
+                // is exactly how a failed paid source goes undiagnosed.
+                error!(error = %err, source = %name, "source fetch failed");
                 fetches.push(SourceFetch {
                     source: name.clone(),
                     batch: Err(err),
@@ -181,6 +201,7 @@ pub(crate) async fn ingest_postings<F: Fetcher>(
         failed,
         truncated_results: 0,
         discovered_at: None,
+        partial_error: None,
     }
 }
 
@@ -356,6 +377,7 @@ mod tests {
                         failed,
                         truncated_results: 0,
                         discovered_at: None,
+                        partial_error: None,
                     })
                 }
             })
@@ -375,6 +397,7 @@ mod tests {
                         failed: 0,
                         truncated_results: 0,
                         discovered_at: None,
+                        partial_error: None,
                     },
                 }),
             ),
@@ -387,6 +410,7 @@ mod tests {
                         failed: 0,
                         truncated_results: 0,
                         discovered_at: None,
+                        partial_error: None,
                     },
                 }),
             ),

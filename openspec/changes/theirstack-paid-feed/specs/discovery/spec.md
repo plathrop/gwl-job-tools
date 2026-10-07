@@ -119,10 +119,57 @@ mode excludes.
 
 When a paid source returns fewer results than exist because the account ran
 out of credits, the `discover` command SHALL report the number of truncated
-(unreturned) results in its summary.
+(unreturned) results in its summary. Credit exhaustion may surface either as
+a truncation marker in a successful response or as a payment-required (402)
+response; both SHALL be reported as truncated results.
 
 #### Scenario: Credit exhaustion is reported
 
 - **WHEN** a paid source's response indicates it could not return some results
   because credits ran out
 - **THEN** the run summary reports the truncated-result count
+
+#### Scenario: A payment-required response is reported as truncation
+
+- **WHEN** a paid source rejects a page request because the remaining credit
+  balance cannot cover it (HTTP 402), and the response states how many
+  credits the rejected results required
+- **THEN** the run summary reports those unreturned results in the
+  truncated-result count, and the source's failure reason records the
+  payment-required error
+
+### Requirement: A partial paid fetch keeps its already-fetched records
+
+When a paid source's fetch fails after it has already returned records
+(mid-pagination failure, credit exhaustion at a page boundary), the
+`discover` command SHALL ingest the already-fetched records, record their
+watermark, and report the source as failed with the reason — rather than
+discarding the fetched records. A failure before any record is fetched
+remains a whole-source failure.
+
+#### Scenario: Mid-pagination failure salvages the fetched records
+
+- **WHEN** a paid source returns one or more pages of records and a later
+  page request fails
+- **THEN** the already-fetched records are ingested through the pipeline, the
+  run records their watermark, and the source appears in the failed-sources
+  list
+
+#### Scenario: A failure before any record is fetched is a whole-source failure
+
+- **WHEN** a paid source's first page request fails
+- **THEN** no records are ingested for that source, the source is reported as
+  failed, and the run continues with the remaining sources
+
+### Requirement: Source failures carry their reason
+
+The `discover` command SHALL record why each failed source failed — in the
+run summary and on the `discovery` run event — so the failure is diagnosable
+from the run's own artifacts without re-running at a higher log level, and
+SHALL log source fetch failures at the error level.
+
+#### Scenario: The failure reason is recorded
+
+- **WHEN** a source's fetch fails or ends early, in whole or in part
+- **THEN** the run summary and the `discovery` event carry the reason keyed by
+  source, and the log records the failure at the error level

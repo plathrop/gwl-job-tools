@@ -40,7 +40,12 @@ record returned), or every re-run re-spends money on jobs already seen.
   discovery run event and passed back as `discovered_at_gte` next run, so
   re-runs fetch only newly-discovered jobs.
 - **Credit observability**: `metadata.truncated_results` (credit exhaustion)
-  surfaces in the run summary.
+  surfaces in the run summary. Live-verified 2026-10-07: exhaustion also
+  surfaces as a mid-pagination **402** whose body states the required/available
+  credits — so the adapter salvages already-fetched records instead of
+  discarding them, mines the 402 body for the unreturned count, and every
+  source failure (whole or partial) carries its reason into the summary,
+  the run event, and the error-level log (GWLJ-w9xhcg).
 
 ## Capabilities
 

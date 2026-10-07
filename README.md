@@ -130,7 +130,10 @@ only newly-discovered jobs. A `--dry-run` that would spend credits prompts on
 stderr (`--yes` skips the prompt; without `--yes` it refuses under `--json` or
 when stdin isn't a terminal). The configured blacklist is additionally pushed server-side as a
 credit-saving pre-filter, but the client-side blacklist gate remains the
-authoritative backstop.
+authoritative backstop. A paid fetch that fails partway (e.g. credits
+exhausted mid-pagination, a 402) keeps the records already paid for — they
+are ingested and the watermark advances — while the source is still reported
+as failed, with the reason, in the summary and the run event.
 
 ## How it works
 

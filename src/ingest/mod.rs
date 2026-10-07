@@ -203,11 +203,51 @@ impl<F: Fetcher> PoliteClient<F> {
             .wrap_err_with(|| format!("parsing JSON from {owned}"))
     }
 
-    /// The shared politeness + retry loop: sleep the politeness delay,
-    /// run the request, honor `Retry-After` on 429/503 once, and fail on
-    /// any non-2xx status. `make` returns a fresh future on each call so a
-    /// retry re-issues the request.
+    /// POST a JSON body (with optional bearer auth) and return the parsed
+    /// JSON body for ANY status — 2xx or not — as `(status, body)`, so an
+    /// adapter can mine an error payload (e.g. TheirStack's 402 credit
+    /// message) before deciding the failure is fatal. The body is parsed
+    /// best-effort: `None` means the response was not valid JSON. Shares the
+    /// politeness/retry loop with `post_json`.
+    pub async fn post_json_status(
+        &self,
+        url: &Url,
+        body: &serde_json::Value,
+        bearer: Option<&str>,
+    ) -> Result<(u16, Option<serde_json::Value>)> {
+        let owned = url.clone();
+        let body = serde_json::to_string(body).into_diagnostic()?;
+        let bearer = bearer.map(str::to_string);
+        let response = self
+            .request_unchecked(&owned, || {
+                self.fetcher.post(&owned, body.clone(), bearer.clone())
+            })
+            .await?;
+        let parsed = serde_json::from_str(&response.body).into_diagnostic().ok();
+        Ok((response.status, parsed))
+    }
+
+    /// The politeness + retry loop with the non-2xx bail restored: sleep
+    /// the politeness delay, run the request, honor `Retry-After` on 429/503
+    /// once, and fail on any non-2xx status. `make` returns a fresh future
+    /// on each call so a retry re-issues the request.
     async fn request<R, Fut>(&self, url: &Url, make: R) -> Result<FetchResponse>
+    where
+        R: Fn() -> Fut,
+        Fut: Future<Output = Result<FetchResponse>> + Send,
+    {
+        let response = self.request_unchecked(url, make).await?;
+        if !(200..300).contains(&response.status) {
+            bail!("fetching {url} failed with status {}", response.status);
+        }
+        Ok(response)
+    }
+
+    /// The retry loop without the non-2xx bail: the caller decides whether
+    /// an error status (and its body) is fatal. Rate-limit handling is
+    /// unchanged: 429/503 still honors `Retry-After` once before the
+    /// response is returned as-is.
+    async fn request_unchecked<R, Fut>(&self, url: &Url, make: R) -> Result<FetchResponse>
     where
         R: Fn() -> Fut,
         Fut: Future<Output = Result<FetchResponse>> + Send,
@@ -234,9 +274,6 @@ impl<F: Fetcher> PoliteClient<F> {
                 tokio::time::sleep(delay).await;
                 attempt += 1;
                 continue;
-            }
-            if !(200..300).contains(&status) {
-                bail!("fetching {url} failed with status {status}");
             }
             return Ok(response);
         }
@@ -608,6 +645,50 @@ mod tests {
 
         assert!(client.get_text(&url).await.is_err());
         assert_eq!(client.fetcher.calls().len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_json_status_surfaces_non_2xx_bodies() {
+        // An adapter mining an error payload (TheirStack's 402 credit
+        // message) must get the status AND the body — the ordinary POST
+        // path bails and discards it.
+        let fetcher = ScriptedFetcher::with(vec![response(
+            402,
+            None,
+            r#"{"error":{"code":"E-007","description":"Required: 301 API credits."}}"#,
+        )]);
+        let client = client_with(fetcher);
+        let url = Url::parse("https://example.com/search").unwrap();
+
+        let (status, body) = client
+            .post_json_status(&url, &serde_json::json!({"page": 0}), Some("secret"))
+            .await
+            .unwrap();
+
+        assert_eq!(status, 402);
+        assert_eq!(body.unwrap()["error"]["code"], "E-007");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn post_json_status_parses_2xx_and_tolerates_bad_json() {
+        let fetcher = ScriptedFetcher::with(vec![
+            response(200, None, r#"{"data":[]}"#),
+            response(200, None, "<html>not json</html>"),
+        ]);
+        let client = client_with(fetcher);
+        let url = Url::parse("https://example.com/search").unwrap();
+
+        let (_, body) = client
+            .post_json_status(&url, &serde_json::json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(body.unwrap()["data"], serde_json::json!([]));
+
+        let (_, body) = client
+            .post_json_status(&url, &serde_json::json!({}), None)
+            .await
+            .unwrap();
+        assert_eq!(body, None);
     }
 
     #[tokio::test(start_paused = true)]

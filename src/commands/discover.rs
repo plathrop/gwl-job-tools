@@ -46,9 +46,74 @@ pub struct BatchSummary {
     /// rejection counts, so an operator can see which source's postings the
     /// gates are dropping (gating runs after the per-source fetch span closes).
     pub rejected_by_source: BTreeMap<String, u64>,
+    /// Why each failed source failed (design decision 8): whole-source
+    /// failures AND partial fetches, keyed by source — so a run is diagnosable
+    /// from its own summary and event without re-running at a higher log
+    /// level (the incident this fixes: a 402 mid-pagination whose only trace
+    /// was a warn! beneath the default error file-sink level).
+    pub failed_source_reasons: BTreeMap<String, String>,
     /// True when this summary is a `--dry-run` preview (no events written),
     /// so a scripted `--json` consumer can tell a preview from a real run.
     pub dry_run: bool,
+}
+
+/// A discovery fetch pass, flattened: outcomes ready for ingest plus the
+/// per-run facts the summary and the `discovery` event carry. Extracted from
+/// `execute_discover` so the salvage semantics (partial batches count as
+/// failed sources WITH their records ingested) are unit-testable without a
+/// network.
+#[derive(Debug, Default)]
+struct Flattened {
+    outcomes: Vec<(String, IngestOutcome)>,
+    failed_postings: u64,
+    truncated_results: u64,
+    failed_sources: Vec<String>,
+    failed_source_reasons: BTreeMap<String, String>,
+    new_watermark: HashMap<String, String>,
+}
+
+/// Flatten fetch results (design decision 8): a source's outcomes are kept
+/// whether its fetch completed or ended early — a partial paid fetch's
+/// records are paid for and ARE ingested — while a fetch that failed before
+/// returning anything contributes only its failure. Every failure, whole or
+/// partial, lands in `failed_sources` and carries its reason.
+fn flatten_fetches(fetches: Vec<discovery::SourceFetch>) -> Flattened {
+    let mut flat = Flattened::default();
+    for fetch in fetches {
+        let source = fetch.source;
+        match fetch.batch {
+            Ok(batch) => {
+                for outcome in batch.outcomes {
+                    flat.outcomes.push((source.clone(), outcome));
+                }
+                flat.failed_postings += batch.failed;
+                flat.truncated_results += batch.truncated_results;
+                if let Some(ts) = batch.discovered_at {
+                    flat.new_watermark.insert(source.clone(), ts);
+                }
+                if let Some(reason) = batch.partial_error {
+                    flat.failed_sources.push(source.clone());
+                    flat.failed_source_reasons.insert(source, reason);
+                }
+            }
+            Err(err) => {
+                flat.failed_sources.push(source.clone());
+                flat.failed_source_reasons.insert(source, err.to_string());
+            }
+        }
+    }
+    flat
+}
+
+/// Fold a flattened fetch pass into a run summary (both the real and the
+/// dry-run path report the same fetch facts). Takes the flattened pass by
+/// reference: the caller moves `outcomes` into the ingest loop and the
+/// watermark into the run event.
+fn apply_fetch_facts(summary: &mut BatchSummary, flat: &Flattened) {
+    summary.failed = flat.failed_postings;
+    summary.failed_sources = flat.failed_sources.clone();
+    summary.failed_source_reasons = flat.failed_source_reasons.clone();
+    summary.truncated_results = flat.truncated_results;
 }
 
 /// Decision for gating a paid `--dry-run`: proceed, prompt, or refuse.
@@ -188,31 +253,14 @@ pub async fn execute_discover(
     // Fetch sources (no writer lock); a source failure is non-fatal.
     let fetches = discovery::fetch_sources(&sources, &client, config).await;
 
-    // Flatten into (source, outcome) pairs, collecting failed sources,
-    // per-posting failures, truncation, and the new per-source watermarks.
-    let mut outcomes: Vec<(String, IngestOutcome)> = Vec::new();
-    let mut failed_sources: Vec<String> = Vec::new();
-    let mut failed_postings = 0u64;
-    let mut truncated_results = 0u64;
-    let mut new_watermark: HashMap<String, String> = HashMap::new();
-    for fetch in fetches {
-        match fetch.batch {
-            Ok(batch) => {
-                for o in batch.outcomes {
-                    outcomes.push((fetch.source.clone(), o));
-                }
-                failed_postings += batch.failed;
-                truncated_results += batch.truncated_results;
-                if let Some(ts) = batch.discovered_at {
-                    new_watermark.insert(fetch.source, ts);
-                }
-            }
-            Err(_) => failed_sources.push(fetch.source),
-        }
-    }
+    // Flatten into (source, outcome) pairs, collecting failed sources (with
+    // reasons — whole or partial), per-posting failures, truncation, and the
+    // new per-source watermarks. A partial paid batch's records are kept.
+    let mut flat = flatten_fetches(fetches);
+    let new_watermark = flat.new_watermark.clone();
 
     let rates = discovery::null_rates(
-        outcomes.iter().map(|(_, o)| o),
+        flat.outcomes.iter().map(|(_, o)| o),
         config.remote_only,
         config.compensation_floor,
     );
@@ -223,11 +271,10 @@ pub async fn execute_discover(
         // Nothing is written; the summary is what a real run would do.
         let events = read_only_envelopes(paths.event_log())?;
         let mut store = MemStore::seeded(events);
+        let outcomes = std::mem::take(&mut flat.outcomes);
         let mut summary =
             ingest_outcomes_correlated(&mut store, config, &resume_skills, outcomes, run_id)?;
-        summary.failed = failed_postings;
-        summary.failed_sources = failed_sources;
-        summary.truncated_results = truncated_results;
+        apply_fetch_facts(&mut summary, &flat);
         summary.unknown_workplace = rates.unknown_workplace;
         summary.unknown_salary = rates.unknown_salary;
         summary.strict_would_drop = rates.strict_would_drop;
@@ -247,11 +294,10 @@ pub async fn execute_discover(
 
     // Acquire the single-writer lock only for the decide → append cycle.
     let (mut store, _projection) = open_workspace(paths)?;
+    let outcomes = std::mem::take(&mut flat.outcomes);
     let mut summary =
         ingest_outcomes_correlated(&mut store, config, &resume_skills, outcomes, run_id)?;
-    summary.failed = failed_postings;
-    summary.failed_sources = failed_sources;
-    summary.truncated_results = truncated_results;
+    apply_fetch_facts(&mut summary, &flat);
     summary.unknown_workplace = rates.unknown_workplace;
     summary.unknown_salary = rates.unknown_salary;
     summary.strict_would_drop = rates.strict_would_drop;
@@ -316,6 +362,9 @@ fn print_summary(summary: &BatchSummary, json: bool) -> Result<()> {
     }
     if !summary.failed_sources.is_empty() {
         println!("  failed sources: {}", summary.failed_sources.join(", "));
+        for (source, reason) in &summary.failed_source_reasons {
+            println!("    {source}: {reason}");
+        }
     }
     Ok(())
 }
@@ -389,6 +438,11 @@ fn append_discovery_event(
             None
         } else {
             Some(discovered_at)
+        },
+        failed_source_reasons: if summary.failed_source_reasons.is_empty() {
+            None
+        } else {
+            Some(summary.failed_source_reasons.clone())
         },
     };
     let pending = PendingEvent::new(event_type::DISCOVERY, None, &payload)?;
@@ -814,5 +868,144 @@ mod tests {
         assert_eq!(value["unknown_workplace"], 1);
         assert_eq!(value["unknown_salary"], 2);
         assert_eq!(value["strict_would_drop"], 3);
+    }
+
+    // ── partial-fetch salvage + failure reasons (design decision 8) ──
+
+    fn partial_batch(partial_error: Option<String>) -> discovery::SourceBatch {
+        let mut outcome = outcome_with_url("https://example.com/salvaged");
+        outcome.extracted.remote = Some(true);
+        discovery::SourceBatch {
+            outcomes: vec![outcome],
+            failed: 0,
+            truncated_results: 301,
+            discovered_at: Some("2024-01-02T00:00:00Z".into()),
+            partial_error,
+        }
+    }
+
+    #[test]
+    fn flatten_keeps_partial_batch_records_and_carries_the_reason() {
+        // The live incident, abstracted: a paid source fetched (and paid
+        // for) records, then hit 402 mid-pagination. The records MUST be
+        // kept — they are the point of the salvage rule — while the source
+        // still counts as failed with its reason and watermark intact.
+        let fetches = vec![discovery::SourceFetch {
+            source: "theirstack".into(),
+            batch: Ok(partial_batch(Some(
+                "fetching https://api.theirstack.com failed with status 402: Required: 301 API credits"
+                    .into(),
+            ))),
+        }];
+
+        let flat = flatten_fetches(fetches);
+
+        assert_eq!(flat.outcomes.len(), 1);
+        assert_eq!(flat.outcomes[0].0, "theirstack");
+        assert_eq!(flat.truncated_results, 301);
+        assert_eq!(flat.failed_sources, vec!["theirstack".to_string()]);
+        assert!(flat.failed_source_reasons["theirstack"].contains("402"));
+        assert_eq!(
+            flat.new_watermark.get("theirstack").map(String::as_str),
+            Some("2024-01-02T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn flatten_records_whole_source_failure_with_reason() {
+        // A failure before any record is fetched contributes no outcomes —
+        // but its reason must still land, so the log alone can answer "why".
+        let fetches = vec![discovery::SourceFetch {
+            source: "remotive".into(),
+            batch: Err(miette::miette!("feed down")),
+        }];
+
+        let flat = flatten_fetches(fetches);
+
+        assert!(flat.outcomes.is_empty());
+        assert_eq!(flat.failed_sources, vec!["remotive".to_string()]);
+        assert_eq!(flat.failed_source_reasons["remotive"], "feed down");
+    }
+
+    #[test]
+    fn flatten_keeps_complete_batches_out_of_failed_sources() {
+        let fetches = vec![discovery::SourceFetch {
+            source: "remotive".into(),
+            batch: Ok(partial_batch(None)),
+        }];
+
+        let flat = flatten_fetches(fetches);
+
+        assert_eq!(flat.outcomes.len(), 1);
+        assert!(flat.failed_sources.is_empty());
+        assert!(flat.failed_source_reasons.is_empty());
+    }
+
+    #[test]
+    fn apply_fetch_facts_folds_reasons_into_the_summary() {
+        let fetches = vec![discovery::SourceFetch {
+            source: "theirstack".into(),
+            batch: Ok(partial_batch(Some("status 402: out of credits".into()))),
+        }];
+        let flat = flatten_fetches(fetches);
+
+        let mut summary = BatchSummary::default();
+        apply_fetch_facts(&mut summary, &flat);
+
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            value["failed_source_reasons"]["theirstack"],
+            "status 402: out of credits"
+        );
+        assert_eq!(value["truncated_results"], 301);
+    }
+
+    #[test]
+    fn run_event_roundtrips_failure_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
+        let mut summary = BatchSummary {
+            failed: 1,
+            ..Default::default()
+        };
+        summary.failed_sources = vec!["theirstack".into()];
+        summary
+            .failed_source_reasons
+            .insert("theirstack".into(), "status 402: out of credits".into());
+
+        append_discovery_event(&mut store, Uuid::now_v7(), &summary, HashMap::new()).unwrap();
+
+        let events = store.replay().unwrap();
+        let discovery = events
+            .iter()
+            .find(|e| e.event_type == event_type::DISCOVERY)
+            .expect("a discovery event");
+        let payload: DiscoveryPayload = serde_json::from_value(discovery.payload.clone()).unwrap();
+        assert_eq!(
+            payload
+                .failed_source_reasons
+                .as_ref()
+                .and_then(|m| m.get("theirstack"))
+                .map(String::as_str),
+            Some("status 402: out of credits")
+        );
+        // A run where nothing failed serializes no reasons field at all —
+        // old readers see the exact shape they always did.
+        let bare = DiscoveryPayload {
+            new: 0,
+            updated: 0,
+            suppressed: 0,
+            rejected: 0,
+            failed: 0,
+            failed_sources: vec![],
+            discovered_at: None,
+            failed_source_reasons: None,
+        };
+        assert!(
+            serde_json::to_value(&bare)
+                .unwrap()
+                .get("failed_source_reasons")
+                .is_none()
+        );
     }
 }

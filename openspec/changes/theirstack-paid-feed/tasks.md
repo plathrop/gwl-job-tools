@@ -23,7 +23,15 @@
 - [x] 3.1 Add a per-source `discovered_at` watermark to the `discovery` run-event payload (additive, optional field). Verify: the existing discovery-event test still passes; a new test round-trips the watermark through append → replay.
 - [x] 3.2 Store the run's max `discovered_at` per source on the run event, and derive the prior watermark from the last run event for that source; pass it as `discovered_at_gte` on the next TheirStack query. Verify: an integration test runs twice and asserts the second query carries the first run's watermark.
 - [x] 3.3 Surface `metadata.truncated_results` in the `BatchSummary` (new field, default 0) and print it. Verify: a unit test maps a truncated response into the summary; the summary serializes the count.
-- [ ] 3.4 Confirm `truncated_results` semantics against a live near-exhausted response before relying on them (a compatible-schema product reads the field the opposite way). Tracked as GWLJ-2yflze.
+- [x] 3.4 Confirm `truncated_results` semantics against a live near-exhausted response before relying on them (a compatible-schema product reads the field the opposite way). Tracked as GWLJ-2yflze.
+      Settled 2026-10-07 with live near-exhaustion data: exhaustion does NOT surface as `metadata.truncated_results` (every page reported 0); the API demands credits ≥ `min(limit, remaining matches)` per request and 402s otherwise, with required/available counts in the error body. Follow-ups: tasks 6.1–6.4.
+
+## 6. Partial-fetch salvage + failure-reason surfacing (GWLJ-w9xhcg, live-incident follow-up)
+
+- [x] 6.1 Expose non-2xx response bodies through the client: add a POST method that returns `(status, body)` without bailing, sharing the existing politeness/retry loop, so adapters can mine error payloads (TheirStack's 402 credit message). Verify: client unit test asserts a 402 body is returned, not discarded; the retry loop still honors 429/503.
+- [x] 6.2 Salvage in `fetch_jobs`: on a page error after records have been fetched, return the fetched pages with the failure reason (best-effort: parse `Required: N API credits` from the 402 body and add N to `truncated_results`); a failure before any record is fetched stays `Err`. Verify: a scripted two-page transport test (page 0 ok, page 1 402 with the live E-007 body) yields the page-0 records, `truncated_results` = N, and the partial reason; a page-0-only 402 yields `Err`.
+- [x] 6.3 Carry `partial_error` on `SourceBatch`; the discover driver ingests a partial batch's outcomes, records its watermark, lists the source in `failed_sources`, and passes the reason through. Verify: unit tests over the driver flatten loop (partial batch → outcomes ingested + source listed + reason carried; `Err` batch → source listed with reason).
+- [x] 6.4 Add `failed_source_reasons` (source → reason) to `BatchSummary` and the `discovery` run-event payload (additive, optional), print reasons in the human summary, and log whole-source failures at `error!` instead of `warn!`. Verify: summary serialization test; run-event round-trip test asserts the reasons map; the failed-source log line emits at error level with the source and reason.
 
 ## 4. Decision telemetry (separate small PR, outside increments A/B/C)
 

@@ -145,15 +145,18 @@ Observability) shows the dropped population is negligible.
 - **Limit**: page size 500 (TheirStack's max), serial pagination — the 300ms
   politeness delay already sits under the 4 req/sec ceiling.
 - `include_total_results` stays off (slow).
-- **Credit exhaustion**: the raw markdown API reference
-  (`search_jobs_v1.md`) defines `metadata.truncated_results` as "results not
-  returned because the user doesn't have enough credits", but that definition
-  is not surfaced in the rendered docs and a compatible-schema product reads
-  the field the opposite way — so the semantics are **inferred, not
-  verified**, and task 3.3's live near-exhausted check is the gate that
-  settles them. A **402** (no credits at all) is a fetch error → the source
-  is reported failed and the run continues, per the failed-source
-  requirement.
+- **Credit exhaustion — live-verified 2026-10-07** (settles GWLJ-2yflze;
+  supersedes the earlier inference): TheirStack does NOT signal near-exhaustion
+  via `metadata.truncated_results` — every successful page reports 0. The API
+  requires credits ≥ `min(limit, remaining matches)` per request and, when the
+  balance falls short, returns a hard **402** whose body carries the counts
+  (`{"error":{"code":"E-007","description":"…Required: 301 API
+  credits. You currently have 199…"}}`). So exhaustion surfaces **mid-
+  pagination**, after whole pages have already been paid for. A 402 on the
+  FIRST page (no records fetched) is a fetch error → the source is reported
+  failed and the run continues, per the failed-source requirement. A 402
+  (or any failure) AFTER records have been fetched is a **partial fetch** —
+  see decision 8.
 
 ### 5. The watermark lives on the discovery run event
 
@@ -194,6 +197,46 @@ command refuses rather than prompts when stdin is not a terminal or under
 `--json` (a prompt would corrupt the JSON contract). A real (non-dry) run
 spends credits by definition and is not gated.
 
+### 8. A partial paid fetch keeps its records; every source failure carries a reason
+
+Live evidence (2026-10-07 run): a query matching ~1,801 jobs burned 1,500
+credits over pages 0–2, then page 3 returned 402 with 199 credits left —
+and `fetch_jobs` treated the non-2xx as a hard source failure, discarding
+the entire paid batch: 1,500 credits spent, zero leads ingested, no
+watermark recorded, and the next run would re-pay for the same window.
+Worse, the only record of *why* was a `warn!` beneath the file sink's
+default `error` level, so the log was silent.
+
+Two rules, both additive to the failed-source requirement:
+
+- **Salvage**: `SourceBatch` gains `partial_error: Option<String>`. When a
+  fetch fails after records have been fetched, the adapter returns those
+  records as a normal batch with `partial_error` set to the failure's
+  reason (e.g. `"402 payment required: TheirStack E-007 — Required: 301
+  API credits, 199 available"`). The driver ingests the outcomes, records
+  the watermark (so the next run resumes past the paid-for records),
+  counts the source in `failed_sources` (the fetch is incomplete), and
+  carries the reason through. A failure before any record is fetched stays
+  `Err` — nothing was paid for, and the source-failure contract is
+  unchanged.
+- **Reason surfacing**: `BatchSummary` and the `discovery` run-event
+  payload gain an additive `failed_source_reasons` map (source → reason),
+  covering partial fetches AND total failures. Whole-source failures now
+  log at `error!` (not `warn!`) so the default file sink records them; a
+  partial fetch logs `error!` with the reason and the salvaged count.
+
+The 402 body is mined on a best-effort basis: `Required: N API credits`
+means N records were not returned, which is exactly the credit-exhaustion
+count the spec requires reporting — so `truncated_results` absorbs N.
+This needs one client addition: a POST that surfaces non-2xx bodies
+instead of discarding them (the adapter decides fatality). The count is
+best-effort; the reason string always carries the status.
+
+*Alternative*: fail the whole source and rely on dedupe suppression after
+a top-up — rejected: it re-spends the credits, and until a top-up lands a
+balance below one page's requirement (500) bricks the source on page 0
+with no diagnostic trail.
+
 ## Risks / Trade-offs
 
 - **Cross-feed dedup without `req_id`** → TheirStack carries no req id; dedup
@@ -207,10 +250,13 @@ spends credits by definition and is not gated.
 - **Watermark boundary re-fetch** → `discovered_at_gte` is inclusive, so the
   boundary job may be re-fetched once; corpus dedup suppresses the re-ingest
   (safe, one credit).
-- **Truncation tail-loss** → a truncated backfill (credits ran out mid-window)
-  advances the watermark past the unfetched older tail, which is then never
-  fetched. Forward-flow trade-off: aged jobs age out; `truncated_results`
-  surfaces the gap so the operator can re-run with a smaller recency window.
+- **Truncation tail-loss** → a truncated backfill (credits ran out mid-window
+  or a partial fetch ended early) advances the watermark past the unfetched
+  tail, which is then never fetched. Forward-flow trade-off: aged jobs age
+  out; `truncated_results` surfaces the gap so the operator can re-run with
+  a smaller recency window. A 402-salvaged fetch shares this trade-off — the
+  alternative (no watermark on a partial fetch) re-spends the full credit
+  cost of the salvaged pages, which is strictly worse.
 - **Watermark durability** → the watermark becomes durable only when the run
   event is appended at run end; an aborted run (store corruption) records no
   watermark, so the next run re-fetches the window (re-spend). Acceptable —
@@ -236,9 +282,12 @@ library-surface change is breaking, but v0.1-internal and pre-1.0.
 
 Per decision 0011: a span per source fetch (feed, query filters, record
 count, truncation) and per posting ingest (canonical URL, kind); `info!` run
-start/finish with the summary + credit-exhaustion count; `warn!`/`error!`
+start/finish with the summary + credit-exhaustion count; `error!` for any
+whole-source fetch failure and any partial fetch (reason + salvaged count),
 with the offending URL/source. Trust-but-verify mismatch spans/logs are the
-new failure-mode surface.
+new failure-mode surface. Failure reasons also land durably in the run
+summary and the `discovery` event payload, so the log alone answers "why
+did source X fail" without re-running at a higher log level.
 
 The strict-vs-client-side decision is answered by data, so two streams must
 land in Honeycomb:

@@ -5,7 +5,7 @@
 //! not bump the version, anything else requires an upcaster (see
 //! `event_store::upcast`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use jiff::Timestamp;
 use miette::IntoDiagnostic;
@@ -275,6 +275,13 @@ pub struct DiscoveryPayload {
     /// events and on runs with no watermark-bearing sources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovered_at: Option<HashMap<String, String>>,
+    /// Per-source failure reasons (theirstack-paid-feed design decision 8):
+    /// why each failed source failed — whole-source failures AND partial
+    /// fetches — so a run is diagnosable from its own artifacts without a
+    /// higher log level. Additive, optional — absent on older events and on
+    /// runs where nothing failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_source_reasons: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
