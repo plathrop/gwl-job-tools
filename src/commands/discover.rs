@@ -2,7 +2,10 @@
 //! `discovery-ingestion`) — fetch postings from feed sources and ingest them
 //! through the existing pipeline.
 
-use std::{collections::HashMap, io::IsTerminal};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::IsTerminal,
+};
 
 use miette::{IntoDiagnostic, Result, miette};
 use serde::Serialize;
@@ -39,6 +42,10 @@ pub struct BatchSummary {
     /// Fetched records strict mode would have dropped (unknown workplace or
     /// salary).
     pub strict_would_drop: u64,
+    /// Client-gate rejections, keyed by source (task 2.7): per-source
+    /// rejection counts, so an operator can see which source's postings the
+    /// gates are dropping (gating runs after the per-source fetch span closes).
+    pub rejected_by_source: BTreeMap<String, u64>,
     /// True when this summary is a `--dry-run` preview (no events written),
     /// so a scripted `--json` consumer can tell a preview from a real run.
     pub dry_run: bool,
@@ -54,8 +61,9 @@ enum DryRunGate {
 /// The paid `--dry-run` gate (design decision 7): a dry-run performs the
 /// real fetch and skips only the writes, so it spends credits. Before
 /// fetching a source that charges per record, the driver asks — unless `--yes`
-/// skips the prompt, or the session cannot prompt (`--json` / non-TTY), in
-/// which case it refuses rather than corrupt the output or hang.
+/// authorizes the spend (it is checked first, so a scripted `--json` preview
+/// can proceed), or the session cannot prompt (`--json` / non-TTY), in which
+/// case it refuses rather than corrupt the output or hang.
 fn dry_run_gate(
     dry_run: bool,
     yes: bool,
@@ -67,6 +75,9 @@ fn dry_run_gate(
         return DryRunGate::Proceed;
     }
     let names = paid_sources.join(", ");
+    if yes {
+        return DryRunGate::Proceed;
+    }
     if json {
         return DryRunGate::Refuse {
             reason: format!(
@@ -74,9 +85,6 @@ fn dry_run_gate(
                  a prompt would corrupt --json output — pass --yes to proceed"
             ),
         };
-    }
-    if yes {
-        return DryRunGate::Proceed;
     }
     if !stdin_tty {
         return DryRunGate::Refuse {
@@ -89,18 +97,28 @@ fn dry_run_gate(
     DryRunGate::Prompt
 }
 
-/// Derive each source's prior `discovered_at` watermark from the most recent
-/// `discovery` run event (read-only; no writer lock).
+/// Derive each source's prior `discovered_at` watermark by folding discovery
+/// events in reverse (newest first), retaining the first watermark found per
+/// source. Folding per source — rather than reading only the most recent
+/// event's whole map — keeps a source's cursor across runs that did not
+/// produce a watermark for it (a Remotive-only run, a failed/empty fetch),
+/// so the next paid run does not re-fetch the already-seen window (read-only;
+/// no writer lock).
 fn prior_watermark(paths: &AppPaths) -> Result<HashMap<String, String>> {
     let events = read_only_envelopes(paths.event_log())?;
+    let mut watermark = HashMap::new();
     for event in events.iter().rev() {
         if event.event_type == event_type::DISCOVERY {
             let payload: DiscoveryPayload =
                 serde_json::from_value(event.payload.clone()).into_diagnostic()?;
-            return Ok(payload.discovered_at.unwrap_or_default());
+            if let Some(map) = payload.discovered_at {
+                for (source, ts) in map {
+                    watermark.entry(source).or_insert(ts);
+                }
+            }
         }
     }
-    Ok(HashMap::new())
+    Ok(watermark)
 }
 
 #[instrument(skip_all)]
@@ -168,7 +186,7 @@ pub async fn execute_discover(
     }
 
     // Fetch sources (no writer lock); a source failure is non-fatal.
-    let fetches = discovery::fetch_sources(&sources, &client).await;
+    let fetches = discovery::fetch_sources(&sources, &client, config).await;
 
     // Flatten into (source, outcome) pairs, collecting failed sources,
     // per-posting failures, truncation, and the new per-source watermarks.
@@ -193,7 +211,11 @@ pub async fn execute_discover(
         }
     }
 
-    let rates = discovery::null_rates(outcomes.iter().map(|(_, o)| o));
+    let rates = discovery::null_rates(
+        outcomes.iter().map(|(_, o)| o),
+        config.remote_only,
+        config.compensation_floor,
+    );
 
     if args.dry_run {
         // Dry run: read the corpus WITHOUT the writer lock, seed an
@@ -211,6 +233,7 @@ pub async fn execute_discover(
         summary.strict_would_drop = rates.strict_would_drop;
         summary.dry_run = true;
         print_summary(&summary, json)?;
+        log_rejections_by_source(&summary);
         info!(
             new = summary.new,
             updated = summary.updated,
@@ -234,6 +257,7 @@ pub async fn execute_discover(
     summary.strict_would_drop = rates.strict_would_drop;
     append_discovery_event(&mut store, run_id, &summary, new_watermark)?;
     print_summary(&summary, json)?;
+    log_rejections_by_source(&summary);
     info!(
         new = summary.new,
         updated = summary.updated,
@@ -243,6 +267,21 @@ pub async fn execute_discover(
         "discovery complete"
     );
     Ok(())
+}
+
+/// Emit one structured log per source with client-gate rejections (task 2.7):
+/// per-source rejection telemetry, recorded at the run level because gating
+/// runs after the per-source fetch span closes.
+fn log_rejections_by_source(summary: &BatchSummary) {
+    for (source, count) in &summary.rejected_by_source {
+        if *count > 0 {
+            info!(
+                source = %source,
+                rejected = count,
+                "client-gate rejections by source"
+            );
+        }
+    }
 }
 
 /// Render a run summary: the counts plus, on the human path, a dry-run or
@@ -306,6 +345,7 @@ fn ingest_outcomes_correlated(
 ) -> Result<BatchSummary> {
     let mut summary = BatchSummary::default();
     for (source, mut outcome) in outcomes {
+        let source_name = source.clone();
         outcome.source = source;
         // Re-project: the read model is always `rebuild(log)`, and the prior
         // posting's appends must be visible before this one's identity lookup.
@@ -315,6 +355,7 @@ fn ingest_outcomes_correlated(
             record_ingest_correlated(store, &projection, config, resume_skills, outcome, run_id)?;
         if ingested.rejected.is_some() {
             summary.rejected += 1;
+            *summary.rejected_by_source.entry(source_name).or_insert(0) += 1;
         } else {
             match ingested.kind {
                 "ingested" => summary.new += 1,
@@ -430,6 +471,29 @@ mod tests {
         let summary =
             ingest_outcomes(&mut store, &config, &[], vec![("remotive".into(), again)]).unwrap();
         assert_eq!(summary.updated, 1);
+    }
+
+    #[test]
+    fn summary_records_rejections_by_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = JsonlEventStore::open(dir.path().join("events.jsonl")).unwrap();
+        let config = Config {
+            remote_only: true,
+            ..Default::default()
+        };
+
+        let mut rejected = outcome_with_url("https://example.com/b");
+        rejected.extracted.remote = Some(false);
+
+        let summary = ingest_outcomes(
+            &mut store,
+            &config,
+            &[],
+            vec![("theirstack".into(), rejected)],
+        )
+        .unwrap();
+        assert_eq!(summary.rejected, 1);
+        assert_eq!(summary.rejected_by_source.get("theirstack"), Some(&1));
     }
 
     #[test]
@@ -650,6 +714,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prior_watermark_survives_runs_without_a_theirstack_entry() {
+        // The bug this guards: a Remotive-only run (or a failed/empty
+        // TheirStack fetch) writes a discovery event with no theirstack
+        // watermark. Folding per source must retain the earlier cursor, or
+        // the next paid run re-fetches the already-seen window at cost.
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let paths = AppPaths::new(dir.path().join("config"), data_dir);
+
+        {
+            let mut store = JsonlEventStore::open(paths.event_log()).unwrap();
+            let mut watermark = HashMap::new();
+            watermark.insert("theirstack".to_string(), "2024-01-02T00:00:00Z".to_string());
+            append_discovery_event(
+                &mut store,
+                Uuid::now_v7(),
+                &BatchSummary::default(),
+                watermark,
+            )
+            .unwrap();
+        }
+        {
+            let mut store = JsonlEventStore::open(paths.event_log()).unwrap();
+            append_discovery_event(
+                &mut store,
+                Uuid::now_v7(),
+                &BatchSummary::default(),
+                HashMap::new(),
+            )
+            .unwrap();
+        }
+
+        let prior = prior_watermark(&paths).unwrap();
+        assert_eq!(
+            prior.get("theirstack").map(String::as_str),
+            Some("2024-01-02T00:00:00Z")
+        );
+    }
+
     // ── paid --dry-run gate (increment 2, task 2.8) ─────────────
 
     #[test]
@@ -669,6 +774,12 @@ mod tests {
         assert!(matches!(
             dry_run_gate(true, false, true, true, &paid),
             DryRunGate::Refuse { .. }
+        ));
+        // --json WITH --yes proceeds: --yes skips the prompt, so there is no
+        // prompt to corrupt the JSON contract.
+        assert!(matches!(
+            dry_run_gate(true, true, true, true, &paid),
+            DryRunGate::Proceed
         ));
         // --yes skips the prompt, even in a non-TTY session.
         assert!(matches!(

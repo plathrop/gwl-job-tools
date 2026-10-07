@@ -282,27 +282,24 @@ fn parse_job(record: &Value) -> TheirstackJob {
     }
 }
 
+/// Map TheirStack's compensation fields to a [`CompRange`]. The pipeline's
+/// contract is explicit that `CompRange` is USD/year (`gates.rs`,
+/// `extract.rs`), and v0 has no currency conversion — so ONLY the `_usd`
+/// fields are used, with `currency: "USD"`. A posting whose only salary data
+/// is in a non-USD currency (or absent) maps to `None`: unknown compensation
+/// passes the permissive floor gate rather than false-rejecting a £150k
+/// posting against a $180k floor (the invisible loss the permissive-gate
+/// spec forbids).
 fn parse_comp(record: &Value) -> Option<CompRange> {
-    let min = record
-        .get("min_annual_salary_usd")
-        .and_then(num_to_u64)
-        .or_else(|| record.get("min_annual_salary").and_then(num_to_u64));
-    let max = record
-        .get("max_annual_salary_usd")
-        .and_then(num_to_u64)
-        .or_else(|| record.get("max_annual_salary").and_then(num_to_u64));
+    let min = record.get("min_annual_salary_usd").and_then(num_to_u64);
+    let max = record.get("max_annual_salary_usd").and_then(num_to_u64);
     if min.is_none() && max.is_none() {
         return None;
     }
-    let currency = record
-        .get("salary_currency")
-        .and_then(Value::as_str)
-        .unwrap_or("USD")
-        .to_string();
     Some(CompRange {
         min,
         max,
-        currency,
+        currency: "USD".into(),
         period: "year".into(),
         raw: record
             .get("salary_string")
@@ -331,15 +328,18 @@ fn num_to_u64(value: &Value) -> Option<u64> {
 }
 
 /// Trust-but-verify (design decision 2): run our own text heuristics over the
-/// description and log a `debug!` per disagreement with the structured fields.
+/// description and log a `debug!` per disagreement with the structured fields,
+/// in BOTH directions — a structured field the description contradicts, or a
+/// structured field TheirStack omitted but the description quotes (the latter
+/// means ingest would store "unknown" while discarding extractable data).
 /// Never blocking — it exists to make TheirStack data problems visible.
 fn mismatches(job: &TheirstackJob) -> Vec<&'static str> {
     let ours = ingest::extract::extract_fields(&job.description, job.location.as_deref());
     let mut out = Vec::new();
-    if job.comp.is_some() && ours.comp != job.comp {
+    if ours.comp != job.comp {
         out.push("comp");
     }
-    if job.remote.is_some() && ours.remote != job.remote {
+    if ours.remote != job.remote {
         out.push("remote");
     }
     out
@@ -356,15 +356,26 @@ fn emit_mismatches(job: &TheirstackJob) {
     }
 }
 
-/// Normalize TheirStack's naive `discovered_at` (already UTC per the API docs)
-/// to an explicit-UTC timestamp for the watermark.
+/// Normalize TheirStack's `discovered_at` to a canonical UTC timestamp for
+/// the watermark. The API emits naive UTC stamps (second precision), but we
+/// also accept explicit offsets (`Z`, `+HH:MM`, `-HH:MM`) and render
+/// everything to a uniform `YYYY-MM-DDTHH:MM:SSZ`. Uniform second precision
+/// is what makes the lexicographic-max in [`max_discovered_at`] correct, and
+/// the cursor we send back matches the API's own stamp shape.
 fn normalize_discovered_at(raw: &str) -> String {
     let raw = raw.trim();
-    if raw.ends_with('Z') || raw.contains('+') {
-        raw.to_string()
-    } else {
-        format!("{raw}Z")
+    // Explicit offset: parse as an absolute instant and render Zulu time.
+    if let Ok(ts) = raw.parse::<jiff::Timestamp>() {
+        return format!("{ts:.0}");
     }
+    // Naive stamp (the API's documented shape): treat as UTC.
+    if let Ok(dt) = raw.parse::<jiff::civil::DateTime>()
+        && let Ok(zoned) = dt.to_zoned(jiff::tz::TimeZone::UTC)
+    {
+        return format!("{:.0}", zoned.timestamp());
+    }
+    // Unknown shape: pass through unchanged rather than corrupt it.
+    raw.to_string()
 }
 
 /// The max `discovered_at` across a fetch (the watermark cursor's lower
@@ -379,7 +390,13 @@ fn max_discovered_at(jobs: &[TheirstackJob]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
+    };
+
     use super::*;
+    use crate::ingest::FetchResponse;
 
     fn source_config(api_key: &str) -> SourceConfig {
         SourceConfig {
@@ -493,6 +510,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_comp_ignores_non_usd_salary() {
+        // v0 has no currency conversion, and the gate contract is USD/year:
+        // a non-USD-only salary must map to None (unknown), not feed a GBP
+        // amount into the USD floor and false-reject the posting.
+        let record = serde_json::json!({
+            "min_annual_salary": 150000,
+            "max_annual_salary": 200000,
+            "salary_currency": "GBP"
+        });
+        assert!(parse_comp(&record).is_none());
+    }
+
+    #[test]
+    fn parse_comp_uses_usd_fields_with_usd_currency() {
+        // The `_usd` fields win and the range is labeled USD, regardless of
+        // the posting's original currency.
+        let record = serde_json::json!({
+            "min_annual_salary_usd": 180000,
+            "max_annual_salary_usd": 220000,
+            "salary_currency": "GBP",
+            "salary_string": "£150,000"
+        });
+        let comp = parse_comp(&record).unwrap();
+        assert_eq!(comp.min, Some(180_000));
+        assert_eq!(comp.max, Some(220_000));
+        assert_eq!(comp.currency, "USD");
+    }
+
+    #[test]
     fn parses_truncated_results() {
         let value = serde_json::json!({
             "data": [],
@@ -560,6 +606,27 @@ mod tests {
         assert!(mismatches(&job).is_empty());
     }
 
+    #[test]
+    fn mismatch_detects_missing_structured_salary_quoted_in_description() {
+        // The reverse direction: TheirStack omits the structured salary but
+        // the description quotes one — ingest would store unknown comp while
+        // discarding extractable data. This must surface, not be suppressed.
+        let mut job = parse_job(&fixture_job());
+        job.comp = None;
+        job.description = "Salary: $200,000 - $250,000. Remote.".into();
+        let ours = mismatches(&job);
+        assert!(ours.contains(&"comp"));
+    }
+
+    #[test]
+    fn mismatch_detects_missing_structured_remote_quoted_in_description() {
+        let mut job = parse_job(&fixture_job());
+        job.remote = None;
+        job.description = "Salary: $200,000 - $250,000. Remote.".into();
+        let ours = mismatches(&job);
+        assert!(ours.contains(&"remote"));
+    }
+
     // ── watermark normalization ──────────────────────────────────
 
     #[test]
@@ -570,6 +637,30 @@ mod tests {
         );
         assert_eq!(
             normalize_discovered_at("2024-01-01T00:00:00Z"),
+            "2024-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalizes_explicit_offsets_to_utc() {
+        // An offset like `-05:00` must not be blindly `Z`-appended (the bug
+        // this replaces): it parses as an instant and renders in Zulu time.
+        assert_eq!(
+            normalize_discovered_at("2024-01-01T00:00:00+02:00"),
+            "2023-12-31T22:00:00Z"
+        );
+        assert_eq!(
+            normalize_discovered_at("2024-01-01T00:00:00-05:00"),
+            "2024-01-01T05:00:00Z"
+        );
+    }
+
+    #[test]
+    fn normalizes_fractional_seconds_to_uniform_precision() {
+        // Truncating to whole seconds keeps the watermark lexicographically
+        // sortable regardless of the API's sub-second precision.
+        assert_eq!(
+            normalize_discovered_at("2024-01-01T00:00:00.123Z"),
             "2024-01-01T00:00:00Z"
         );
     }
@@ -604,5 +695,88 @@ mod tests {
             technology_slugs: vec![],
             discovered_at: None,
         }
+    }
+
+    // ── fetch_jobs transport (review: pagination was untested) ──
+
+    /// A captured POST: the serialized JSON body and optional bearer token.
+    type CapturedRequest = (String, Option<String>);
+
+    struct ScriptedFetcher {
+        responses: Arc<Mutex<VecDeque<Value>>>,
+        requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    }
+
+    impl Fetcher for ScriptedFetcher {
+        async fn get(&self, _url: &Url) -> Result<FetchResponse> {
+            Err(miette::miette!("get not scripted"))
+        }
+
+        async fn post(
+            &self,
+            _url: &Url,
+            body: String,
+            bearer: Option<String>,
+        ) -> Result<FetchResponse> {
+            self.requests.lock().unwrap().push((body, bearer));
+            let value = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| miette::miette!("scripted fetcher ran out of responses"))?;
+            Ok(FetchResponse {
+                status: 200,
+                retry_after: None,
+                final_url: None,
+                body: serde_json::to_string(&value).unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fetch_jobs_paginates_and_propagates_bearer() {
+        fn job(url: &str) -> Value {
+            serde_json::json!({
+                "job_title": "Engineer",
+                "description": "Remote job.",
+                "final_url": url,
+                "discovered_at": "2024-01-01T00:00:00"
+            })
+        }
+        // Page 0: a full page; page 1: a short final page carrying the
+        // truncation count. The loop must terminate on the short page and
+        // take the max truncation across pages.
+        let page0 = serde_json::json!({
+            "data": (0..PAGE_SIZE as usize)
+                .map(|i| job(&format!("https://example.com/job/{i}")))
+                .collect::<Vec<_>>(),
+            "metadata": {"truncated_results": 0}
+        });
+        let page1 = serde_json::json!({
+            "data": [job("https://example.com/job/500")],
+            "metadata": {"truncated_results": 5}
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let fetcher = ScriptedFetcher {
+            responses: Arc::new(Mutex::new(VecDeque::from([page0, page1]))),
+            requests: requests.clone(),
+        };
+        let client = PoliteClient::new(fetcher);
+        let url = Url::parse(THEIRSTACK_API).unwrap();
+        let query = serde_json::json!({"posted_at_max_age_days": 30, "limit": PAGE_SIZE});
+
+        let (jobs, truncated) = fetch_jobs(&client, &url, &query, "secret").await.unwrap();
+
+        assert_eq!(jobs.len(), 501);
+        assert_eq!(truncated, 5);
+
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        // The page cursor starts at 0 and increments; bearer propagates.
+        assert!(reqs[0].0.contains("\"page\":0"));
+        assert!(reqs[1].0.contains("\"page\":1"));
+        assert_eq!(reqs[0].1.as_deref(), Some("secret"));
+        assert_eq!(reqs[1].1.as_deref(), Some("secret"));
     }
 }

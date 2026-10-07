@@ -73,8 +73,17 @@ pub struct NullRates {
     pub strict_would_drop: u64,
 }
 
-/// Compute null-rate facts over a set of fetched outcomes.
-pub fn null_rates<'a, I>(outcomes: I) -> NullRates
+/// Compute null-rate facts over a set of fetched outcomes. `remote_only` and
+/// `compensation_floor` are the active gate config: `strict_would_drop`
+/// counts a record only when strict query shaping would actually drop it — an
+/// unknown-workplace record when `remote_only` is on, or an unknown-salary
+/// record when a compensation floor is set. With both gates off, strict mode
+/// drops nothing and the count must read zero.
+pub fn null_rates<'a, I>(
+    outcomes: I,
+    remote_only: bool,
+    compensation_floor: Option<u64>,
+) -> NullRates
 where
     I: IntoIterator<Item = &'a IngestOutcome>,
 {
@@ -86,7 +95,9 @@ where
         if outcome.extracted.comp.is_none() {
             rates.unknown_salary += 1;
         }
-        if outcome.extracted.remote.is_none() || outcome.extracted.comp.is_none() {
+        let strict_drops_remote = remote_only && outcome.extracted.remote.is_none();
+        let strict_drops_salary = compensation_floor.is_some() && outcome.extracted.comp.is_none();
+        if strict_drops_remote || strict_drops_salary {
             rates.strict_would_drop += 1;
         }
     }
@@ -100,6 +111,7 @@ where
 pub async fn fetch_sources(
     sources: &[(String, Box<dyn DiscoverySource>)],
     client: &HttpClient,
+    config: &Config,
 ) -> Vec<SourceFetch> {
     let mut fetches = Vec::with_capacity(sources.len());
     for (name, source) in sources {
@@ -113,7 +125,11 @@ pub async fn fetch_sources(
         );
         match source.fetch(client).instrument(span.clone()).await {
             Ok(batch) => {
-                let rates = null_rates(batch.outcomes.iter());
+                let rates = null_rates(
+                    batch.outcomes.iter(),
+                    config.remote_only,
+                    config.compensation_floor,
+                );
                 span.record("unknown_workplace", rates.unknown_workplace);
                 span.record("unknown_salary", rates.unknown_salary);
                 span.record("strict_would_drop", rates.strict_would_drop);
@@ -376,7 +392,7 @@ mod tests {
             ),
         ];
 
-        let fetches = fetch_sources(&sources, &client).await;
+        let fetches = fetch_sources(&sources, &client, &Config::default()).await;
 
         assert!(fetches[0].batch.is_ok());
         assert!(fetches[1].batch.is_err());
@@ -385,7 +401,7 @@ mod tests {
     // ── null_rates ───────────────────────────────────────────────
 
     #[test]
-    fn null_rates_counts_unknown_and_strict() {
+    fn null_rates_counts_unknown_and_strict_only_when_gates_active() {
         let known_comp = || crate::domain::events::CompRange {
             min: Some(100_000),
             max: None,
@@ -402,13 +418,25 @@ mod tests {
         let mut known = outcome("https://example.com/c");
         known.extracted.remote = Some(true);
         known.extracted.comp = Some(known_comp());
+        let sample = vec![&remote_unknown, &salary_unknown, &known];
 
-        let rates = null_rates(vec![&remote_unknown, &salary_unknown, &known]);
-
+        // Both gates active: both unknown records would be dropped.
+        let rates = null_rates(sample.clone(), true, Some(100_000));
         assert_eq!(rates.unknown_workplace, 1);
         assert_eq!(rates.unknown_salary, 1);
-        // One unknown-workplace record + one unknown-salary record.
         assert_eq!(rates.strict_would_drop, 2);
+
+        // Both gates off: strict mode drops nothing (the bug this guards).
+        let rates = null_rates(sample.clone(), false, None);
+        assert_eq!(rates.strict_would_drop, 0);
+
+        // Only the remote gate: only the unknown-workplace record drops.
+        let rates = null_rates(sample.clone(), true, None);
+        assert_eq!(rates.strict_would_drop, 1);
+
+        // Only the comp floor: only the unknown-salary record drops.
+        let rates = null_rates(sample, false, Some(100_000));
+        assert_eq!(rates.strict_would_drop, 1);
     }
 
     // ── ingest_postings (posting-level failure) ───────────────────

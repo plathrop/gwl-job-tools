@@ -15,14 +15,15 @@
 - [x] 2.4 Shape the query: blacklist → `company_name_not`/`company_domain_not` and recency → `posted_at_max_age_days` always; behind `strict_filtering`, also push `remote_only` → `workplace_types_or: ["remote"]` and `compensation_floor` → `min_salary_usd`; never push skills. Verify: unit tests assert the default query carries blacklist + recency only, and the strict query adds the remote/comp filters.
 - [x] 2.5 Trust-but-verify: run `extract_fields` over `description` and emit mismatch spans/logs (structured vs extracted) keyed by lead id + source. Verify: a unit test asserts a salary/remote mismatch produces the expected span fields or debug log.
 - [x] 2.6 Register `theirstack` in the source registry (`make_source`) so `build_sources` can construct it. Verify: a unit test asserts `build_sources` with `[sources.theirstack]` yields the adapter, and an unknown name still errors.
-- [x] 2.7 Emit source null-rate telemetry: the source-fetch span and run summary record unknown-workplace and unknown-salary counts, client-gate rejection counts, and the strict-would-drop count. Verify: a unit test asserts the summary/span fields are populated from a fixture feed.
-- [x] 2.8 Add `charges_per_record()` to `DiscoverySource` (default `false`; `true` for TheirStack) and gate a paid `--dry-run`: prompt `[y/N]` on stderr before fetching, `--yes` to skip, refuse in non-TTY/`--json`. Verify: a unit test asserts the prompt/refuse/`--yes` paths.
+- [x] 2.7 Emit source null-rate telemetry: the source-fetch span records unknown-workplace, unknown-salary, and strict-would-drop counts; the run summary records those plus client-gate rejection counts (aggregate and per-source — gating runs after the fetch span closes). Verify: a unit test asserts the summary/span fields are populated from a fixture feed.
+- [x] 2.8 Add `charges_per_record()` to `DiscoverySource` (default `false`; `true` for TheirStack) and gate a paid `--dry-run`: prompt `[y/N]` on stderr before fetching, `--yes` to skip, refuse in non-TTY/`--json` (unless `--yes`). Verify: a unit test asserts the prompt/refuse/`--yes` paths.
 
 ## 3. Credit budgeting: watermark + credit exhaustion
 
 - [x] 3.1 Add a per-source `discovered_at` watermark to the `discovery` run-event payload (additive, optional field). Verify: the existing discovery-event test still passes; a new test round-trips the watermark through append → replay.
 - [x] 3.2 Store the run's max `discovered_at` per source on the run event, and derive the prior watermark from the last run event for that source; pass it as `discovered_at_gte` on the next TheirStack query. Verify: an integration test runs twice and asserts the second query carries the first run's watermark.
-- [x] 3.3 Surface `metadata.truncated_results` in the `BatchSummary` (new field, default 0) and print it. Verify: a unit test maps a truncated response into the summary; the summary serializes the count. Before relying on the semantics, confirm `truncated_results` against a live near-exhausted response (a compatible-schema product reads the field the opposite way).
+- [x] 3.3 Surface `metadata.truncated_results` in the `BatchSummary` (new field, default 0) and print it. Verify: a unit test maps a truncated response into the summary; the summary serializes the count.
+- [ ] 3.4 Confirm `truncated_results` semantics against a live near-exhausted response before relying on them (a compatible-schema product reads the field the opposite way). Tracked as GWLJ-2yflze.
 
 ## 4. Decision telemetry (separate small PR, outside increments A/B/C)
 
