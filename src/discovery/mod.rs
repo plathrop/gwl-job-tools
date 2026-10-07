@@ -484,8 +484,7 @@ mod tests {
         };
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, f);
-        let captured = events.lock().unwrap().clone();
-        captured
+        events.lock().unwrap().clone()
     }
 
     /// Drive a future whose internals never park on an async timer (the
@@ -493,11 +492,7 @@ mod tests {
     /// without a runtime — so `tracing::subscriber::with_default` can scope
     /// the capture around the whole call.
     fn block_on_ready<F: Future>(fut: F) -> F::Output {
-        struct NoopWaker;
-        impl std::task::Wake for NoopWaker {
-            fn wake(self: std::sync::Arc<Self>) {}
-        }
-        let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker));
+        let waker = std::task::Waker::noop();
         let mut cx = std::task::Context::from_waker(&waker);
         let mut fut = std::pin::pin!(fut);
         loop {
