@@ -493,7 +493,7 @@ mod tests {
     /// the capture around the whole call.
     fn block_on_ready<F: Future>(fut: F) -> F::Output {
         let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(&waker);
+        let mut cx = std::task::Context::from_waker(waker);
         let mut fut = std::pin::pin!(fut);
         loop {
             match fut.as_mut().poll(&mut cx) {
