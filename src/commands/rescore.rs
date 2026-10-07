@@ -117,7 +117,9 @@ pub async fn execute_rescore(
         let record_after = summary
             .results
             .first()
-            .filter(|_| summary.evaluated == 1)
+            // The card re-render is a single-lead-form behavior (the
+            // invocation decides, not the match count — PR #43 review).
+            .filter(|_| args.lead.is_some())
             .map(|r| r.lead_id);
         (summary, record_after)
     };
@@ -136,26 +138,41 @@ pub async fn execute_rescore(
             "{}",
             serde_json::to_string_pretty(&summary).into_diagnostic()?
         );
-    } else if summary.evaluated == 1 {
-        // Single-lead (non-dry) run: re-render the card so the new score and
-        // breakdown are visible immediately (same UX as edit). The dry run
-        // has no post-append state to render and prints the delta line only.
-        let result = &summary.results[0];
-        println!("{}", outcome_line(result));
-        if let (Some(lead_id), false) = (record_after, args.dry_run) {
-            let (_, projection) = open_workspace(paths)?;
-            let record = projection
-                .leads
-                .get(&lead_id)
-                .ok_or_else(|| miette!("lead {lead_id} not found after rescore"))?;
-            render::render_card(record, color)?;
-        }
     } else {
-        for result in &summary.results {
-            println!("{}", outcome_line(result));
+        // The dry run appends nothing; the human output must say so before
+        // any past-tense outcome line can read as a persisted change
+        // (PR #43 review).
+        if args.dry_run {
+            println!("(dry run — nothing appended)");
         }
-        println!();
-        println!("{}", summary_line(&summary));
+        match output_mode(&args) {
+            OutputMode::SingleLead => {
+                let result = &summary.results[0];
+                println!("{}", outcome_line(result));
+                // A real single-lead run re-renders the card so the new
+                // score and breakdown are visible immediately (same UX as
+                // edit). The dry run has no post-append state to render.
+                if let Some(lead_id) = record_after {
+                    let (_, projection) = open_workspace(paths)?;
+                    let record = projection
+                        .leads
+                        .get(&lead_id)
+                        .ok_or_else(|| miette!("lead {lead_id} not found after rescore"))?;
+                    render::render_card(record, color)?;
+                }
+            }
+            // `--all` is always batch reporting — even when exactly one
+            // lead is eligible, the batch totals the spec requires are
+            // printed (PR #43 review: select the mode by invocation, not
+            // by match count).
+            OutputMode::Batch => {
+                for result in &summary.results {
+                    println!("{}", outcome_line(result));
+                }
+                println!();
+                println!("{}", summary_line(&summary));
+            }
+        }
     }
 
     // The info summary mirrors the command output (decision 0011).
@@ -301,6 +318,26 @@ fn classify(
                 RescoreDelta::Changed
             }
         }
+    }
+}
+
+/// The human output shape (PR #43 review): selected by the invocation,
+/// never by the match count — `--all` is always batch reporting, even when
+/// exactly one lead is eligible, so the batch totals the spec requires
+/// are never omitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputMode {
+    /// The single-lead form: the delta line, then the card (on a real run).
+    SingleLead,
+    /// The batch form: per-lead lines, then the summary.
+    Batch,
+}
+
+fn output_mode(args: &RescoreArgs) -> OutputMode {
+    if args.lead.is_some() {
+        OutputMode::SingleLead
+    } else {
+        OutputMode::Batch
     }
 }
 
@@ -708,6 +745,31 @@ mod tests {
     }
 
     // ── output helpers ──────────────────────────────────────────
+
+    #[test]
+    fn output_mode_selects_by_invocation_not_match_count() {
+        // PR #43 review: `--all` is batch reporting even when exactly one
+        // lead is eligible — the batch totals the spec requires must
+        // print, so the mode can never depend on the result count.
+        let args = RescoreArgs {
+            lead: None,
+            all: true,
+            dry_run: false,
+        };
+        assert_eq!(output_mode(&args), OutputMode::Batch);
+        let dry = RescoreArgs {
+            lead: None,
+            all: true,
+            dry_run: true,
+        };
+        assert_eq!(output_mode(&dry), OutputMode::Batch);
+        let single = RescoreArgs {
+            lead: Some("0192f8a1".into()),
+            all: false,
+            dry_run: false,
+        };
+        assert_eq!(output_mode(&single), OutputMode::SingleLead);
+    }
 
     #[test]
     fn outcome_and_summary_lines_read_clearly() {
