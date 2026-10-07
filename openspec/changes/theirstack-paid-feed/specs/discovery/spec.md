@@ -121,7 +121,10 @@ When a paid source returns fewer results than exist because the account ran
 out of credits, the `discover` command SHALL report the number of truncated
 (unreturned) results in its summary. Credit exhaustion may surface either as
 a truncation marker in a successful response or as a payment-required (402)
-response; both SHALL be reported as truncated results.
+response; both SHALL be reported as truncated results. A payment-required
+response's stated requirement is a lower bound on the unreturned tail (it is
+the rejected page's own requirement, not the whole tail), and the reported
+count SHALL reflect at least that bound.
 
 #### Scenario: Credit exhaustion is reported
 
@@ -134,9 +137,16 @@ response; both SHALL be reported as truncated results.
 - **WHEN** a paid source rejects a page request because the remaining credit
   balance cannot cover it (HTTP 402), and the response states how many
   credits the rejected results required
-- **THEN** the run summary reports those unreturned results in the
-  truncated-result count, and the source's failure reason records the
+- **THEN** the run summary reports at least that many unreturned results in
+  the truncated-result count, and the source's failure reason records the
   payment-required error
+
+#### Scenario: Exhaustion on the first page is reported, not discarded
+
+- **WHEN** a paid source's FIRST page request is rejected as payment-required
+- **THEN** no records are ingested for that source, the source is reported as
+  failed with the payment-required reason, the unreturned count is reported
+  in the truncated-result count, and the run continues
 
 ### Requirement: A partial paid fetch keeps its already-fetched records
 
@@ -144,8 +154,10 @@ When a paid source's fetch fails after it has already returned records
 (mid-pagination failure, credit exhaustion at a page boundary), the
 `discover` command SHALL ingest the already-fetched records, record their
 watermark, and report the source as failed with the reason — rather than
-discarding the fetched records. A failure before any record is fetched
-remains a whole-source failure.
+discarding the fetched records. A payment-required response keeps this
+treatment at ANY page, including the first (exhaustion, not a generic
+failure). Any other failure before any record is fetched remains a
+whole-source failure.
 
 #### Scenario: Mid-pagination failure salvages the fetched records
 
@@ -157,7 +169,8 @@ remains a whole-source failure.
 
 #### Scenario: A failure before any record is fetched is a whole-source failure
 
-- **WHEN** a paid source's first page request fails
+- **WHEN** a paid source's first page request fails for a non-payment reason
+  (feed down, malformed response, timeout)
 - **THEN** no records are ingested for that source, the source is reported as
   failed, and the run continues with the remaining sources
 

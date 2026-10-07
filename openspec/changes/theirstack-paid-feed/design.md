@@ -226,11 +226,17 @@ Two rules, both additive to the failed-source requirement:
   partial fetch logs `error!` with the reason and the salvaged count.
 
 The 402 body is mined on a best-effort basis: `Required: N API credits`
-means N records were not returned, which is exactly the credit-exhaustion
-count the spec requires reporting — so `truncated_results` absorbs N.
-This needs one client addition: a POST that surfaces non-2xx bodies
-instead of discarding them (the adapter decides fatality). The count is
-best-effort; the reason string always carries the status.
+is a **lower bound** on the unreturned records — it is the rejected
+page's own requirement, `min(limit, remaining matches)`, not the whole
+remaining tail (the tail count would need `include_total_results`, which
+stays off as slow). A **402 at any page — including page 0** — is a known
+credit-exhaustion signal rather than a generic failure: it returns a
+partial batch (possibly empty) so the count is never discarded (the
+review of this change caught the original page-0 `bail!` losing it); the
+driver lists the source as failed with the reason either way. The count
+needs one client addition: a POST that surfaces non-2xx bodies instead of
+discarding them (the adapter decides fatality). Non-payment failures keep
+the original rule: `Err` before any record is fetched, salvage after.
 
 *Alternative*: fail the whole source and rely on dedupe suppression after
 a top-up — rejected: it re-spends the credits, and until a top-up lands a

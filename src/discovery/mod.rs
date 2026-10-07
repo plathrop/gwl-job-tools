@@ -270,6 +270,7 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
     use miette::bail;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
     use crate::{config::SourceConfig, domain::events::ExtractedFields, ingest::FetchResponse};
@@ -357,6 +358,9 @@ mod tests {
 
     struct FakeSource {
         fail: bool,
+        /// A partial fetch: succeed with outcomes AND an early-stop reason
+        /// (design decision 8), so tests can exercise the salvage log path.
+        partial_error: Option<String>,
         batch: SourceBatch,
     }
 
@@ -368,6 +372,7 @@ mod tests {
             let fail = self.fail;
             let outcomes = self.batch.outcomes.clone();
             let failed = self.batch.failed;
+            let partial_error = self.partial_error.clone();
             Box::pin(async move {
                 if fail {
                     bail!("feed down");
@@ -377,7 +382,7 @@ mod tests {
                         failed,
                         truncated_results: 0,
                         discovered_at: None,
-                        partial_error: None,
+                        partial_error,
                     })
                 }
             })
@@ -392,6 +397,7 @@ mod tests {
                 "ok".into(),
                 Box::new(FakeSource {
                     fail: false,
+                    partial_error: None,
                     batch: SourceBatch {
                         outcomes: vec![outcome("https://example.com/a")],
                         failed: 0,
@@ -405,6 +411,7 @@ mod tests {
                 "down".into(),
                 Box::new(FakeSource {
                     fail: true,
+                    partial_error: None,
                     batch: SourceBatch {
                         outcomes: vec![],
                         failed: 0,
@@ -420,6 +427,173 @@ mod tests {
 
         assert!(fetches[0].batch.is_ok());
         assert!(fetches[1].batch.is_err());
+    }
+
+    // ── failure log events land at error (design decision 8) ──
+
+    /// One captured log event: level, message, and field values.
+    type CapturedEvent = (tracing::Level, String, Vec<(String, String)>);
+
+    /// A minimal tracing `Layer` capturing LOG events (the mirror of the
+    /// span-field CapturingLayer in `theirstack.rs` tests), so tests can
+    /// assert the event level and its identifying fields — the
+    /// observability contract this change exists to protect (PR #44
+    /// review: nothing asserted the failed-source log line's level).
+    struct EventCaptureLayer {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    struct EventVisitor<'a> {
+        out: &'a mut Vec<(String, String)>,
+    }
+
+    impl tracing::field::Visit for EventVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.out
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for EventCaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = Vec::new();
+            let mut visitor = EventVisitor { out: &mut fields };
+            event.record(&mut visitor);
+            // The `event!` message lands as the "message" field
+            // (`Arguments` Debug-prints as the formatted text).
+            let message = fields
+                .iter()
+                .find(|(name, _)| name == "message")
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default();
+            self.events
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), message, fields));
+        }
+    }
+
+    fn capture_events<R>(f: impl FnOnce() -> R) -> Vec<CapturedEvent> {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = EventCaptureLayer {
+            events: events.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, f);
+        let captured = events.lock().unwrap().clone();
+        captured
+    }
+
+    /// Drive a future whose internals never park on an async timer (the
+    /// `FakeSource` futures are always immediately ready) to completion,
+    /// without a runtime — so `tracing::subscriber::with_default` can scope
+    /// the capture around the whole call.
+    fn block_on_ready<F: Future>(fut: F) -> F::Output {
+        struct NoopWaker;
+        impl std::task::Wake for NoopWaker {
+            fn wake(self: std::sync::Arc<Self>) {}
+        }
+        let waker = std::task::Waker::from(std::sync::Arc::new(NoopWaker));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                std::task::Poll::Ready(out) => return out,
+                std::task::Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[test]
+    fn whole_source_failure_logs_at_error_with_source_and_reason() {
+        // The incident's observability gap: a failed paid source's only
+        // trace was a warn! beneath the default (error) file sink. The
+        // failure event must land at ERROR with the source and the reason.
+        let client = crate::ingest::default_client().unwrap();
+        let sources: Vec<(String, Box<dyn DiscoverySource>)> = vec![(
+            "down".into(),
+            Box::new(FakeSource {
+                fail: true,
+                partial_error: None,
+                batch: SourceBatch {
+                    outcomes: vec![],
+                    failed: 0,
+                    truncated_results: 0,
+                    discovered_at: None,
+                    partial_error: None,
+                },
+            }),
+        )];
+
+        let captured =
+            capture_events(|| block_on_ready(fetch_sources(&sources, &client, &Config::default())));
+
+        let (level, _message, fields) = captured
+            .iter()
+            .find(|(_, message, _)| message.contains("source fetch failed"))
+            .expect("a whole-source failure log event");
+        assert_eq!(*level, tracing::Level::ERROR);
+        let value_of = |name: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("field {name} not recorded: {fields:?}"))
+        };
+        assert!(value_of("source").contains("down"));
+        assert!(value_of("error").contains("feed down"));
+    }
+
+    #[test]
+    fn partial_fetch_logs_at_error_with_salvaged_count() {
+        // A partial batch is real data plus a shortfall: the salvage event
+        // must land at ERROR (visible in the default file sink) carrying
+        // the salvaged count and the early-stop reason.
+        let client = crate::ingest::default_client().unwrap();
+        let sources: Vec<(String, Box<dyn DiscoverySource>)> = vec![
+            (
+                "theirstack".into(),
+                Box::new(FakeSource {
+                    fail: false,
+                    partial_error: Some(
+                        "fetching https://api.theirstack.com failed with status 402: Required: 301 API credits".into(),
+                    ),
+                    batch: SourceBatch {
+                        outcomes: vec![
+                            outcome("https://example.com/a"),
+                            outcome("https://example.com/b"),
+                        ],
+                        failed: 0,
+                        truncated_results: 301,
+                        discovered_at: Some("2024-01-02T00:00:00Z".into()),
+                        partial_error: None,
+                    },
+                }),
+            ),
+        ];
+
+        let captured =
+            capture_events(|| block_on_ready(fetch_sources(&sources, &client, &Config::default())));
+
+        let (level, _message, fields) = captured
+            .iter()
+            .find(|(_, message, _)| message.contains("source fetch ended early"))
+            .expect("a partial-fetch salvage log event");
+        assert_eq!(*level, tracing::Level::ERROR);
+        let value_of = |name: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("field {name} not recorded: {fields:?}"))
+        };
+        assert_eq!(value_of("source").replace('\"', ""), "theirstack");
+        assert_eq!(value_of("salvaged"), "2");
+        assert!(value_of("error").contains("402"));
     }
 
     // ── null_rates ───────────────────────────────────────────────

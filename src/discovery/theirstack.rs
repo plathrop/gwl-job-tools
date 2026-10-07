@@ -204,12 +204,36 @@ struct FetchedJobs {
     partial_error: Option<String>,
 }
 
+/// Why a page request failed. A payment-required (402) response is a
+/// known credit-exhaustion signal at ANY page — a reported shortfall, not
+/// a generic fetch failure — so it salvages even with no records fetched
+/// (page 0), preserving the unreturned count as truncation (review of
+/// PR #44: the old page-0 `bail!` discarded it).
+#[derive(Debug)]
+enum PageFailure {
+    Fetch { reason: String },
+    PaymentRequired { reason: String },
+}
+
+impl PageFailure {
+    fn fetch(reason: String) -> Self {
+        PageFailure::Fetch { reason }
+    }
+
+    fn payment_required(reason: String) -> Self {
+        PageFailure::PaymentRequired { reason }
+    }
+}
+
 /// Paginate the search endpoint (serial, `page`-based) until a page returns
 /// fewer than the page size. Generic over the transport seam so tests can
 /// script the responses. A failure AFTER records have been fetched salvages
 /// them — they are paid for — and returns the partial batch with the
 /// failure's reason; a failure before any record is fetched is a hard
-/// `Err` (the whole-source failure contract is unchanged).
+/// `Err` (the whole-source failure contract is unchanged) — except a
+/// payment-required (402) response, which is exhaustion at any page and
+/// returns a partial batch (possibly empty) so the unreturned count is
+/// never discarded.
 async fn fetch_jobs<F: Fetcher>(
     client: &PoliteClient<F>,
     api_url: &Url,
@@ -227,16 +251,17 @@ async fn fetch_jobs<F: Fetcher>(
         // string. The 402 body is mined BEFORE the salvage decision — its
         // "Required: N API credits" is the unreturned-record count the
         // credit-exhaustion contract needs.
-        let step: std::result::Result<TheirstackResponse, String> = match client
+        let step: std::result::Result<TheirstackResponse, PageFailure> = match client
             .post_json_status(api_url, &page_query, Some(api_key))
             .await
         {
             Ok((status, value)) if (200..300).contains(&status) => match value {
-                Some(value) => Theirstack::parse_response(&value)
-                    .map_err(|e| format!("parsing theirstack page {page} response: {e}")),
-                None => Err(format!(
+                Some(value) => Theirstack::parse_response(&value).map_err(|e| {
+                    PageFailure::fetch(format!("parsing theirstack page {page} response: {e}"))
+                }),
+                None => Err(PageFailure::fetch(format!(
                     "theirstack page {page}: response body is not valid JSON"
-                )),
+                ))),
             },
             Ok((status, value)) => {
                 let mut reason = format!("fetching {api_url} failed with status {status}");
@@ -249,11 +274,19 @@ async fn fetch_jobs<F: Fetcher>(
                     reason.push_str(&format!(": {detail}"));
                 }
                 if status == 402 {
-                    fetched.truncated_results += unreturned_from_402(value.as_ref());
+                    // The "Required: N API credits" clause is a LOWER BOUND
+                    // on the unreturned tail: it is the rejected page's own
+                    // requirement, min(limit, remaining matches), not the
+                    // whole tail (PR #44 review). Counted before the
+                    // salvage decision so it survives even a page-0 402.
+                    let unreturned = unreturned_from_402(value.as_ref());
+                    fetched.truncated_results += unreturned;
+                    Err(PageFailure::payment_required(reason))
+                } else {
+                    Err(PageFailure::fetch(reason))
                 }
-                Err(reason)
             }
-            Err(err) => Err(err.to_string()),
+            Err(err) => Err(PageFailure::fetch(err.to_string())),
         };
         match step {
             Ok(parsed) => {
@@ -265,7 +298,17 @@ async fn fetch_jobs<F: Fetcher>(
                 }
                 page += 1;
             }
-            Err(reason) => {
+            // Exhaustion at ANY page — including page 0 — keeps the
+            // unreturned count and returns a partial batch (possibly empty):
+            // the driver lists the source as failed with this reason either
+            // way, and the count is never discarded.
+            Err(PageFailure::PaymentRequired { reason }) => {
+                fetched.partial_error = Some(reason);
+                return Ok(fetched);
+            }
+            // A non-payment failure before any record is fetched stays a
+            // hard whole-source `Err`; after records, salvage.
+            Err(PageFailure::Fetch { reason }) => {
                 if fetched.jobs.is_empty() {
                     bail!("{reason}");
                 }
@@ -277,10 +320,13 @@ async fn fetch_jobs<F: Fetcher>(
 }
 
 /// TheirStack's 402 credit-exhaustion body states how many credits the
-/// rejected results required — one credit per record, so that number IS
-/// the unreturned-record count (live-verified 2026-10-07, GWLJ-2yflze).
-/// Best-effort: any shape change just yields 0, and the failure reason
-/// string still carries the full error text.
+/// rejected page required — one credit per record, so that number is a
+/// LOWER BOUND on the unreturned records (it is `min(limit, remaining
+/// matches)`, the rejected page's own requirement, not the whole tail;
+/// the tail would need `include_total_results`, which stays off).
+/// Live-verified 2026-10-07, GWLJ-2yflze. Best-effort: any shape change
+/// just yields 0, and the failure reason string still carries the full
+/// error text.
 fn unreturned_from_402(value: Option<&Value>) -> u64 {
     let description = value
         .and_then(|v| v.get("error"))
@@ -1129,9 +1175,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn first_page_402_fails_the_whole_source() {
-        // Nothing fetched yet — the whole-source failure contract is
-        // unchanged, but the error must carry the 402 and its detail.
+    async fn page_zero_402_reports_exhaustion_without_losing_the_count() {
+        // The whole-source failure contract covers *fetch* failures; a
+        // payment-required response on page 0 is a known exhaustion signal,
+        // so its unreturned count must survive (PR #44 review: the old
+        // page-0 bail! discarded it). No records were paid for — the batch
+        // is empty — but the source still reports as failed with the
+        // reason, and the count lands as truncation.
         let fetcher = ScriptedFetcher {
             responses: Arc::new(Mutex::new(VecDeque::from([(
                 402,
@@ -1143,14 +1193,17 @@ mod tests {
         let url = Url::parse(THEIRSTACK_API).unwrap();
         let query = serde_json::json!({"posted_at_max_age_days": 30, "limit": PAGE_SIZE});
 
-        let err = fetch_jobs(&client, &url, &query, "secret")
+        let fetched = fetch_jobs(&client, &url, &query, "secret")
             .await
-            .expect_err("page-0 failure must Err");
-        let message = err.to_string();
-        assert!(message.contains("status 402"), "message: {message}");
+            .expect("a page-0 402 is exhaustion, not a hard failure");
+
+        assert!(fetched.jobs.is_empty());
+        assert_eq!(fetched.truncated_results, 500);
+        let reason = fetched.partial_error.expect("reason carried");
+        assert!(reason.contains("status 402"), "reason: {reason}");
         assert!(
-            message.contains("E-007") || message.contains("credits"),
-            "message: {message}"
+            reason.contains("Required: 500 API credits"),
+            "reason: {reason}"
         );
     }
 
