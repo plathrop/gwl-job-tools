@@ -92,7 +92,10 @@ right place for "do I re-extract or not."
 TheirStack's structured fields are authoritative. The adapter still runs our
 `extract_fields` over `description` and compares, emitting span fields (and a
 `debug!`) per mismatch — e.g. `comp_structured` vs `comp_extracted`,
-`remote_structured` vs `remote_extracted` — keyed by lead id and source.
+`remote_structured` vs `remote_extracted` — keyed by url and source (the lead
+id is not minted until ingest; the canonicalized url is the join key). The
+comp comparison is semantic — `min`/`max`/`currency`/`period`, not the `raw`
+presentation string — so formatting differences alone never fire a mismatch.
 Never blocking: it exists to make TheirStack data problems visible.
 
 ### 3. Blacklist is client-side always, with a server-side pre-filter; permissive gates are opt-in strict

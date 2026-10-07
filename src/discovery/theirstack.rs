@@ -327,32 +327,85 @@ fn num_to_u64(value: &Value) -> Option<u64> {
         .or_else(|| value.as_f64().map(|f| f.round() as u64))
 }
 
+/// One field where TheirStack's structured data disagrees with our text
+/// heuristics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MismatchField {
+    Comp,
+    Remote,
+}
+
 /// Trust-but-verify (design decision 2): run our own text heuristics over the
-/// description and log a `debug!` per disagreement with the structured fields,
-/// in BOTH directions — a structured field the description contradicts, or a
+/// description and compare them against TheirStack's structured fields, in
+/// BOTH directions — a structured field the description contradicts, or a
 /// structured field TheirStack omitted but the description quotes (the latter
 /// means ingest would store "unknown" while discarding extractable data).
 /// Never blocking — it exists to make TheirStack data problems visible.
-fn mismatches(job: &TheirstackJob) -> Vec<&'static str> {
-    let ours = ingest::extract::extract_fields(&job.description, job.location.as_deref());
+fn mismatches(job: &TheirstackJob, ours: &ExtractedFields) -> Vec<MismatchField> {
     let mut out = Vec::new();
-    if ours.comp != job.comp {
-        out.push("comp");
+    if comp_disagrees(ours.comp.as_ref(), job.comp.as_ref()) {
+        out.push(MismatchField::Comp);
     }
     if ours.remote != job.remote {
-        out.push("remote");
+        out.push(MismatchField::Remote);
     }
     out
 }
 
+/// Whether two compensation ranges disagree on the *semantic* fields
+/// (`min`, `max`, `currency`, `period`). `raw` is deliberately ignored: it is
+/// a presentation string from two independent sources (our regex capture vs
+/// TheirStack's `salary_string`), so it differs on almost every posting even
+/// when the numbers agree — comparing it would make every comp-carrying
+/// posting a phantom "mismatch" and the signal would detect nothing. A
+/// `None` on one side and `Some` on the other is a real disagreement.
+fn comp_disagrees(a: Option<&CompRange>, b: Option<&CompRange>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            a.min != b.min || a.max != b.max || a.currency != b.currency || a.period != b.period
+        }
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+/// Emit one span per mismatch carrying the structured-vs-extracted values
+/// (design decision 2: `comp_structured` vs `comp_extracted`, …), keyed by
+/// url and source — the lead id is not minted until ingest, and the
+/// canonicalized url is the deterministic join key in Honeycomb. Never
+/// blocking.
 fn emit_mismatches(job: &TheirstackJob) {
-    for field in mismatches(job) {
-        debug!(
-            field,
+    let ours = ingest::extract::extract_fields(&job.description, job.location.as_deref());
+    for field in mismatches(job, &ours) {
+        let span = tracing::info_span!(
+            "theirstack_mismatch",
             source = "theirstack",
             url = ?job.url,
-            "theirstack structured field disagrees with text heuristics"
+            comp_structured = tracing::field::Empty,
+            comp_extracted = tracing::field::Empty,
+            remote_structured = tracing::field::Empty,
+            remote_extracted = tracing::field::Empty,
         );
+        match field {
+            MismatchField::Comp => {
+                span.record("comp_structured", tracing::field::debug(&job.comp));
+                span.record("comp_extracted", tracing::field::debug(&ours.comp));
+                debug!(
+                    parent: &span,
+                    field = "comp",
+                    "theirstack structured comp disagrees with text heuristics"
+                );
+            }
+            MismatchField::Remote => {
+                span.record("remote_structured", tracing::field::debug(&job.remote));
+                span.record("remote_extracted", tracing::field::debug(&ours.remote));
+                debug!(
+                    parent: &span,
+                    field = "remote",
+                    "theirstack structured remote disagrees with text heuristics"
+                );
+            }
+        }
     }
 }
 
@@ -394,6 +447,9 @@ mod tests {
         collections::VecDeque,
         sync::{Arc, Mutex},
     };
+
+    use proptest::prelude::*;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::*;
     use crate::ingest::FetchResponse;
@@ -586,16 +642,18 @@ mod tests {
 
     // ── trust-but-verify (task 2.5) ──────────────────────────────
 
+    fn ours_for(job: &TheirstackJob) -> ExtractedFields {
+        ingest::extract::extract_fields(&job.description, job.location.as_deref())
+    }
+
     #[test]
     fn mismatch_detects_salary_disagreement() {
         // Structured comp is $200k-$250k; the description quotes a
         // different range, so our heuristics disagree.
-        let job = parse_job(&fixture_job());
-        // Give the fixture a description that quotes a different salary.
-        let mut job = job;
+        let mut job = parse_job(&fixture_job());
         job.description = "Salary: $300,000 - $350,000. Remote.".into();
-        let ours = mismatches(&job);
-        assert!(ours.contains(&"comp"));
+        let ours = ours_for(&job);
+        assert!(mismatches(&job, &ours).contains(&MismatchField::Comp));
     }
 
     #[test]
@@ -603,7 +661,27 @@ mod tests {
         let job = parse_job(&fixture_job());
         // The fixture's description quotes $200k-$250k and "Remote", matching
         // the structured fields.
-        assert!(mismatches(&job).is_empty());
+        let ours = ours_for(&job);
+        assert!(mismatches(&job, &ours).is_empty());
+    }
+
+    #[test]
+    fn comp_mismatch_ignores_raw_formatting() {
+        // Numerics/currency/period agree; only `raw` differs (our regex
+        // capture "$200k - $250k" vs TheirStack's "salary_string"). This must
+        // NOT fire a comp mismatch — `raw` is a presentation string from two
+        // independent sources, and comparing it made every comp-carrying
+        // posting a phantom mismatch (the over-firing Remi flagged).
+        let mut job = parse_job(&fixture_job());
+        job.description = "Salary: $200k - $250k. Remote.".into();
+        let ours = ours_for(&job);
+        // Sanity: the numbers agree, the raw strings differ.
+        let o = ours.comp.as_ref().unwrap();
+        let j = job.comp.as_ref().unwrap();
+        assert_eq!(o.min, j.min);
+        assert_eq!(o.max, j.max);
+        assert_ne!(o.raw, j.raw);
+        assert!(!mismatches(&job, &ours).contains(&MismatchField::Comp));
     }
 
     #[test]
@@ -614,8 +692,8 @@ mod tests {
         let mut job = parse_job(&fixture_job());
         job.comp = None;
         job.description = "Salary: $200,000 - $250,000. Remote.".into();
-        let ours = mismatches(&job);
-        assert!(ours.contains(&"comp"));
+        let ours = ours_for(&job);
+        assert!(mismatches(&job, &ours).contains(&MismatchField::Comp));
     }
 
     #[test]
@@ -623,8 +701,138 @@ mod tests {
         let mut job = parse_job(&fixture_job());
         job.remote = None;
         job.description = "Salary: $200,000 - $250,000. Remote.".into();
-        let ours = mismatches(&job);
-        assert!(ours.contains(&"remote"));
+        let ours = ours_for(&job);
+        assert!(mismatches(&job, &ours).contains(&MismatchField::Remote));
+    }
+
+    // ── mismatch span fields (design decision 2) ────────────────
+
+    /// A minimal tracing `Layer` that captures every recorded span field as
+    /// `(name, debug-value)`, so tests can assert what a span carried
+    /// (mirrors the pattern in `commands/mark.rs`).
+    struct CapturingLayer {
+        fields: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    struct CaptureVisitor<'a> {
+        out: &'a mut Vec<(String, String)>,
+    }
+
+    impl tracing::field::Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.out
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for CapturingLayer {
+        fn on_record(
+            &self,
+            _id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut out = Vec::new();
+            let mut visitor = CaptureVisitor { out: &mut out };
+            values.record(&mut visitor);
+            self.fields.lock().unwrap().extend(out);
+        }
+    }
+
+    #[test]
+    fn mismatch_emits_span_fields_with_values() {
+        let mut job = parse_job(&fixture_job());
+        // Structured comp is $200k-$250k; the description quotes $300k-$350k.
+        job.description = "Salary: $300,000 - $350,000. Remote.".into();
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let layer = CapturingLayer {
+            fields: captured.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            emit_mismatches(&job);
+        });
+
+        let fields = captured.lock().unwrap();
+        let value_of = |name: &str| {
+            fields
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("span field {name} not recorded"))
+        };
+        let structured = value_of("comp_structured");
+        let extracted = value_of("comp_extracted");
+        // Structured carries TheirStack's $200k-$250k, extracted carries our
+        // $300k-$350k — the two sides are queryable and distinguishable.
+        assert!(structured.contains("200000"));
+        assert!(extracted.contains("300000"));
+        assert_ne!(structured, extracted);
+    }
+
+    // ── property tests: comp_disagrees (proptest) ───────────────
+
+    fn arb_comp_range() -> impl Strategy<Value = CompRange> {
+        (
+            any::<Option<u64>>(),
+            any::<Option<u64>>(),
+            any::<String>(),
+            any::<String>(),
+            any::<String>(),
+        )
+            .prop_map(|(min, max, currency, period, raw)| CompRange {
+                min,
+                max,
+                currency,
+                period,
+                raw,
+            })
+    }
+
+    proptest! {
+        #[test]
+        fn comp_disagrees_equals_semantic_field_diff(
+            a in arb_comp_range(),
+            b in arb_comp_range(),
+        ) {
+            let expected = a.min != b.min
+                || a.max != b.max
+                || a.currency != b.currency
+                || a.period != b.period;
+            prop_assert_eq!(comp_disagrees(Some(&a), Some(&b)), expected);
+        }
+
+        #[test]
+        fn comp_disagrees_ignores_raw(
+            base in arb_comp_range(),
+            raw_a in any::<String>(),
+            raw_b in any::<String>(),
+        ) {
+            let mut a = base.clone();
+            a.raw = raw_a;
+            let mut b = base;
+            b.raw = raw_b;
+            prop_assert!(!comp_disagrees(Some(&a), Some(&b)));
+        }
+
+        #[test]
+        fn comp_disagrees_is_symmetric(
+            a in arb_comp_range(),
+            b in arb_comp_range(),
+        ) {
+            prop_assert_eq!(
+                comp_disagrees(Some(&a), Some(&b)),
+                comp_disagrees(Some(&b), Some(&a)),
+            );
+        }
+
+        #[test]
+        fn comp_disagrees_none_semantics(x in arb_comp_range()) {
+            prop_assert!(!comp_disagrees(None, None));
+            prop_assert!(comp_disagrees(Some(&x), None));
+            prop_assert!(comp_disagrees(None, Some(&x)));
+        }
     }
 
     // ── watermark normalization ──────────────────────────────────
