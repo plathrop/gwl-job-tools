@@ -35,6 +35,11 @@ opentelemetry-otlp = { version = "0.32", features = [
   "http-proto",
   "reqwest-client",
   "reqwest-rustls",
+  # Export failures (misconfigured endpoint, auth, network) flow through
+  # tracing::error! — into the file sink and Honeycomb — instead of being
+  # silently swallowed (GWLJ-21r6zw; the 0.32 SDK reports errors via these
+  # internal logs, there is no global error handler anymore).
+  "internal-logs",
 ], optional = true }
 opentelemetry-semantic-conventions = { version = "0.26", optional = true }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"], optional = true }

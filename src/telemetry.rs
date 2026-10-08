@@ -2,7 +2,9 @@ use std::{fs::OpenOptions, path::Path, sync::Mutex};
 
 use clap::ValueEnum;
 use miette::{Context, IntoDiagnostic, Result};
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, registry, util::SubscriberInitExt};
+use tracing_subscriber::{
+    EnvFilter, Layer as _, fmt, layer::SubscriberExt, registry, util::SubscriberInitExt,
+};
 #[cfg(feature = "telemetry")]
 use {
     opentelemetry::{KeyValue, global, trace::TracerProvider as _},
@@ -13,7 +15,7 @@ use {
     },
     opentelemetry_semantic_conventions::resource as semconv_resource,
     std::time::Duration,
-    tracing::debug,
+    tracing::{debug, warn},
     tracing_opentelemetry::OpenTelemetryLayer,
 };
 
@@ -79,15 +81,22 @@ pub fn init_telemetry(
     let fmt_layer = fmt::layer()
         .with_target(false)
         .with_ansi(false)
-        .with_writer(Mutex::new(log_file));
+        .with_writer(Mutex::new(log_file))
+        // Per-layer filter (GWLJ-21r6zw): the log level is a FILE-SINK
+        // decision (decision 0005) and must not gate telemetry. As a
+        // registry-level filter it silently filtered info-level SPAN
+        // callsites before the OTLP layer saw them, so `telemetry = "on"`
+        // with the default (error) log level exported nothing at all.
+        .with_filter(match target {
+            TelemetryStatus::Off => env_filter(log_level),
+            #[cfg(feature = "telemetry")]
+            TelemetryStatus::On => telemetry_env_filter(log_level),
+        });
 
     match target {
         TelemetryStatus::Off => {
             let _ = name;
-            registry()
-                .with(env_filter(log_level))
-                .with(fmt_layer)
-                .init();
+            registry().with(fmt_layer).init();
             Ok(TelemetryGuard::NoProvider)
         }
         #[cfg(feature = "telemetry")]
@@ -95,19 +104,32 @@ pub fn init_telemetry(
             let setup = build_otlp_provider(name)?;
             global::set_tracer_provider(setup.provider.clone());
 
+            // Export failures surface through the `internal-logs` feature
+            // (Cargo.toml): the 0.32 SDK reports them via tracing::error!,
+            // which lands in the file sink and (as span events) Honeycomb —
+            // never failing the command (guardrail).
+
             let tracer = setup.provider.tracer(name.to_owned());
             let telemetry_layer: OpenTelemetryLayer<_, SdkTracer> = OpenTelemetryLayer::new(tracer);
 
-            registry()
-                .with(env_filter(log_level))
-                .with(fmt_layer)
-                .with(telemetry_layer)
-                .init();
+            // The OTLP layer is deliberately UNfiltered: spans (info-level
+            // `#[instrument]`/`info_span!` callsites) reach Honeycomb
+            // regardless of the file-sink log level; events attach to active
+            // spans as span events.
+            registry().with(fmt_layer).with(telemetry_layer).init();
 
             // Log the endpoint/headers AFTER the real subscriber is installed,
             // so they go to the file (not stderr) — the "nothing on stderr"
             // contract (decision 0005) holds even during telemetry bootstrap.
             debug!("using telemetry endpoint: {:?}", setup.endpoint);
+            if setup.endpoint.as_deref() != setup.raw_endpoint.as_deref() {
+                warn!(
+                    raw = ?setup.raw_endpoint,
+                    resolved = ?setup.endpoint,
+                    "trace endpoint had no path; appended /v1/traces — set \
+                     OTEL_EXPORTER_OTLP_TRACES_ENDPOINT to the full URL to keep it verbatim"
+                );
+            }
             debug!(
                 "telemetry endpoint headers: {:?}",
                 setup.headers.as_deref().map(redact_header_values)
@@ -127,6 +149,24 @@ fn env_filter(log_level: Option<LogLevel>) -> EnvFilter {
     }
 }
 
+/// The file-sink filter when telemetry is ON (GWLJ-21r6zw): the base log
+/// level plus `debug` for the opentelemetry crates, because the 0.32 SDK
+/// reports export failures (connection refused, auth rejected, wrong
+/// endpoint — exactly the misconfigurations that made `telemetry = "on"`
+/// silently produce nothing) at `otel_debug!` level. Without this, a
+/// broken exporter is invisible at the default (`error`) file level.
+#[cfg(feature = "telemetry")]
+fn telemetry_env_filter(log_level: Option<LogLevel>) -> EnvFilter {
+    let mut filter = env_filter(log_level);
+    for target in ["opentelemetry", "opentelemetry_sdk", "opentelemetry_otlp"] {
+        let directive = format!("{target}=debug")
+            .parse()
+            .expect("static directive parses");
+        filter = filter.add_directive(directive);
+    }
+    filter
+}
+
 /// The OTLP provider plus the endpoint/headers it was configured from, so
 /// the caller can log them after the real subscriber is installed. They must
 /// not be logged during construction — that would need a stderr bootstrap
@@ -134,16 +174,46 @@ fn env_filter(log_level: Option<LogLevel>) -> EnvFilter {
 #[cfg(feature = "telemetry")]
 struct OtlpSetup {
     provider: SdkTracerProvider,
+    /// The endpoint applied to the exporter (path-corrected), if any —
+    /// `None` means the SDK default (localhost:4318) applies.
     endpoint: Option<String>,
+    /// The raw env value before path correction, for the append warning.
+    raw_endpoint: Option<String>,
     headers: Option<String>,
+}
+
+/// Resolve the trace export endpoint from the OTel env vars, applying the
+/// signal path (`/v1/traces`) to pathless values (GWLJ-21r6zw). The SDK
+/// uses `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` VERBATIM, so a base-style
+/// value (e.g. `https://api.honeycomb.io`) POSTs to `/` and 404s —
+/// silently, since export failures were invisible. The pathless fix is a
+/// deliberate deviation from strict-spec verbatim behavior: the value is
+/// the documented Honeycomb endpoint for the base var, and a pathed value
+/// is still honored verbatim. `None` when neither var is set (the SDK
+/// default applies).
+#[cfg(feature = "telemetry")]
+fn resolve_trace_endpoint(
+    traces_endpoint: Option<&str>,
+    base_endpoint: Option<&str>,
+) -> Option<String> {
+    let raw = traces_endpoint.or(base_endpoint)?;
+    let trimmed = raw.trim().trim_end_matches('/');
+    let has_path = trimmed
+        .split_once("://")
+        .map(|(_, rest)| rest.contains('/'))
+        .unwrap_or(true);
+    if has_path {
+        return Some(trimmed.to_string());
+    }
+    Some(format!("{trimmed}/v1/traces"))
 }
 
 #[cfg(feature = "telemetry")]
 fn build_otlp_provider(name: &str) -> Result<OtlpSetup> {
     // Per-signal vars take precedence over the base vars, per the OTel spec.
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-        .ok()
-        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok());
+    let traces_endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT").ok();
+    let base_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
+    let raw_endpoint = traces_endpoint.clone().or_else(|| base_endpoint.clone());
     let headers = std::env::var("OTEL_EXPORTER_OTLP_TRACES_HEADERS")
         .ok()
         .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_HEADERS").ok());
@@ -156,13 +226,19 @@ fn build_otlp_provider(name: &str) -> Result<OtlpSetup> {
         ])
         .build();
 
-    let exporter = SpanExporter::builder()
+    // The endpoint is applied explicitly (path-corrected) rather than left
+    // to the SDK's verbatim env handling — see `resolve_trace_endpoint`.
+    // Headers stay with the SDK's own env resolution.
+    let endpoint = resolve_trace_endpoint(traces_endpoint.as_deref(), base_endpoint.as_deref());
+    let mut builder = SpanExporter::builder()
         .with_http()
         // Keep from hanging for a long time when an endpoint is
         // firewalled or otherwise blackholed.
-        .with_timeout(Duration::from_millis(750))
-        .build()
-        .into_diagnostic()?;
+        .with_timeout(Duration::from_millis(750));
+    if let Some(endpoint) = &endpoint {
+        builder = builder.with_endpoint(endpoint.clone());
+    }
+    let exporter = builder.build().into_diagnostic()?;
 
     // Note: It is important that we use `with_simple_exporter` here
     // because as a CLI tool, we want spans transmitted immediately
@@ -176,6 +252,7 @@ fn build_otlp_provider(name: &str) -> Result<OtlpSetup> {
     Ok(OtlpSetup {
         provider,
         endpoint,
+        raw_endpoint,
         headers,
     })
 }
@@ -315,5 +392,60 @@ mod tests {
             redact_header_values(" key = value , stray"),
             "key=<redacted>, stray=<redacted>"
         );
+    }
+
+    // ── resolve_trace_endpoint (GWLJ-21r6zw) ────────────
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn pathless_endpoint_gets_the_trace_path_appended() {
+        // The live footgun: the SDK uses OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+        // VERBATIM, so this base-style value (the documented Honeycomb
+        // endpoint for the BASE var) POSTs to / and 404s — silently.
+        assert_eq!(
+            resolve_trace_endpoint(Some("https://api.honeycomb.io"), None),
+            Some("https://api.honeycomb.io/v1/traces".to_string())
+        );
+        // Trailing slash, bare host, host with port: all pathless.
+        assert_eq!(
+            resolve_trace_endpoint(Some("https://api.honeycomb.io/"), None),
+            Some("https://api.honeycomb.io/v1/traces".to_string())
+        );
+        assert_eq!(
+            resolve_trace_endpoint(Some("http://localhost:4318"), None),
+            Some("http://localhost:4318/v1/traces".to_string())
+        );
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn pathed_endpoint_is_used_verbatim() {
+        assert_eq!(
+            resolve_trace_endpoint(
+                Some("https://api.honeycomb.io/v1/traces"),
+                Some("https://elsewhere.example")
+            ),
+            Some("https://api.honeycomb.io/v1/traces".to_string())
+        );
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn base_endpoint_var_gets_the_trace_path_appended() {
+        // Per the OTel spec, the BASE var takes the signal path.
+        assert_eq!(
+            resolve_trace_endpoint(None, Some("https://api.honeycomb.io")),
+            Some("https://api.honeycomb.io/v1/traces".to_string())
+        );
+        assert_eq!(
+            resolve_trace_endpoint(None, Some("https://collector.example/api/traces"),),
+            Some("https://collector.example/api/traces".to_string())
+        );
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn no_endpoint_vars_means_sdk_default() {
+        assert_eq!(resolve_trace_endpoint(None, None), None);
     }
 }
