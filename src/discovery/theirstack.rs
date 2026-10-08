@@ -359,7 +359,6 @@ async fn fetch_jobs<F: Fetcher>(
     max_credits_per_run: Option<u64>,
 ) -> Result<FetchedJobs> {
     let mut fetched = FetchedJobs::default();
-    let mut page = 0u64;
     loop {
         // Budget pass 1 — the account balance (a free endpoint check).
         // A failed check does NOT block the fetch: warn and proceed
@@ -412,7 +411,7 @@ async fn fetch_jobs<F: Fetcher>(
             page_limit = page_limit.min(left);
         }
         debug!(
-            page,
+            offset = fetched.credits_spent,
             page_limit,
             balance = ?balance,
             spent = fetched.credits_spent,
@@ -421,7 +420,12 @@ async fn fetch_jobs<F: Fetcher>(
 
         let mut page_query = query.clone();
         if let Value::Object(ref mut map) = page_query {
-            map.insert("page".into(), json!(page));
+            // Offset-based continuation (`theirstack-offset-pagination`
+            // decision 1): the page-based window is `page × limit` — live-
+            // verified — so a varying cap would duplicate and skip records.
+            // The window is `[offset, offset + limit)`; offset advances by
+            // the records actually returned.
+            map.insert("offset".into(), json!(fetched.credits_spent));
             map.insert("limit".into(), json!(page_limit));
         }
         // One page: 2xx parses; every other outcome becomes a reason
@@ -434,10 +438,14 @@ async fn fetch_jobs<F: Fetcher>(
         {
             Ok((status, value)) if (200..300).contains(&status) => match value {
                 Some(value) => Theirstack::parse_response(&value).map_err(|e| {
-                    PageFailure::fetch(format!("parsing theirstack page {page} response: {e}"))
+                    PageFailure::fetch(format!(
+                        "parsing theirstack response at offset {}: {e}",
+                        fetched.credits_spent
+                    ))
                 }),
                 None => Err(PageFailure::fetch(format!(
-                    "theirstack page {page}: response body is not valid JSON"
+                    "theirstack response at offset {} is not valid JSON",
+                    fetched.credits_spent
                 ))),
             },
             Ok((status, value)) => {
@@ -478,7 +486,6 @@ async fn fetch_jobs<F: Fetcher>(
                 if count < page_limit {
                     return Ok(fetched);
                 }
-                page += 1;
             }
             // Exhaustion at ANY page — including page 0 — keeps the
             // unreturned count and returns a partial batch (possibly empty):
@@ -1340,9 +1347,16 @@ mod tests {
 
         let reqs = requests.lock().unwrap();
         assert_eq!(reqs.len(), 2);
-        // The page cursor starts at 0 and increments; bearer propagates.
-        assert!(reqs[0].0.contains("\"page\":0"));
-        assert!(reqs[1].0.contains("\"page\":1"));
+        // Offset-based continuation: the cursor advances by the records
+        // actually returned, and no `page` parameter is sent.
+        assert!(reqs[0].0.contains("\"offset\":0"), "body: {}", reqs[0].0);
+        assert!(reqs[1].0.contains("\"offset\":500"), "body: {}", reqs[1].0);
+        assert!(
+            !reqs[0].0.contains("\"page\""),
+            "no page param: {}",
+            reqs[0].0
+        );
+        // Bearer propagates.
         assert_eq!(reqs[0].1.as_deref(), Some("secret"));
         assert_eq!(reqs[1].1.as_deref(), Some("secret"));
     }
@@ -1601,6 +1615,11 @@ mod tests {
             "the zero-balance ask is uncapped — the API arbitrates: {}",
             reqs[1].0
         );
+        assert!(
+            reqs[1].0.contains("\"offset\":199"),
+            "the ask continues at the fetched offset: {}",
+            reqs[1].0
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1633,6 +1652,72 @@ mod tests {
         assert_eq!(fetched.credits_spent, 500);
         assert_eq!(fetched.truncated_results, 0);
         assert_eq!(fetched.partial_error, None);
+    }
+
+    #[test]
+    fn multi_page_varying_cap_fetches_the_exact_contiguous_window() {
+        // The review's shrunk case (758 matches / 758 credits), end to end
+        // against the faithful model: the balance cap makes page 1's limit
+        // differ from page 0's (500 then 258), so under the old page-based
+        // window (`page × limit`) the second request duplicated [258,500)
+        // and silently skipped [516,758). Under offset continuation the
+        // fetched records are exactly [0,758) — the contiguous prefix,
+        // complete, no failure.
+        let state = Arc::new(Mutex::new(ModelState::default()));
+        let model = ModelApi {
+            total_credits: 758,
+            matches: 758,
+            budget: None,
+            state: state.clone(),
+        };
+        let client = PoliteClient::with_delays(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(30),
+            model,
+        );
+        let url = Url::parse(THEIRSTACK_API).unwrap();
+        let balance_url = Url::parse(THEIRSTACK_BALANCE_API).unwrap();
+        let query = serde_json::json!({"posted_at_max_age_days": 30});
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fetched = rt
+            .block_on(fetch_jobs(
+                &client,
+                &url,
+                &query,
+                "secret",
+                &balance_url,
+                None,
+            ))
+            .expect("complete fetch");
+
+        let model_state = state.lock().unwrap();
+        assert!(
+            model_state.violations.is_empty(),
+            "unpayable or page-based requests: {:?}",
+            model_state.violations
+        );
+        assert_eq!(fetched.credits_spent, 758);
+        assert_eq!(fetched.truncated_results, 0);
+        assert_eq!(fetched.partial_error, None);
+        // Exactly the contiguous prefix [0, 758): no duplicates, no skips.
+        let mut indices: Vec<u64> = fetched
+            .jobs
+            .iter()
+            .map(|j| {
+                j.url
+                    .as_deref()
+                    .and_then(|u| u.rsplit('/').next())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(u64::MAX)
+            })
+            .collect();
+        indices.sort_unstable();
+        let expected: Vec<u64> = (0..758).collect();
+        assert_eq!(indices, expected);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1706,7 +1791,6 @@ mod tests {
     #[derive(Default)]
     struct ModelState {
         used_credits: u64,
-        served: u64,
         requested_limits: Vec<u64>,
         violations: Vec<String>,
     }
@@ -1747,6 +1831,18 @@ mod tests {
         ) -> Result<FetchResponse> {
             let mut state = self.state.lock().unwrap();
             let request: Value = serde_json::from_str(&body).expect("model request parses");
+            // A page-based request is a regression by construction: the
+            // model refuses to model `page × limit` windows, so an adapter
+            // regression to page-based pagination fails the property suite
+            // immediately (the model previously IGNORED `page` and served
+            // cumulatively — the fixture-lies failure class, baked into
+            // the model itself; `theirstack-offset-pagination` decision 3).
+            if request.get("page").is_some() {
+                state
+                    .violations
+                    .push("page-based request: the adapter must continue by offset".into());
+            }
+            let offset = request.get("offset").and_then(Value::as_u64).unwrap_or(0);
             let limit = request
                 .get("limit")
                 .and_then(Value::as_u64)
@@ -1771,7 +1867,10 @@ mod tests {
                     .push(format!("requested {limit} records with budget {left} left"));
             }
             state.requested_limits.push(limit);
-            let matches_left = self.matches - state.served;
+            // The serving window comes FROM THE REQUEST (`offset` +
+            // `limit`), live-verified offset semantics — not from the
+            // model's own counter.
+            let matches_left = self.matches.saturating_sub(offset);
             let count = limit.min(matches_left);
             // The live-verified demand contract (GWLJ-2yflze): a request
             // requires credits >= min(limit, remaining matches) — fewer,
@@ -1797,9 +1896,8 @@ mod tests {
                     .to_string(),
                 });
             }
-            let first_index = state.served;
+            let first_index = offset;
             state.used_credits += count;
-            state.served += count;
             let jobs: Vec<Value> = (0..count)
                 .map(|i| {
                     serde_json::json!({
@@ -1878,6 +1976,28 @@ mod tests {
                 let fetched = result.expect("payable fetch succeeds");
                 prop_assert_eq!(fetched.credits_spent, spent);
                 prop_assert_eq!(fetched.jobs.len() as u64, spent);
+                // The prefix property (`theirstack-offset-pagination`
+                // decision 3): the fetched records are exactly the
+                // contiguous prefix [0, spent) of the result set — no
+                // duplicates, no skips. The model serves each record at
+                // its result-set index, so a window bug (page×limit
+                // semantics, a drifting offset) fails this immediately —
+                // this is the property that would have caught the live
+                // varying-cap pagination bug the review surfaced.
+                let mut indices: Vec<u64> = fetched
+                    .jobs
+                    .iter()
+                    .map(|j| {
+                        j.url
+                            .as_deref()
+                            .and_then(|u| u.rsplit('/').next())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(u64::MAX)
+                    })
+                    .collect();
+                indices.sort_unstable();
+                let expected: Vec<u64> = (0..spent).collect();
+                prop_assert_eq!(indices, expected);
                 if spent == matches {
                     // A fetch that got everything reports no failure —
                     // EXCEPT when the per-run budget cut landed exactly at
