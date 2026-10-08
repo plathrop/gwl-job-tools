@@ -41,9 +41,9 @@ beyond the salvage fix:
   max_credits_per_run` caps what a single run will spend regardless of
   balance (default: no cap — the balance is the only bound).
 - **Spend visibility**: the run summary reports credits spent per paid
-  source (records returned = credits, per TheirStack's pricing), and the
-  source-fetch span carries the balance, the cap applied, and the budget
-  stop reason.
+  source (records returned = credits, per TheirStack's pricing); the
+  source-fetch span records that spend, and per-page balance checks log at
+  `debug!` (balance remaining, cap applied, running spend).
 - **Spec**: ADDED requirements for query-shaping config, budget-capped
   paid fetches, and spend reporting in the `discovery` capability.
 
@@ -75,7 +75,8 @@ None.
 - **Dependencies**: none new (reqwest/serde/serde_json/regex already in use).
 - **No breaking changes**: config additions are opt-in (absent = current
   behavior); the event schema is untouched.
-- **Observability** (decision 0011): the source-fetch span gains
-  credits-remaining/cap/spend fields; a budget stop logs at `error!` with the
+- **Observability** (decision 0011): the source-fetch span records
+  `credits_spent`; per-page balance checks log at `debug!` (balance
+  remaining, cap, running spend); a budget stop logs at `error!` with the
   reason via the partial-fetch mechanism; the summary carries
   `credits_spent_by_source` so a `--json` consumer can track spend per run.

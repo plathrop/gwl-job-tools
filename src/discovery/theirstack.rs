@@ -48,6 +48,12 @@ pub struct Theirstack {
 const ALWAYS_RESERVED_QUERY_KEYS: &[&str] = &[
     "limit",
     "page",
+    // TheirStack's alternative pagination parameter (the deferred
+    // cursor-based pagination path): a fixed operator cursor alongside the
+    // adapter's `page` counter would fetch ambiguous — potentially
+    // duplicate — pages, the same class of silent budgeting breakage the
+    // other keys are reserved against (PR #45 review).
+    "cursor",
     "posted_at_max_age_days",
     "discovered_at_gte",
     "company_name_not",
@@ -1577,11 +1583,15 @@ mod tests {
     async fn per_run_budget_bounds_spend() {
         // A declared budget of 400 caps the page to 400; the full page
         // continues and the next iteration stops at the budget with a
-        // reason — no further page requests.
+        // reason — no further page requests. The fixtures model the real
+        // account arithmetic (1699 remaining after the top-up; 1299 after
+        // the 400-record spend) — the scripted response never exceeds what
+        // the balance and budget can actually pay for (PR #45 review: the
+        // old fixtures scripted 199 credits against a 400-record page).
         let (mut fetcher, requests) = ScriptedFetcher::new([(200, jobs_page(400))]);
         fetcher.balance_responses = Arc::new(Mutex::new(VecDeque::from([
-            ScriptedFetcher::balance(1700, 1501),
-            ScriptedFetcher::balance(1700, 1501),
+            ScriptedFetcher::balance(3200, 1501),
+            ScriptedFetcher::balance(3200, 1901),
         ])));
         let client = PoliteClient::new(fetcher);
         let url = Url::parse(THEIRSTACK_API).unwrap();
@@ -1624,5 +1634,181 @@ mod tests {
             "message: {err}"
         );
         assert!(requests.lock().unwrap().is_empty(), "no page request made");
+    }
+
+    // ── budget loop model check (proptest; PR #45 review finding 4) ──
+
+    /// A model of TheirStack's search API and credit accounting, honoring
+    /// the live-verified request contract: a page request returns
+    /// `min(limit, remaining matches)` records, charges one credit per
+    /// record, and — the assertion this model exists for — the adapter
+    /// must never ask for more than the remaining balance (or the
+    /// remaining budget) can pay for. The response is derived FROM the
+    /// request, so a fixture that lies about the API (the failure mode
+    /// this guards: a scripted 400-record page against a 199-credit
+    /// balance the real API would refuse) is impossible by construction.
+    #[derive(Default)]
+    struct ModelState {
+        used_credits: u64,
+        served: u64,
+        requested_limits: Vec<u64>,
+        violations: Vec<String>,
+    }
+
+    struct ModelApi {
+        total_credits: u64,
+        matches: u64,
+        budget: Option<u64>,
+        state: Arc<Mutex<ModelState>>,
+    }
+
+    impl Fetcher for ModelApi {
+        async fn get(&self, _url: &Url) -> Result<FetchResponse> {
+            Err(miette::miette!("model: plain get not expected"))
+        }
+
+        async fn get_bearer(&self, _url: &Url, _bearer: Option<String>) -> Result<FetchResponse> {
+            let used = self.state.lock().unwrap().used_credits;
+            Ok(FetchResponse {
+                status: 200,
+                retry_after: None,
+                final_url: None,
+                body: serde_json::json!({
+                    "ui_credits": 50,
+                    "used_ui_credits": 0,
+                    "api_credits": self.total_credits,
+                    "used_api_credits": used,
+                })
+                .to_string(),
+            })
+        }
+
+        async fn post(
+            &self,
+            _url: &Url,
+            body: String,
+            _bearer: Option<String>,
+        ) -> Result<FetchResponse> {
+            let mut state = self.state.lock().unwrap();
+            let request: Value = serde_json::from_str(&body).expect("model request parses");
+            let limit = request
+                .get("limit")
+                .and_then(Value::as_u64)
+                .expect("adapter always sends limit");
+            let remaining = self.total_credits - state.used_credits;
+            let budget_left = self.budget.map(|b| b.saturating_sub(state.used_credits));
+            // The good-citizen contract: never request more than payable.
+            if limit > remaining {
+                state.violations.push(format!(
+                    "requested {limit} records with {remaining} credits"
+                ));
+            }
+            if let Some(left) = budget_left
+                && limit > left
+            {
+                state
+                    .violations
+                    .push(format!("requested {limit} records with budget {left} left"));
+            }
+            state.requested_limits.push(limit);
+            let matches_left = self.matches - state.served;
+            let count = limit.min(matches_left);
+            let first_index = state.served;
+            state.used_credits += count;
+            state.served += count;
+            let jobs: Vec<Value> = (0..count)
+                .map(|i| {
+                    serde_json::json!({
+                        "job_title": "Engineer",
+                        "description": "Remote job.",
+                        "final_url": format!("https://example.com/job/{}", first_index + i),
+                        "discovered_at": "2024-01-01T00:00:00",
+                    })
+                })
+                .collect();
+            Ok(FetchResponse {
+                status: 200,
+                retry_after: None,
+                final_url: None,
+                body: serde_json::json!({
+                    "data": jobs,
+                    "metadata": {"truncated_results": 0},
+                })
+                .to_string(),
+            })
+        }
+    }
+
+    proptest! {
+        /// Whatever the balance, budget, and match count, the budget loop
+        /// spends exactly min(matches, remaining, budget) — never requests
+        /// an unpayable page (checked inside the model), never overspends,
+        /// and reports a partial fetch with the right stop reason iff
+        /// matches remain unfetched.
+        #[test]
+        fn budget_loop_spends_within_bounds(
+            remaining in 0u64..1200,
+            budget in proptest::option::of(0u64..1200),
+            matches in 0u64..1200,
+        ) {
+            let state = Arc::new(Mutex::new(ModelState::default()));
+            let model = ModelApi {
+                total_credits: remaining,
+                matches,
+                budget,
+                state: state.clone(),
+            };
+            let client =
+                PoliteClient::with_delays(std::time::Duration::ZERO, std::time::Duration::from_secs(30), model);
+            let url = Url::parse(THEIRSTACK_API).unwrap();
+            let balance_url = Url::parse(THEIRSTACK_BALANCE_API).unwrap();
+            let query = serde_json::json!({"posted_at_max_age_days": 30});
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt
+                .block_on(fetch_jobs(&client, &url, &query, "secret", &balance_url, budget));
+
+            let model_state = state.lock().unwrap();
+            prop_assert!(
+                model_state.violations.is_empty(),
+                "unpayable page requests: {:?}",
+                model_state.violations
+            );
+
+            if remaining == 0 || budget == Some(0) {
+                // Nothing payable before any record was fetched: the
+                // whole-source failure contract, and no page request.
+                let err = result.expect_err("nothing payable must Err");
+                let message = err.to_string();
+                if remaining == 0 {
+                    prop_assert!(message.contains("credit balance exhausted"), "{message}");
+                } else {
+                    prop_assert!(message.contains("per-run credit budget"), "{message}");
+                }
+                prop_assert!(model_state.requested_limits.is_empty());
+            } else {
+                let spent = matches.min(remaining).min(budget.unwrap_or(u64::MAX));
+                let fetched = result.expect("payable fetch succeeds");
+                prop_assert_eq!(fetched.credits_spent, spent);
+                prop_assert_eq!(fetched.jobs.len() as u64, spent);
+                prop_assert_eq!(fetched.truncated_results, 0);
+                if spent == matches {
+                    prop_assert!(fetched.partial_error.is_none());
+                } else {
+                    let reason = fetched
+                        .partial_error
+                        .expect("an incomplete fetch carries its reason");
+                    if reason.contains("per-run credit budget") {
+                        prop_assert_eq!(budget, Some(spent));
+                    } else {
+                        prop_assert!(reason.contains("credit balance exhausted"), "{reason}");
+                        prop_assert_eq!(remaining, spent);
+                    }
+                }
+            }
+        }
     }
 }

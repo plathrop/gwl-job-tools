@@ -59,11 +59,12 @@ job_country_code_or = ["US", "CA"]
 - **Merge order**: adapter-generated parameters first, then the table's —
   with the reserved-key rule below making true precedence a non-event.
 - **Reserved keys, unconditionally rejected** (config load fails, no
-  credits spent): `limit`, `page`, `posted_at_max_age_days`,
+  credits spent): `limit`, `page`, `cursor`, `posted_at_max_age_days`,
   `discovered_at_gte`, `company_name_not`, `company_domain_not` — these are
-  owned by the pagination loop, the recency config, the watermark cursor,
-  and the blacklist pre-filter. Conflicting with them would silently break
-  the credit-budgeting machinery this change exists to protect.
+  owned by the pagination loop (page and cursor alike), the recency config,
+  the watermark cursor, and the blacklist pre-filter. Conflicting with them
+  would silently break the credit-budgeting machinery this change exists to
+  protect.
 - **Conflict-rejected** (only when `strict_filtering = true`):
   `workplace_types_or`, `min_salary_usd` — these are the strict-mode gates.
   With `strict_filtering = false` they are free for the operator, which is

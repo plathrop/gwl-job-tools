@@ -196,7 +196,7 @@ impl<F: Fetcher> PoliteClient<F> {
     }
 
     #[cfg(test)]
-    fn with_delays(politeness: Duration, max_retry: Duration, fetcher: F) -> Self {
+    pub(crate) fn with_delays(politeness: Duration, max_retry: Duration, fetcher: F) -> Self {
         Self {
             fetcher,
             politeness_delay: politeness,

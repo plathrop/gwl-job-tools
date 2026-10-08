@@ -146,8 +146,9 @@ chose: every entry is merged into the TheirStack search request, so you can
 narrow the feed server-side (titles, technologies, seniority, countries,
 salary, workplace type — any parameter TheirStack documents; build a search
 in their app UI and copy the cURL). Keys the adapter itself owns (`limit`,
-`page`, `posted_at_max_age_days`, `discovered_at_gte`, `company_name_not`,
-`company_domain_not`) are rejected at load time; `workplace_types_or` and
+`page`, `cursor`, `posted_at_max_age_days`, `discovered_at_gte`,
+`company_name_not`, `company_domain_not`) are rejected at load time;
+`workplace_types_or` and
 `min_salary_usd` are rejected only when `strict_filtering` is on (with it
 off, they're yours — e.g. `workplace_types_or = ["remote", "hybrid"]`).
 Everything a narrowed feed returns still passes through every client-side

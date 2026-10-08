@@ -49,8 +49,8 @@ partial-fetch salvage are the backstop.
 - **WHEN** a paid source is fetched and the account's remaining credits are
   fewer than the source's page size
 - **THEN** the page request's size is capped to the remaining credits, the
-  records that pay for are fetched and ingested, and the fetch reports that
-  it stopped early because the balance ran out
+  records those remaining credits pay for are fetched and ingested, and the
+  fetch reports that it stopped early because the balance ran out
 
 #### Scenario: A zero balance stops the fetch before it spends
 
