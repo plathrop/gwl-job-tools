@@ -377,14 +377,23 @@ async fn fetch_jobs<F: Fetcher>(
         let mut page_limit = PAGE_SIZE;
         if let Some(remaining) = balance {
             if remaining == 0 {
-                let reason = "credit balance exhausted (0 remaining)".to_string();
+                // Nothing fetched yet: the whole-source failure contract
+                // (no records, source reported failed, run continues).
                 if fetched.jobs.is_empty() {
-                    bail!("{reason}");
+                    bail!("credit balance exhausted (0 remaining)");
                 }
-                fetched.partial_error = Some(reason);
-                return Ok(fetched);
+                // Mid-run with a drained balance: do NOT declare
+                // exhaustion blindly — the result set may have ended
+                // exactly at the last capped page (the false-partial bug
+                // the budget-loop proptest caught: a complete fetch
+                // reported as failed). Ask anyway: free either way. If
+                // matches remain, the API 402s and the payment-required
+                // path reports the shortfall WITH its count; if none
+                // remain, the empty page completes the fetch cleanly.
+                // Leave the page uncapped — the API arbitrates.
+            } else {
+                page_limit = page_limit.min(remaining);
             }
-            page_limit = page_limit.min(remaining);
         }
         // Budget pass 2 — the per-run spend bound, if declared.
         if let Some(budget) = max_credits_per_run {
@@ -1544,9 +1553,13 @@ mod tests {
     async fn balance_caps_the_page_limit_and_stops_when_exhausted() {
         // 199 credits remaining (the live post-incident balance): the page
         // request is capped to 199, the full capped page continues, and the
-        // next balance check (0 remaining) stops the fetch as a partial
-        // with the reason — records already paid for are kept.
-        let (mut fetcher, requests) = ScriptedFetcher::new([(200, jobs_page(199))]);
+        // next balance check (0 remaining) does NOT blindly declare
+        // exhaustion — the adapter asks once more, free either way, and the
+        // API's own payment-required response settles it: records already
+        // paid for are kept, and the 402's count is the lower bound on the
+        // unreturned tail (the false-partial fix).
+        let (mut fetcher, requests) =
+            ScriptedFetcher::new([(200, jobs_page(199)), (402, credit_402_body(500, 0))]);
         fetcher.balance_responses = Arc::new(Mutex::new(VecDeque::from([
             ScriptedFetcher::balance(1700, 1501),
             ScriptedFetcher::balance(0, 0),
@@ -1562,21 +1575,64 @@ mod tests {
 
         assert_eq!(fetched.jobs.len(), 199);
         assert_eq!(fetched.credits_spent, 199);
+        assert_eq!(fetched.truncated_results, 500);
         let reason = fetched
             .partial_error
             .expect("balance exhaustion stops as a partial fetch");
+        assert!(reason.contains("status 402"), "reason: {reason}");
         assert!(
-            reason.contains("credit balance exhausted"),
+            reason.contains("Required: 500 API credits"),
             "reason: {reason}"
         );
 
         let reqs = requests.lock().unwrap();
-        assert_eq!(reqs.len(), 1, "no further page after the balance ran out");
+        assert_eq!(
+            reqs.len(),
+            2,
+            "one capped page plus the free zero-balance arbitration ask"
+        );
         assert!(
             reqs[0].0.contains("\"limit\":199"),
             "page limit capped to the balance: {}",
             reqs[0].0
         );
+        assert!(
+            reqs[1].0.contains("\"limit\":500"),
+            "the zero-balance ask is uncapped — the API arbitrates: {}",
+            reqs[1].0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_balance_mid_run_completes_cleanly_when_nothing_remains() {
+        // The false-partial bug (caught by the budget-loop proptest): the
+        // balance cap made the last page fetch EXACTLY the final records,
+        // the next balance check saw 0, and a COMPLETE fetch was reported
+        // as failed ("credit balance exhausted"). The fix: ask once more —
+        // with nothing left to return, the empty page completes the fetch
+        // cleanly and no failure is reported at all.
+        let (mut fetcher, _requests) =
+            ScriptedFetcher::new([(200, jobs_page(500)), (200, jobs_page(0))]);
+        fetcher.balance_responses = Arc::new(Mutex::new(VecDeque::from([
+            ScriptedFetcher::balance(1000, 0),
+            ScriptedFetcher::balance(1000, 500),
+        ])));
+        let client = PoliteClient::new(fetcher);
+        let url = Url::parse(THEIRSTACK_API).unwrap();
+        let balance_url = Url::parse(THEIRSTACK_BALANCE_API).unwrap();
+        let query = serde_json::json!({"posted_at_max_age_days": 30});
+
+        let fetched = fetch_jobs(&client, &url, &query, "secret", &balance_url, None)
+            .await
+            .unwrap();
+
+        // 500 matches, 500 credits: page 0 (limit 500) fetched them all;
+        // the ask after the balance hit 0 returned an empty page — complete,
+        // no failure, nothing truncated.
+        assert_eq!(fetched.jobs.len(), 500);
+        assert_eq!(fetched.credits_spent, 500);
+        assert_eq!(fetched.truncated_results, 0);
+        assert_eq!(fetched.partial_error, None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1697,8 +1753,12 @@ mod tests {
                 .expect("adapter always sends limit");
             let remaining = self.total_credits - state.used_credits;
             let budget_left = self.budget.map(|b| b.saturating_sub(state.used_credits));
-            // The good-citizen contract: never request more than payable.
-            if limit > remaining {
+            // The good-citizen contract: never request more than payable —
+            // EXCEPT at a zero balance, where the adapter deliberately asks
+            // uncapped (free either way) so the API — not the adapter —
+            // arbitrates whether anything actually remains unfetched (the
+            // false-partial bug: a complete fetch reported as exhausted).
+            if remaining > 0 && limit > remaining {
                 state.violations.push(format!(
                     "requested {limit} records with {remaining} credits"
                 ));
@@ -1713,6 +1773,30 @@ mod tests {
             state.requested_limits.push(limit);
             let matches_left = self.matches - state.served;
             let count = limit.min(matches_left);
+            // The live-verified demand contract (GWLJ-2yflze): a request
+            // requires credits >= min(limit, remaining matches) — fewer,
+            // and the API refuses with a payment-required 402, charging
+            // nothing. The model must refuse like the real API does.
+            if count > remaining {
+                return Ok(FetchResponse {
+                    status: 402,
+                    retry_after: None,
+                    final_url: None,
+                    body: serde_json::json!({
+                        "request_id": 1,
+                        "error": {
+                            "code": "E-007",
+                            "title": "Not enough credits to perform this action",
+                            "description": format!(
+                                "You need to upgrade your plan to perform this \
+                                 action. Required: {count} API credits. You \
+                                 currently have {remaining} API credits."
+                            ),
+                        },
+                    })
+                    .to_string(),
+                });
+            }
             let first_index = state.served;
             state.used_credits += count;
             state.served += count;
@@ -1794,18 +1878,44 @@ mod tests {
                 let fetched = result.expect("payable fetch succeeds");
                 prop_assert_eq!(fetched.credits_spent, spent);
                 prop_assert_eq!(fetched.jobs.len() as u64, spent);
-                prop_assert_eq!(fetched.truncated_results, 0);
                 if spent == matches {
-                    prop_assert!(fetched.partial_error.is_none());
+                    // A fetch that got everything reports no failure —
+                    // EXCEPT when the per-run budget cut landed exactly at
+                    // the end: an honest internal stop ("budget reached"),
+                    // not an API fact (the balance case can now tell the
+                    // difference by asking; the budget cannot, without
+                    // spending).
+                    if budget == Some(spent) {
+                        let reason = fetched
+                            .partial_error
+                            .expect("the budget stop carries its reason");
+                        prop_assert!(
+                            reason.contains("per-run credit budget"),
+                            "{reason}"
+                        );
+                    } else {
+                        prop_assert!(fetched.partial_error.is_none());
+                    }
                 } else {
+                    let tail = matches - spent;
                     let reason = fetched
                         .partial_error
                         .expect("an incomplete fetch carries its reason");
                     if reason.contains("per-run credit budget") {
                         prop_assert_eq!(budget, Some(spent));
+                        prop_assert_eq!(fetched.truncated_results, 0);
                     } else {
-                        prop_assert!(reason.contains("credit balance exhausted"), "{reason}");
+                        // Balance exhaustion surfaces as the API's own
+                        // payment-required response, whose "Required: N"
+                        // is a lower bound on the unreturned tail.
+                        prop_assert!(reason.contains("status 402"), "{reason}");
                         prop_assert_eq!(remaining, spent);
+                        let budget_left =
+                            budget.map(|b| b - spent).unwrap_or(u64::MAX);
+                        prop_assert_eq!(
+                            fetched.truncated_results,
+                            PAGE_SIZE.min(tail).min(budget_left)
+                        );
                     }
                 }
             }
