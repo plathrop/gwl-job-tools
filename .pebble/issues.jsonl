@@ -466,3 +466,5 @@
 {"type":"update","issueId":"GWLJ-sepubv","timestamp":"2026-10-08T14:43:41.676Z","data":{"status":"in_progress"},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-5vx5wd","timestamp":"2026-10-08T16:19:06.485Z","data":{"priority":0,"title":"Bugs [bucket]","description":"Evergreen bucket epic for filing bugs.\n\nCorrectness defects: behavior that violates a documented contract (wrong/missing audit data, wrong output). Performance and refactor work does not belong here — that's an enhancement (GWLJ-32p6d0)."},"source":"gwl-job-tools"}
 {"type":"update","issueId":"GWLJ-32p6d0","timestamp":"2026-10-08T16:19:07.175Z","data":{"title":"Future Enhancements [bucket]","description":"Evergreen bucket epic for filing future work."},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-32p6d0","timestamp":"2026-10-08T16:27:16.928Z","data":{"title":"Backlog [bucket]"},"source":"gwl-job-tools"}
+{"type":"update","issueId":"GWLJ-5vx5wd","timestamp":"2026-10-08T16:27:17.620Z","data":{"description":"Evergreen bucket epic for filing bugs."},"source":"gwl-job-tools"}
