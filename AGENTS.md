@@ -212,7 +212,7 @@ Pebbles track:
 
 - ideas not yet ready to become specs;
 - bugfixes (no spec needed);
-- epics — an arc of work or a bucket (e.g., the "Bug Fixes" epic);
+- epics — an arc of work;
 - breaking a large spec into small deliverable chunks;
 - tasks that surface during execution of a change but don't belong in it.
 
