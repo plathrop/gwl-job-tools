@@ -36,7 +36,8 @@ opentelemetry-otlp = { version = "0.32", features = [
   "reqwest-client",
   "reqwest-rustls",
   # Export failures (misconfigured endpoint, auth, network) flow through
-  # tracing::error! — into the file sink and Honeycomb — instead of being
+  # otel_debug!/tracing::debug! — into the file sink (via the debug
+  # directive in telemetry_env_filter) and Honeycomb — instead of being
   # silently swallowed (GWLJ-21r6zw; the 0.32 SDK reports errors via these
   # internal logs, there is no global error handler anymore).
   "internal-logs",

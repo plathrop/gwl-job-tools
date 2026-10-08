@@ -105,9 +105,10 @@ pub fn init_telemetry(
             global::set_tracer_provider(setup.provider.clone());
 
             // Export failures surface through the `internal-logs` feature
-            // (Cargo.toml): the 0.32 SDK reports them via tracing::error!,
-            // which lands in the file sink and (as span events) Honeycomb —
-            // never failing the command (guardrail).
+            // (Cargo.toml): the 0.32 SDK reports them via `otel_debug!` →
+            // `tracing::debug!`, which `telemetry_env_filter` raises to the
+            // file sink (and the unfiltered OTLP layer carries them as span
+            // events) — never failing the command (guardrail).
 
             let tracer = setup.provider.tracer(name.to_owned());
             let telemetry_layer: OpenTelemetryLayer<_, SdkTracer> = OpenTelemetryLayer::new(tracer);
@@ -182,30 +183,42 @@ struct OtlpSetup {
     headers: Option<String>,
 }
 
-/// Resolve the trace export endpoint from the OTel env vars, applying the
-/// signal path (`/v1/traces`) to pathless values (GWLJ-21r6zw). The SDK
-/// uses `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` VERBATIM, so a base-style
-/// value (e.g. `https://api.honeycomb.io`) POSTs to `/` and 404s —
-/// silently, since export failures were invisible. The pathless fix is a
-/// deliberate deviation from strict-spec verbatim behavior: the value is
-/// the documented Honeycomb endpoint for the base var, and a pathed value
-/// is still honored verbatim. `None` when neither var is set (the SDK
-/// default applies).
+/// Resolve the trace export endpoint from the OTel env vars
+/// (GWLJ-21r6zw), keeping the two variables' spec semantics distinct:
+///
+/// - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (signal-specific) is used
+///   VERBATIM per the stable exporter spec — with ONE deliberate,
+///   documented deviation: a **pathless** value gets `/v1/traces`
+///   appended, because the base-style form (`https://api.honeycomb.io`)
+///   is the live footgun (verbatim, it POSTs to `/` and 404s, silently).
+/// - `OTEL_EXPORTER_OTLP_ENDPOINT` (base) ALWAYS gets the signal path
+///   appended — even when it already carries a path, per spec Example 3
+///   (`http://collector:4318/mycollector/` → `…/mycollector/v1/traces`).
+///
+/// The branches must not be collapsed (PR #47 review: the collapsed
+/// version returned a pathed base verbatim — a valid collector config
+/// exporting to the wrong URL — and stripped a trailing slash from
+/// pathed signal-specific values).
 #[cfg(feature = "telemetry")]
 fn resolve_trace_endpoint(
     traces_endpoint: Option<&str>,
     base_endpoint: Option<&str>,
 ) -> Option<String> {
-    let raw = traces_endpoint.or(base_endpoint)?;
-    let trimmed = raw.trim().trim_end_matches('/');
-    let has_path = trimmed
-        .split_once("://")
-        .map(|(_, rest)| rest.contains('/'))
-        .unwrap_or(true);
-    if has_path {
-        return Some(trimmed.to_string());
+    if let Some(raw) = traces_endpoint {
+        let trimmed = raw.trim();
+        let without_trailing_slash = trimmed.trim_end_matches('/');
+        let has_path = without_trailing_slash
+            .split_once("://")
+            .map(|(_, rest)| rest.contains('/'))
+            .unwrap_or(true);
+        if has_path {
+            // Verbatim, trailing slash and all.
+            return Some(trimmed.to_string());
+        }
+        return Some(format!("{without_trailing_slash}/v1/traces"));
     }
-    Some(format!("{trimmed}/v1/traces"))
+    let base = base_endpoint?.trim().trim_end_matches('/');
+    Some(format!("{base}/v1/traces"))
 }
 
 #[cfg(feature = "telemetry")]
@@ -427,19 +440,34 @@ mod tests {
             ),
             Some("https://api.honeycomb.io/v1/traces".to_string())
         );
+        // Verbatim means untouched: a trailing slash on a pathed
+        // signal-specific value survives (PR #47 review: the collapsed
+        // version stripped it).
+        assert_eq!(
+            resolve_trace_endpoint(Some("https://collector.example/custom/"), None),
+            Some("https://collector.example/custom/".to_string())
+        );
     }
 
     #[cfg(feature = "telemetry")]
     #[test]
-    fn base_endpoint_var_gets_the_trace_path_appended() {
-        // Per the OTel spec, the BASE var takes the signal path.
+    fn base_endpoint_var_always_gets_the_trace_path_appended() {
+        // Per the OTel spec, the BASE var takes the signal path — even
+        // when it already carries a path (spec Example 3:
+        // http://collector:4318/mycollector/ → …/mycollector/v1/traces).
+        // PR #47 review: the collapsed version returned a pathed base
+        // verbatim — a valid collector config exporting to the wrong URL.
         assert_eq!(
             resolve_trace_endpoint(None, Some("https://api.honeycomb.io")),
             Some("https://api.honeycomb.io/v1/traces".to_string())
         );
         assert_eq!(
-            resolve_trace_endpoint(None, Some("https://collector.example/api/traces"),),
-            Some("https://collector.example/api/traces".to_string())
+            resolve_trace_endpoint(None, Some("https://collector.example/mycollector/"),),
+            Some("https://collector.example/mycollector/v1/traces".to_string())
+        );
+        assert_eq!(
+            resolve_trace_endpoint(None, Some("http://collector:4318")),
+            Some("http://collector:4318/v1/traces".to_string())
         );
     }
 
