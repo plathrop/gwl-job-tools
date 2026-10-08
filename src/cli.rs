@@ -372,7 +372,11 @@ pub struct DiscoverArgs {
     pub source: Option<String>,
     /// Preview the run: fetch, resolve, gate, and score every posting and
     /// print the summary, but write nothing (no event-log writes, no
-    /// discovery event, no writer lock)
+    /// discovery event, no writer lock). The fetch is REAL: a paid source
+    /// still spends 1 credit per returned record (the prompt/--yes
+    /// authorizes that spend), and no watermark advances — the next real
+    /// run re-fetches the same window and re-spends. Bound the spend with
+    /// [sources.<name>].max_credits_per_run.
     #[arg(long)]
     pub dry_run: bool,
     /// Skip the paid-source `--dry-run` confirmation prompt (scripts)

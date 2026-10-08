@@ -132,7 +132,12 @@ job_country_code_or = ["US", "CA"]
 Discovery sources are opt-in and fetched only when `enabled = true`. The
 TheirStack source charges one API credit per returned job, so `discover`
 records a per-source `discovered_at` watermark on each run and re-runs fetch
-only newly-discovered jobs. A `--dry-run` that would spend credits prompts on
+only newly-discovered jobs. **`--dry-run` is not free on a paid source**: it
+performs the real fetch and spends 1 credit per returned record (the prompt/
+`--yes` authorizes that spend) while writing nothing and advancing no
+watermark — so the next real run re-fetches the same window and re-spends
+those credits. Bound what any single run — dry or real — can spend with
+`max_credits_per_run`. A `--dry-run` that would spend credits prompts on
 stderr (`--yes` skips the prompt; without `--yes` it refuses under `--json` or
 when stdin isn't a terminal). The configured blacklist is additionally pushed server-side as a
 credit-saving pre-filter, but the client-side blacklist gate remains the
