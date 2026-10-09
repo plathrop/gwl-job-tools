@@ -151,11 +151,18 @@ fn env_filter(log_level: Option<LogLevel>) -> EnvFilter {
 }
 
 /// The file-sink filter when telemetry is ON (GWLJ-21r6zw): the base log
-/// level plus `debug` for the opentelemetry crates, because the 0.32 SDK
-/// reports export failures (connection refused, auth rejected, wrong
-/// endpoint — exactly the misconfigurations that made `telemetry = "on"`
-/// silently produce nothing) at `otel_debug!` level. Without this, a
-/// broken exporter is invisible at the default (`error`) file level.
+/// level plus two classes of exception —
+/// - `debug` for the opentelemetry crates, because the 0.32 SDK reports
+///   export failures (connection refused, auth rejected, wrong endpoint —
+///   exactly the misconfigurations that made `telemetry = "on"` silently
+///   produce nothing) at `otel_debug!` level. Without this, a broken
+///   exporter is invisible at the default (`error`) file level.
+/// - `warn` for this crate's own events (PR #47 review: the pathless-
+///   endpoint correction warn was filtered out exactly when defaults held
+///   — silence-by-construction, in the PR whose thesis is ending it). The
+///   app's own warns are high-signal operational breadcrumbs (config
+///   corrections, balance-check failures, retries); third-party targets
+///   keep the configured quiet-by-default (decision 0005).
 #[cfg(feature = "telemetry")]
 fn telemetry_env_filter(log_level: Option<LogLevel>) -> EnvFilter {
     let mut filter = env_filter(log_level);
@@ -165,7 +172,10 @@ fn telemetry_env_filter(log_level: Option<LogLevel>) -> EnvFilter {
             .expect("static directive parses");
         filter = filter.add_directive(directive);
     }
-    filter
+    let directive = format!("{}=warn", env!("CARGO_CRATE_NAME"))
+        .parse()
+        .expect("static directive parses");
+    filter.add_directive(directive)
 }
 
 /// The OTLP provider plus the endpoint/headers it was configured from, so
@@ -469,6 +479,29 @@ mod tests {
             resolve_trace_endpoint(None, Some("http://collector:4318")),
             Some("http://collector:4318/v1/traces".to_string())
         );
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn telemetry_env_filter_carries_the_exception_directives() {
+        // At the default (error) file level, the telemetry-on filter adds:
+        // debug for the three opentelemetry crates (export failures are
+        // otel_debug!) and warn for this crate's own events (PR #47
+        // review: the pathless-correction warn must reach the sink when
+        // defaults hold). Third-party targets keep the base level.
+        let filter = telemetry_env_filter(Some(LogLevel::Error));
+        let directives = format!("{filter}");
+        assert!(directives.contains("error"), "{directives}");
+        assert!(
+            directives.contains(&format!("{}=warn", env!("CARGO_CRATE_NAME"))),
+            "{directives}"
+        );
+        for target in ["opentelemetry", "opentelemetry_sdk", "opentelemetry_otlp"] {
+            assert!(
+                directives.contains(&format!("{target}=debug")),
+                "{directives}"
+            );
+        }
     }
 
     #[cfg(feature = "telemetry")]
