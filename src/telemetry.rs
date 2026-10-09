@@ -157,9 +157,14 @@ fn env_filter(log_level: Option<LogLevel>) -> EnvFilter {
 ///   exactly the misconfigurations that made `telemetry = "on"` silently
 ///   produce nothing) at `otel_debug!` level. Without this, a broken
 ///   exporter is invisible at the default (`error`) file level.
-/// - `warn` for this crate's own events (PR #47 review: the pathless-
-///   endpoint correction warn was filtered out exactly when defaults held
-///   — silence-by-construction, in the PR whose thesis is ending it). The
+/// - `warn` for this crate's own events, but ONLY when the effective base
+///   level would otherwise suppress them (the default `error` config):
+///   the pathless-endpoint correction warn was filtered out exactly when
+///   defaults held — silence-by-construction, in the PR whose thesis is
+///   ending it (PR #47 review). An EnvFilter directive is most-specific-
+///   wins, so adding it unconditionally would CLAMP the crate to warn+
+///   at raised levels — at `--log-level info`, the crate's own INFO lines
+///   vanished from the sink (caught live during review; fixed here). The
 ///   app's own warns are high-signal operational breadcrumbs (config
 ///   corrections, balance-check failures, retries); third-party targets
 ///   keep the configured quiet-by-default (decision 0005).
@@ -172,10 +177,22 @@ fn telemetry_env_filter(log_level: Option<LogLevel>) -> EnvFilter {
             .expect("static directive parses");
         filter = filter.add_directive(directive);
     }
-    let directive = format!("{}=warn", env!("CARGO_CRATE_NAME"))
-        .parse()
-        .expect("static directive parses");
-    filter.add_directive(directive)
+    // Only raise the crate's floor when the base level would suppress its
+    // warns: an explicit error config, or the default (no level, no
+    // RUST_LOG — an explicit RUST_LOG is the operator speaking and is
+    // respected wholesale). Never clamp below what was asked for.
+    let base_suppresses_warns = match log_level {
+        Some(LogLevel::Error) => true,
+        Some(_) => false,
+        None => std::env::var_os("RUST_LOG").is_none(),
+    };
+    if base_suppresses_warns {
+        let directive = format!("{}=warn", env!("CARGO_CRATE_NAME"))
+            .parse()
+            .expect("static directive parses");
+        filter = filter.add_directive(directive);
+    }
+    filter
 }
 
 /// The OTLP provider plus the endpoint/headers it was configured from, so
@@ -500,6 +517,30 @@ mod tests {
             assert!(
                 directives.contains(&format!("{target}=debug")),
                 "{directives}"
+            );
+        }
+    }
+
+    #[cfg(feature = "telemetry")]
+    #[test]
+    fn telemetry_env_filter_never_clamps_a_raised_level() {
+        // Directives are most-specific-wins: an unconditional
+        // `<crate>=warn` would CLAMP the crate's own log output to warn+
+        // even at `--log-level info` — its INFO lines vanished from the
+        // sink until this guard (caught live during review). At a raised
+        // level the base already passes warns; the directive must be
+        // absent.
+        for level in [
+            LogLevel::Warn,
+            LogLevel::Info,
+            LogLevel::Debug,
+            LogLevel::Trace,
+        ] {
+            let filter = telemetry_env_filter(Some(level));
+            let directives = format!("{filter}");
+            assert!(
+                !directives.contains(&format!("{}=warn", env!("CARGO_CRATE_NAME"))),
+                "level {level:?} must not clamp the crate: {directives}"
             );
         }
     }
