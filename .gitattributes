@@ -1,0 +1,3 @@
+# Reconcile the pebble ledger by event union, not textual line merge.
+# Requires: git config merge.pebble.driver "pb merge %A %B -o %A"
+.pebble/issues.jsonl merge=pebble
