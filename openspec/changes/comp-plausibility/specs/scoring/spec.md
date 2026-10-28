@@ -38,6 +38,33 @@ gate compares.
 - **THEN** that lead's new score omits the compensation dimension, and the
   previously recorded score remains in the event log as history
 
+#### Scenario: Implausible compensation never fails a gate
+
+- **WHEN** a posting's compensation range exceeds the cap
+- **THEN** the gates report no failure attributable to that range, and the
+  lead is scored (with the dimension dropped) rather than rejected
+
+### Requirement: The scoring breakdown identifies an implausible drop
+
+The composite's human-readable breakdown SHALL distinguish a compensation
+dimension dropped for implausibility from one absent because compensation is
+unknown, and SHALL name both the offending value and the active cap. The
+breakdown SHALL be produced without any configuration, so the explanation is
+visible in the ordinary `list` and `show` output.
+
+#### Scenario: The breakdown explains an implausible drop
+
+- **WHEN** a lead is scored with its compensation dimension dropped for
+  implausibility
+- **THEN** the breakdown names the offending value and the cap, and does not
+  read as though compensation were simply unknown
+
+#### Scenario: An unknown range still reads as unknown
+
+- **WHEN** a lead is scored with no compensation range at all
+- **THEN** the breakdown states that compensation is unknown, unchanged from
+  today
+
 ### Requirement: Inverted compensation ranges are normalized before comparison
 
 When a compensation range's minimum exceeds its maximum — an upstream data
@@ -70,9 +97,15 @@ already absent and this rule has no effect.
 #### Scenario: An operator raises the cap
 
 - **WHEN** the operator sets `compensation_plausibility_multiplier` to a
-  value of 1.0 or greater
-- **THEN** the cap is that multiple of the ceiling, and ranges between the
-  default cap and the raised cap are scored normally
+  value greater than 2.0
+- **THEN** the cap is that multiple of the ceiling, and a range that the
+  default cap would have judged implausible is scored normally
+
+#### Scenario: An operator lowers the cap to the ceiling
+
+- **WHEN** the operator sets `compensation_plausibility_multiplier` to 1.0
+- **THEN** the cap equals the ceiling, and every range above the ceiling is
+  treated as implausible while ranges at or below it score as before
 
 #### Scenario: A nonsensical multiplier fails loudly
 

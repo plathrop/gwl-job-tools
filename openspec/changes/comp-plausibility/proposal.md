@@ -70,12 +70,16 @@ contract.
   was an inflated range will drop in rank on `rescore`, and `list` output
   will reorder accordingly. That is the intended effect.
 - **Dependencies**: none new.
-- **Observability** (decision 0011): each rejection is one `warn!` with the
-  offending values and the active cap (identifying fields: company/title or
-  lead id, min, max, cap) — rare enough today (5 per 100 leads) that a warn
-  is signal, not noise; the breakdown string carries the explanation into
-  `show`/`list` for the operator, and `rescore` reports how many scores
-  changed.
+- **Observability** (decision 0011): the always-visible signal is the
+  composite breakdown, which names the offending value and the active cap in
+  ordinary `list`/`show` output with no configuration; `rescore` also reports
+  how many scores changed. Additionally one `warn!` fires per refused range
+  with identifying fields (company, title, min, max, cap, multiplier) — rare
+  enough today (5 per 100 leads) to be signal. Honest limit, verified in
+  code: with telemetry off (the default) the file sink's floor is `error`, so
+  that warn is visible only at a raised log level; the underlying filter
+  policy is filed separately as GWLJ-5ca8pg rather than smuggled into a
+  scoring change.
 - **Related but out of scope**: the same untrustworthy upstream field feeds
   the `min_salary_usd` server-side filter (GWLJ-ieqxvw), and a future
   improvement can annualize from the source-published

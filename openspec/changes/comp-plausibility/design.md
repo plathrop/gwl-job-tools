@@ -23,9 +23,14 @@ Three facts constrain the fix:
 
 ### 1. The rule lives in scoring — not the adapter, not a gate
 
-`compensation_score()` returns `None` for an implausible range, which is
-exactly the "unknown compensation" path already implemented: the dimension is
-omitted and the remaining weights renormalize.
+`compensation_score()` stops returning `Option<u64>` and returns a small
+verdict instead — `Scored(u64) | Unknown | Implausible { value, cap }` — so
+the caller can drop the dimension *and* say why (Decision 5). The drop itself
+is the existing "unknown compensation" path: the dimension is omitted and the
+remaining weights renormalize. The signature change is deliberate and ripples
+into the existing `Option`-asserting unit tests in `scoring.rs`, which must be
+updated as part of this change; a bare `None` cannot carry the value and cap
+the breakdown needs.
 
 Rejected alternatives:
 
@@ -50,9 +55,16 @@ Validation at config load (`Config::validate`, alongside the existing
 floor-below-ceiling check):
 
 - non-finite (`NaN`, `inf`) → error naming the key;
-- `< 1.0` → error naming the key. At `1.0` the rule only fires above the
-  ceiling; below that it would silently drop every at-or-above-ceiling range,
-  which is a footgun disguised as configuration.
+- `< 1.0` → error naming the key. Below 1.0 the cap falls *below* the
+  ceiling, so the rule would drop legitimate **sub-ceiling** ranges — values
+  that today interpolate to a real score between 0 and 100 — which is a
+  footgun disguised as configuration, not a narrowing of an existing
+  saturation.
+
+The key accepts an integer or a float literal (`2` and `2.0` both mean 2.0).
+TOML integers do not coerce to `f64` through serde, and an operator typing
+`2` should not get a type error instead of a cap; the config deserializer
+accepts either form and the tests pin both.
 
 When `compensation_ceiling` is unset, `compensation_score` already returns
 `None`, so the cap is never computed.
@@ -89,22 +101,60 @@ cap } | NoResume`) and render from it. This is internal to `scoring`, no
 schema or API change, and it keeps the existing strings for the existing
 cases byte-identical where tests already assert them.
 
-### 6. Observability: one `warn!` per refused range, no new counters
+### 6. Observability: the breakdown is the operator-visible signal
 
-```
-warn!(company, title, min, max, cap, multiplier, "compensation implausible; dimension dropped")
-```
+Two layers, ordered by how reliably the operator sees them:
 
-Expected frequency is low (5/100 leads on the worst day measured, none on
-most), which makes `warn` signal rather than the wallpaper an `info` would
-become. Deliberately **not** added:
+- **Always visible — the breakdown string.** `list`, `show` and the review
+  card render it with no configuration at all, so the operator sees why a
+  score is shaped the way it is. This is the signal the spec promises.
+- **Log — one `warn!` per refused range**, with identifying fields
+  (`company`, `title`, `min`, `max`, `cap`, `multiplier`). Expected frequency
+  is low (5 per 100 leads on the worst day measured, none on most), which
+  makes `warn` signal rather than the wallpaper an `info` would become.
 
-- a summary/discovery-event counter — plumbing a score outcome back into the
-  discovery payload for a rare event;
+Honest caveat, found in review and verified in code: with telemetry disabled
+(the default, and this operator's setting) the file sink's filter floor is
+`error` (`env_filter`, decision 0005), so **no crate `warn!` reaches the log**
+unless the level is raised. PR #47 rescued the warn floor only on the
+telemetry-on path (`telemetry_env_filter`), so the off path is
+silence-by-construction for exactly this class of message. Changing that is a
+cross-cutting logging-policy decision, not a scoring rule, so this change does
+not touch it and the spec does not promise the warn. Filed as follow-up
+(GWLJ-5ca8pg).
+
+Deliberately **not** added:
+
+- a discovery-summary or discovery-event counter — plumbing a score outcome
+  back into the discovery payload for a rare event; the breakdown plus the
+  `rescore` changed-count cover the operational need for now;
+- a span on `score()` — it is a pure function that performs no I/O, and this
+  change introduces none; the 0011 floor applies to boundaries, not to pure
+  computation;
 - promoting the existing `theirstack_mismatch` comp span (currently `debug!`)
   — that signal answers a different question (structured field vs text-quoted
-  comp) and would fire on ordinary disagreements; recorded as a follow-up on
-  GWLJ-f5pdka rather than bundled here.
+  comp) and fires on ordinary disagreements; recorded as a follow-up on
+  GWLJ-f5pdka.
+
+### 7. When only the top of the range is junk, the dimension still drops
+
+The compared value is `max.or(min)`, so a range like `min 180,000 / max
+187,200,000` is implausible as a whole and the dimension drops, even though
+the bottom looks sane. Three alternatives were weighed:
+
+- **Score against `min` when `max` is implausible.** Systematically
+  *understates* — `min` scores at or near 0 against a floor above it — and
+  pretends the posting pays its bottom of range.
+- **Clamp `max` to the cap.** Systematically *inflates*: a clamped value
+  lands at or above the ceiling and scores 100, which is the bug being fixed.
+- **Trust the bound that survives and flag the other.** More machinery than
+  the signal warrants, and it invents a comparison rule the floor gate does
+  not share.
+
+Dropping is the only option that adds no information the data does not
+support: we know the range is untrustworthy, not where in it the job sits.
+All five records measured on 2026-10-28 have *both* bounds implausible, so the
+practical cost today is zero.
 
 ## Risks and trade-offs
 
@@ -119,6 +169,17 @@ become. Deliberately **not** added:
 - **The upstream data problem is not fixed.** `min_salary_usd` in the paid
   query carries the same untrustworthy field, so the server-side filter
   narrows less than it appears to (GWLJ-ieqxvw). Out of scope here.
+
+## Follow-ups (filed, not attempted here)
+
+- `GWLJ-5ca8pg` — the crate's `warn!` floor with telemetry off: the file sink
+  filters every crate warn at the default level, so this change's warn (and
+  every other operational warn) is invisible unless the level is raised.
+- Annualize from TheirStack's source-published `salary_currency` /
+  `salary_period` / `min_salary` / `max_salary` instead of trusting the
+  feed's annualized USD fields (~2.5% fill, jobs since 2026-10 only).
+- Promote the `theirstack_mismatch` comp signal out of `debug!` once we know
+  how noisy it is.
 
 ## Non-goals
 
@@ -138,6 +199,10 @@ become. Deliberately **not** added:
   350k record asserting it still scores 100.
 - Unit tests for the inverted-range normalization, asserting the gate and
   scoring agree on the same normalized value.
+- A gate test asserting an above-cap range produces **no** gate failures (the
+  spec's "never rejected, down-gated, or excluded" clause needs a net).
+- Config tests for the multiplier in both literal forms (`2` and `2.0`) and
+  for the rejected values.
 - Config validation tests: `NaN`, `inf`, `0.5`, and an accepted `3.0`.
 - Property tests: (a) any value above the cap produces the same result as
   `comp: None`; (b) within `[floor, cap]` the score is monotone
