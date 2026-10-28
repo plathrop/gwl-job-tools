@@ -2,7 +2,7 @@
 
 ## 1. Config: plausibility multiplier
 
-- [ ] 1.1 Add `compensation_plausibility_multiplier: Option<f64>` to `Config` (absent = 2.0, resolved through a getter so callers never handle the default). Verify: config tests cover absent, present, and `${VAR}`-free parsing; an unknown sibling key is still rejected.
+- [ ] 1.1 Add `compensation_plausibility_multiplier` to `Config` accepting an integer or float literal (absent = 2.0, resolved through a getter so callers never handle the default). Verify: config tests cover absent, `2` (integer literal), `2.0` (float literal), and `${VAR}`-free parsing; an unknown sibling key is still rejected.
 - [ ] 1.2 Validate it in `Config::validate`: non-finite or `< 1.0` fails with an error naming the key, alongside the existing floor-below-ceiling check. Verify: unit tests for `NaN`, `inf`, `0.5` (each an error naming the key) and `3.0` (accepted).
 
 ## 2. Compensation range normalization
@@ -12,14 +12,16 @@
 
 ## 3. Scoring: implausible compensation drops the dimension
 
-- [ ] 3.1 Compute the cap in `compensation_score` (`ceiling × multiplier`) and return `None`, with the reason recorded, when the compared value (`max.or(min)`) exceeds it. Verify: unit tests pinned to the five real 2026-10-28 records (208,000,000 / 301,600,000 / 185,120,000 / 2,808,000 / 2,280,000) each drop the dimension; a 350,000 record still scores 100.
-- [ ] 3.2 Replace `dropped: Vec<&'static str>` with a reason-carrying form (`Unknown | Implausible { value, cap } | NoResume`) and render it, keeping the existing unknown/no-resume strings byte-identical. Verify: `composite_and_breakdown` unit tests — existing assertions unchanged, plus one asserting the implausible string carries both the value and the cap.
+- [ ] 3.0 Change `compensation_score` to return a verdict (`Scored(u64) | Unknown | Implausible { value, cap }`) instead of `Option<u64>`, and update the existing `Option`-asserting tests to the new shape without changing their expectations. Verify: `cargo test domain::scoring` passes with only the assertion shape changed (the pre-existing expected scores are untouched).
+- [ ] 3.1 Compute the cap in the scoring path (`ceiling × multiplier`) and return `Implausible`, so the dimension is dropped and the reason carried, when the compared value (`max.or(min)`) exceeds it. Verify: unit tests pinned to the five real 2026-10-28 records (208,000,000 / 301,600,000 / 185,120,000 / 2,808,000 / 2,280,000) each drop the dimension; a 350,000 record still scores 100.
+- [ ] 3.2 Replace `dropped: &[&'static str]` with a reason-carrying form (`Unknown | Implausible { value, cap } | NoResume`) and render it, keeping the existing unknown/no-resume strings byte-identical. Verify: `composite_and_breakdown` unit tests — existing assertions unchanged, plus one asserting the implausible string carries both the value and the cap.
 - [ ] 3.3 Property tests: (a) any compared value above the cap scores identically to `comp: None`; (b) within `[floor, cap]` the dimension is monotone non-decreasing; (c) `normalized(min>max) == normalized(max>min)`. Verify: `cargo test` runs them, and each property fails if the guard is removed.
+- [ ] 3.4 Gate neutrality: assert `gates::evaluate` produces no failure for an above-cap compensation range (the spec's "never rejected, down-gated, or excluded" clause). Verify: the test fails if a gate ever starts rejecting implausible comp.
 
 ## 4. Observability
 
-- [ ] 4.1 Emit one `warn!` when a range is refused, with identifying fields (`company`, `title`, `min`, `max`, `cap`, `multiplier`). Verify: a test captures the span/log fields for a refused record, and a sanity check that a plausible record emits nothing.
-- [ ] 4.2 Confirm the scoring span still carries the outcome for a dropped dimension (no new fields required) and that telemetry remains optional: the warn reaches the file sink at the default level. Verify: `cargo run -- list --all --log-level warn` style manual check with a fixture, or a test asserting the level.
+- [ ] 4.1 Emit one `warn!` when a range is refused, with identifying fields (`company`, `title`, `min`, `max`, `cap`, `multiplier`). Verify: a test captures the fields for a refused record, and a plausible record emits nothing.
+- [ ] 4.2 Document the honest limit where it matters — in the code comment beside the `warn!` and in the README config note — that with telemetry off the sink's floor is `error`, so the warn is visible only at a raised `--log-level`; the always-visible signal is the breakdown string (GWLJ-5ca8pg tracks the filter policy). Verify: the README note exists and the test for task 4.1 uses an explicit level rather than assuming the default admits warns.
 
 ## 5. Retroactive repair path
 
