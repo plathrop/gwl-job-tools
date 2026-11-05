@@ -12,8 +12,6 @@ excluded for implausible compensation; only its score changes.
 
 #### Scenario: A range above the cap drops the dimension
 
-#### Scenario: A range above the cap drops the dimension
-
 - **WHEN** a posting passes all gates and its compensation range's compared
   value exceeds the plausibility cap
 - **THEN** the lead is scored with no compensation dimension, the remaining
