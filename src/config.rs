@@ -305,8 +305,8 @@ impl Config {
 ///
 /// Any quoted value at or above the ceiling already scores 100, so the cap
 /// carries no ranking information above it; its only job is catching data
-/// errors, and upstream errors observed live are 1–700× too large. Provisional
-/// provisional for public use: the maintainer's scale says 2.0 (anything above
+/// errors, and upstream errors observed live are 1–700× too large.
+/// Provisional for public use: the maintainer's scale says 2.0 (anything above
 /// 600k is beyond caring), and the intent is to iterate on user feedback rather
 /// than tune blind — which is exactly why it is a config key and not a
 /// constant in the rule.

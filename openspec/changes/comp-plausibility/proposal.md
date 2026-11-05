@@ -72,7 +72,8 @@ contract.
 - **Dependencies**: none new.
 - **Observability** (decision 0011): the always-visible signal is the
   composite breakdown, which names the offending value and the active cap in
-  ordinary `list`/`show` output with no configuration; `rescore` also reports
+  `show` and the review card with no configuration (the `list` row stays a
+  one-line scan view and carries the composite only); `rescore` also reports
   how many scores changed. Additionally one `warn!` fires per refused range
   with identifying fields (company, title, min, max, cap, multiplier) — rare
   enough today (5 per 100 leads) to be signal. Honest limit, verified in

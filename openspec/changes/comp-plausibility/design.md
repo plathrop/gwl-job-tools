@@ -105,9 +105,14 @@ cases byte-identical where tests already assert them.
 
 Two layers, ordered by how reliably the operator sees them:
 
-- **Always visible — the breakdown string.** `list`, `show` and the review
-  card render it with no configuration at all, so the operator sees why a
-  score is shaped the way it is. This is the signal the spec promises.
+- **Visible without configuration — the breakdown string.** `show` and the
+  review card render it with no configuration at all, so the operator sees why
+  a score is shaped the way it is. This is the signal the spec promises.
+  `list` deliberately renders the composite only: it is a one-line scan view,
+  and a 60–110-character breakdown per row would dominate it. The alternative —
+  a short implausibility tag on the row — is the card marker this change
+  already declined on simplicity grounds, so the two are one decision, not
+  two.
 - **Log — one `warn!` per refused range**, with identifying fields
   (`company`, `title`, `min`, `max`, `cap`, `multiplier`). Expected frequency
   is low (5 per 100 leads on the worst day measured, none on most), which

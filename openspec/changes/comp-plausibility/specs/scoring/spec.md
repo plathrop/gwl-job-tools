@@ -55,8 +55,7 @@ number represents a posting.
 The composite's human-readable breakdown SHALL distinguish a compensation
 dimension dropped for implausibility from one absent because compensation is
 unknown, and SHALL name both the offending value and the active cap. The
-breakdown SHALL be produced without any configuration, so the explanation is
-visible in the ordinary `list` and `show` output.
+breakdown SHALL be shown without configuration or a raised log level.
 
 #### Scenario: The breakdown explains an implausible drop
 
@@ -70,6 +69,14 @@ visible in the ordinary `list` and `show` output.
 - **WHEN** a lead is scored with no compensation range at all
 - **THEN** the breakdown states that compensation is unknown, unchanged from
   today
+
+#### Scenario: The explanation lives in the detail views
+
+- **WHEN** a scored lead is displayed by `show` or on a review card
+- **THEN** its breakdown is displayed, including any implausibility note
+- **AND WHEN** the same lead appears in `list`
+- **THEN** the row carries the composite and its lead id only, and the
+  breakdown is reachable from that id
 
 ### Requirement: Inverted compensation ranges are normalized before comparison
 

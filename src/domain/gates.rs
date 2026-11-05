@@ -437,15 +437,18 @@ mod tests {
 
     #[test]
     fn inverted_range_is_not_rejected_by_the_floor() {
-        // min 400k / max 250k is an upstream error; the top of the range is
-        // above the floor once normalized, so this must not reject.
+        // min 300k / max 100k is an upstream error. The range is chosen so the
+        // NET IS REAL: the fixture floor is 180k, so without normalization
+        // `compared_value()` is 100k (below the floor → rejected) while with
+        // normalization it is 300k (above the floor → passes). A range that
+        // clears the floor either way round tests nothing.
         let mut e = extracted();
         e.comp = Some(crate::domain::events::CompRange {
-            min: Some(400_000),
-            max: Some(250_000),
+            min: Some(300_000),
+            max: Some(100_000),
             currency: "USD".into(),
             period: "year".into(),
-            raw: "$400,000 - $250,000".into(),
+            raw: "$300,000 - $100,000".into(),
         });
         assert!(evaluate(&config(), &e, "body").is_empty());
     }

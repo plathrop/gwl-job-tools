@@ -20,7 +20,7 @@
 
 ## 4. Observability
 
-- [x] 4.1 Emit one `warn!` when a range is refused, with identifying fields (`company`, `title`, `min`, `max`, `cap`, `multiplier`). Verify: a test captures the fields for a refused record, and a plausible record emits nothing.
+- [x] 4.1 Emit one `warn!` when a range is refused, with identifying fields (`company`, `title`, `value` — the single compared value — `cap`, `multiplier`, and `quoted`, the upstream salary string). Verify: a test captures the fields for a refused record, and a plausible record emits nothing.
 - [x] 4.2 Document the honest limit where it matters — in the code comment beside the `warn!` and in the README config note — that with telemetry off the sink's floor is `error`, so the warn is visible only at a raised `--log-level`; the always-visible signal is the breakdown string (GWLJ-5ca8pg tracks the filter policy). Verify: the README note exists and the test for task 4.1 uses an explicit level rather than assuming the default admits warns.
 
 ## 5. Retroactive repair path
