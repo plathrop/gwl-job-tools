@@ -1,0 +1,137 @@
+# scoring Specification
+
+## Purpose
+
+How a posting's compensation range is judged before it contributes to a
+score, and what the composite does when the range cannot be trusted. A feed
+can publish a unit or currency error (a weekly rate annualized twice, a
+local-currency figure labelled USD); scoring a range like that at face value
+saturates the dimension and ranks the posting at the top of the queue, so an
+implausible range is treated as unknown rather than as evidence.
+
+## Requirements
+
+### Requirement: Implausible compensation is scored as unknown compensation
+
+When a posting's compensation range exceeds the configured plausibility cap,
+scoring SHALL omit the compensation dimension, renormalize the remaining
+dimensions' weights, and mark the dimension as dropped for implausibility
+rather than as unknown. A posting SHALL NOT be rejected, down-gated, or
+excluded for implausible compensation; only its score changes.
+
+#### Scenario: A range above the cap drops the dimension
+
+- **WHEN** a posting passes all gates and its compensation range's compared
+  value exceeds the plausibility cap
+- **THEN** the lead is scored with no compensation dimension, the remaining
+  dimensions renormalize, and the breakdown identifies the compensation as
+  implausible rather than unknown
+
+#### Scenario: A range within the cap scores as before
+
+- **WHEN** a posting's compensation range's compared value is at or below
+  the cap
+- **THEN** the compensation dimension contributes exactly as it does today
+
+#### Scenario: Rescoring repairs previously inflated scores
+
+- **WHEN** `rescore` re-evaluates a lead whose stored compensation range
+  exceeds the cap
+- **THEN** that lead's new score omits the compensation dimension, and the
+  previously recorded score remains in the event log as history
+
+#### Scenario: Implausible compensation never fails a gate
+
+- **WHEN** a posting's compensation range exceeds the cap
+- **THEN** the gates report no failure attributable to that range, and the
+  lead is scored (with the dimension dropped) rather than rejected
+
+### Requirement: The plausibility check uses one comparison value
+
+Scoring SHALL compare a compensation range against the cap using the top of
+the quoted range when present, otherwise the bottom — the same value the
+compensation-floor gate compares, so the two cannot disagree about which
+number represents a posting.
+
+#### Scenario: A single-figure range is compared against its only value
+
+- **WHEN** a posting quotes only one compensation figure (no top of range)
+- **THEN** that figure is compared against the cap, exactly as the floor gate
+  compares it
+
+### Requirement: The scoring breakdown identifies an implausible drop
+
+The composite's human-readable breakdown SHALL distinguish a compensation
+dimension dropped for implausibility from one absent because compensation is
+unknown, and SHALL name both the offending value and the active cap. The
+breakdown SHALL be shown without configuration or a raised log level.
+
+#### Scenario: The breakdown explains an implausible drop
+
+- **WHEN** a lead is scored with its compensation dimension dropped for
+  implausibility
+- **THEN** the breakdown names the offending value and the cap, and does not
+  read as though compensation were simply unknown
+
+#### Scenario: An unknown range still reads as unknown
+
+- **WHEN** a lead is scored with no compensation range at all
+- **THEN** the breakdown states that compensation is unknown, unchanged from
+  today
+
+#### Scenario: The explanation lives in the detail views
+
+- **WHEN** a scored lead is displayed by `show` or on a review card
+- **THEN** its breakdown is displayed, including any implausibility note
+- **AND WHEN** the same lead appears in `list`
+- **THEN** the row carries the composite and its lead id only, and the
+  breakdown is reachable from that id
+
+### Requirement: Inverted compensation ranges are normalized before comparison
+
+When a compensation range's minimum exceeds its maximum — an upstream data
+error — the range SHALL be normalized by swapping the bounds before any
+gate or scoring comparison consumes it, so a single malformed pair cannot
+defeat both the floor gate and the plausibility check.
+
+#### Scenario: A swapped range is compared correctly
+
+- **WHEN** a posting's compensation range has a minimum greater than its
+  maximum (e.g. min 400,000 / max 250,000)
+- **THEN** the floor gate and the plausibility check both compare against
+  400,000, as though the bounds had been recorded the right way round
+
+### Requirement: The plausibility cap is config-derived and tunable
+
+The cap SHALL be computed as the configured `compensation_ceiling`
+multiplied by a `compensation_plausibility_multiplier` config value whose
+default SHALL be 2.0. A multiplier below 1.0, or a non-finite value, SHALL
+fail at config load with an error naming the key, before any lead is scored.
+When no compensation ceiling is configured, the compensation dimension is
+already absent and this rule has no effect.
+
+#### Scenario: The default multiplier applies
+
+- **WHEN** the operator configures a compensation ceiling and does not set
+  `compensation_plausibility_multiplier`
+- **THEN** the cap is twice the ceiling
+
+#### Scenario: An operator raises the cap
+
+- **WHEN** the operator sets `compensation_plausibility_multiplier` to a
+  value greater than 2.0
+- **THEN** the cap is that multiple of the ceiling, and a range that the
+  default cap would have judged implausible is scored normally
+
+#### Scenario: An operator lowers the cap to the ceiling
+
+- **WHEN** the operator sets `compensation_plausibility_multiplier` to 1.0
+- **THEN** the cap equals the ceiling, and every range above the ceiling is
+  treated as implausible while ranges at or below it score as before
+
+#### Scenario: A nonsensical multiplier fails loudly
+
+- **WHEN** the operator sets `compensation_plausibility_multiplier` below
+  1.0 or to a non-finite value
+- **THEN** the command fails at config load with an error naming the key,
+  and no lead is scored under the invalid configuration
