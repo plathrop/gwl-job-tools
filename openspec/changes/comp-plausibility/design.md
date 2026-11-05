@@ -190,7 +190,11 @@ practical cost today is zero.
   `salary_period` / `min_salary` / `max_salary` fields. Correct in principle,
   but ~2.5% fill and only for jobs discovered since 2026-10 (docs checked
   2026-10-28). Recorded on the pebble.
-- Anything about gates, ranking weights, or the review UX.
+- Anything about gates, ranking weights, or the review UX. Specifically: a
+  marker on the `list`/review card flagging implausible compensation was
+  considered and deferred for simplicity — the breakdown string carries the
+  explanation, and a card-level tag is a UI decision better made once we see
+  how often the rule fires.
 
 ## Testing
 
