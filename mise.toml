@@ -1,0 +1,12 @@
+# Dev toolchain pins. Committed so every contributor and reviewer runs the
+# same tool versions; personal environment variables belong in
+# mise.local.toml, which is gitignored.
+[tools]
+dprint = "0.64.1"
+
+# Pinned deliberately: openspec's strict-validation rules change between
+# minors (1.12 did not enforce the >500-char requirement-text rule that 1.14+
+# does), so an unpinned version makes `openspec validate --strict` disagree
+# between reviewers and machines — see PR #49's review note. Run it via
+# `mise exec -- openspec ...` so the pinned version is the one used.
+"npm:@fission-ai/openspec" = "1.16.0"

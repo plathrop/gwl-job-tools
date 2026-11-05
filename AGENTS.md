@@ -175,16 +175,22 @@ Imports must be at the **top level** (top of the file), except:
 - `cargo fmt` (rustfmt) for Rust.
 - `dprint fmt` for Markdown, TOML, YAML, and JSON.
 - `cargo clippy --all-targets -- -D warnings` must pass.
+- `mise exec -- openspec validate --all --strict` (specs) and
+  `mise exec -- openspec validate <change> --strict` (an active change) must
+  pass — `--all` covers specs only. openspec is pinned in `mise.toml`, so run
+  it through `mise exec`: its strict rules change between minors, and a
+  version off `PATH` disagrees with reviewers.
 
 ## Commands
 
-| Command                                     | Purpose           |
-| ------------------------------------------- | ----------------- |
-| `cargo check`                               | Type-check        |
-| `cargo test`                                | Run tests         |
-| `cargo clippy --all-targets -- -D warnings` | Lint (must pass)  |
-| `cargo fmt --check`                         | Verify formatting |
-| `cargo build`                               | Build             |
+| Command                                         | Purpose                    |
+| ----------------------------------------------- | -------------------------- |
+| `cargo check`                                   | Type-check                 |
+| `cargo test`                                    | Run tests                  |
+| `cargo clippy --all-targets -- -D warnings`     | Lint (must pass)           |
+| `cargo fmt --check`                             | Verify formatting          |
+| `cargo build`                                   | Build                      |
+| `mise exec -- openspec validate --all --strict` | Validate specs (must pass) |
 
 ## OpenSpec
 

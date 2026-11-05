@@ -14,7 +14,6 @@ target
 **/mutants.out*/
 
 # Local tool/environment configuration
-mise.toml
 mise.local.toml
 .env
 .env.*
