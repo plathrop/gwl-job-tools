@@ -399,7 +399,10 @@ fn summary_line(summary: &RescoreSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{commands::test_support::*, domain::events::ExtractedFields};
+    use crate::{
+        commands::test_support::*,
+        domain::events::{CompRange, ExtractedFields},
+    };
 
     // ── classify ────────────────────────────────────────────────
 
@@ -801,6 +804,86 @@ mod tests {
         assert_eq!(
             line,
             "rescored 3 leads: 1 changed, 1 newly rejected, 0 revived, 1 unchanged"
+        );
+    }
+    // ── comp-plausibility: rescore repairs an inflated score ────
+
+    #[test]
+    fn rescore_drops_a_compensation_dimension_that_became_implausible() {
+        // Ingest under a multiplier loose enough to admit an absurd range (so
+        // the lead starts life scored with compensation = 100), then rescore
+        // under the default: the dimension must drop, the score must change,
+        // and the original `scored` event must survive as history.
+        let loose = Config {
+            compensation_floor: Some(180_000),
+            compensation_ceiling: Some(300_000),
+            compensation_plausibility_multiplier: Some(1_000.0),
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, record) = ingested_lead(
+            &dir,
+            &loose,
+            ExtractedFields {
+                title: Some("Engineer".into()),
+                company: Some("Acme".into()),
+                comp: Some(CompRange {
+                    min: Some(187_200_000),
+                    max: Some(208_000_000),
+                    currency: "USD".into(),
+                    period: "year".into(),
+                    raw: "$187.2M - $208M".into(),
+                }),
+                ..Default::default()
+            },
+            "body",
+        );
+        let before = record
+            .latest_score
+            .clone()
+            .expect("ingested lead was scored");
+        assert!(
+            before.dimensions.iter().any(|d| d.name == "compensation"),
+            "the loose multiplier should admit the range: {}",
+            before.breakdown
+        );
+
+        let default = Config {
+            compensation_floor: Some(180_000),
+            compensation_ceiling: Some(300_000),
+            ..Default::default()
+        };
+        let outcome = rescore_lead(&mut store, &default, &[], &record, Uuid::now_v7()).unwrap();
+        assert_eq!(outcome.delta, RescoreDelta::Changed);
+        assert_ne!(outcome.old_composite, outcome.new_composite);
+
+        // History is intact: both `scored` events are in the log, and only the
+        // newer one lacks the compensation dimension.
+        let scored: Vec<_> = store
+            .replay()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == "scored")
+            .collect();
+        assert_eq!(scored.len(), 2, "expected the original and the rescores");
+        assert_eq!(scored[0].payload["revision"], 1);
+        assert_eq!(scored[1].payload["revision"], 2);
+
+        let newest = &scored[1].payload;
+        let names: Vec<&str> = newest["dimensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        assert!(!names.contains(&"compensation"), "dimensions: {names:?}");
+        assert!(
+            newest["breakdown"]
+                .as_str()
+                .unwrap()
+                .contains("compensation: implausible (208000000 exceeds cap 600000)"),
+            "breakdown: {}",
+            newest["breakdown"]
         );
     }
 }

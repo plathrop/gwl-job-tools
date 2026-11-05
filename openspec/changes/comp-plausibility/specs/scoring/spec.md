@@ -5,17 +5,12 @@
 ### Requirement: Implausible compensation is scored as unknown compensation
 
 When a posting's compensation range exceeds the configured plausibility cap,
-the scoring pipeline SHALL treat that compensation as unknown: the
-compensation dimension SHALL be omitted from the composite, the remaining
-dimensions' weights SHALL renormalize over what is present, and the
-composite's breakdown SHALL state that the dimension was dropped for
-implausibility — distinguishing it from a posting whose compensation is
-merely unknown. A posting is never rejected, down-gated, or excluded for
-implausible compensation; only its score changes.
+scoring SHALL omit the compensation dimension, renormalize the remaining
+dimensions' weights, and mark the dimension as dropped for implausibility
+rather than as unknown. A posting SHALL NOT be rejected, down-gated, or
+excluded for implausible compensation; only its score changes.
 
-The value compared against the cap SHALL be the top of the quoted range
-when present, otherwise the bottom — the same value the compensation-floor
-gate compares.
+#### Scenario: A range above the cap drops the dimension
 
 #### Scenario: A range above the cap drops the dimension
 
@@ -43,6 +38,19 @@ gate compares.
 - **WHEN** a posting's compensation range exceeds the cap
 - **THEN** the gates report no failure attributable to that range, and the
   lead is scored (with the dimension dropped) rather than rejected
+
+### Requirement: The plausibility check uses one comparison value
+
+Scoring SHALL compare a compensation range against the cap using the top of
+the quoted range when present, otherwise the bottom — the same value the
+compensation-floor gate compares, so the two cannot disagree about which
+number represents a posting.
+
+#### Scenario: A single-figure range is compared against its only value
+
+- **WHEN** a posting quotes only one compensation figure (no top of range)
+- **THEN** that figure is compared against the cap, exactly as the floor gate
+  compares it
 
 ### Requirement: The scoring breakdown identifies an implausible drop
 

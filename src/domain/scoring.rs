@@ -9,11 +9,13 @@
 
 use std::collections::HashMap;
 
+use tracing::warn;
+
 use crate::{
     config::Config,
     domain::{
         cached_regex,
-        events::{CompRange, DimensionScore, ExtractedFields},
+        events::{DimensionScore, ExtractedFields},
     },
 };
 
@@ -26,6 +28,36 @@ pub struct ScoreResult {
     pub breakdown: String,
 }
 
+/// A dimension that could not be scored, and why — the reason reaches the
+/// breakdown so the operator can tell an absent input from a distrusted one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DroppedReason {
+    /// No input to score (e.g. the posting quotes no compensation).
+    Unknown,
+    /// The input was present but is not credible (see [`CompVerdict`]).
+    Implausible { value: u64, cap: u64 },
+    /// No resume configured, so skills cannot be matched.
+    NoResume,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DroppedDimension {
+    name: &'static str,
+    reason: DroppedReason,
+}
+
+/// What scoring decided about a posting's compensation range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompVerdict {
+    /// A plausible range, scored linearly across floor→ceiling.
+    Scored(u64),
+    /// Nothing to score (absent range, or no floor/ceiling configured).
+    Unknown,
+    /// A range that exists but is not credible — scored as unknown, and named
+    /// in the breakdown so it does not read as a simple absence.
+    Implausible { value: u64, cap: u64 },
+}
+
 /// Score a posting. `resume_skills` is the flattened resume keyword list
 /// (empty when no resume is configured or it has no skills — the skills
 /// dimension then drops out).
@@ -36,12 +68,15 @@ pub fn score(
     resume_skills: &[String],
 ) -> ScoreResult {
     let mut dims: Vec<(&'static str, u64)> = Vec::new();
-    let mut dropped: Vec<&'static str> = Vec::new();
+    let mut dropped: Vec<DroppedDimension> = Vec::new();
 
     dims.push(("level", level_score(extracted, raw_text)));
 
     if resume_skills.is_empty() {
-        dropped.push("skills");
+        dropped.push(DroppedDimension {
+            name: "skills",
+            reason: DroppedReason::NoResume,
+        });
     } else {
         // Skills match against the title too: API-sourced postings may
         // mention a skill only in the title, not the extracted body.
@@ -56,8 +91,33 @@ pub fn score(
     }
 
     match compensation_score(config, extracted) {
-        Some(s) => dims.push(("compensation", s)),
-        None => dropped.push("compensation"),
+        CompVerdict::Scored(s) => dims.push(("compensation", s)),
+        CompVerdict::Unknown => dropped.push(DroppedDimension {
+            name: "compensation",
+            reason: DroppedReason::Unknown,
+        }),
+        CompVerdict::Implausible { value, cap } => {
+            // The breakdown is the always-visible signal (the file sink filters
+            // `warn` at the default level — see `env_filter`/decision 0005);
+            // this line is for operators who raise the level.
+            warn!(
+                company = extracted.company.as_deref().unwrap_or_default(),
+                title = extracted.title.as_deref().unwrap_or_default(),
+                value,
+                cap,
+                multiplier = config.plausibility_multiplier(),
+                quoted = extracted
+                    .comp
+                    .as_ref()
+                    .map(|c| c.raw.as_str())
+                    .unwrap_or_default(),
+                "compensation implausible; dimension dropped"
+            );
+            dropped.push(DroppedDimension {
+                name: "compensation",
+                reason: DroppedReason::Implausible { value, cap },
+            });
+        }
     }
 
     dims.push(("remote", remote_score(extracted)));
@@ -95,7 +155,7 @@ fn weight_of(config: &Config, name: &str) -> f64 {
 /// human-readable breakdown (renormalized weights, dropped-dimension notes).
 fn composite_and_breakdown(
     dimensions: &[DimensionScore],
-    dropped: &[&'static str],
+    dropped: &[DroppedDimension],
 ) -> (u64, String) {
     let total_weight: f64 = dimensions.iter().map(|d| d.weight).sum();
     let weighted_sum: f64 = dimensions.iter().map(|d| d.weight * d.score as f64).sum();
@@ -122,10 +182,15 @@ fn composite_and_breakdown(
     if !dropped.is_empty() {
         let notes: Vec<String> = dropped
             .iter()
-            .map(|d| match *d {
-                "compensation" => "compensation: unknown, weight renormalized".to_string(),
-                "skills" => "skills: no resume, weight renormalized".to_string(),
-                other => format!("{other}: unavailable, weight renormalized"),
+            .map(|d| match d.reason {
+                DroppedReason::Unknown => {
+                    format!("{}: unknown, weight renormalized", d.name)
+                }
+                DroppedReason::Implausible { value, cap } => format!(
+                    "{}: implausible ({value} exceeds cap {cap}), weight renormalized",
+                    d.name
+                ),
+                DroppedReason::NoResume => format!("{}: no resume, weight renormalized", d.name),
             })
             .collect();
         breakdown.push_str(&format!(" [{}]", notes.join("; ")));
@@ -296,21 +361,37 @@ fn token_in(token: &str, text: &str) -> bool {
 
 // ── compensation ─────────────────────────────────────────────────
 
-/// Linear interpolation floor→ceiling; at/above ceiling = 100. `None` when
-/// comp is unknown or floor/ceiling are unconfigured (the dimension drops
-/// out).
-fn compensation_score(config: &Config, extracted: &ExtractedFields) -> Option<u64> {
-    let floor = config.compensation_floor?;
-    let ceiling = config.compensation_ceiling?;
-    let comp: &CompRange = extracted.comp.as_ref()?;
-    // Compare against the top of the quoted range when present, else the
-    // single/bottom figure (mirrors the gate's comparison).
-    let value = comp.max.or(comp.min)?;
+/// Linear interpolation floor→ceiling; at/above ceiling = 100. [`CompVerdict::Unknown`]
+/// when comp is unknown or floor/ceiling are unconfigured, and
+/// [`CompVerdict::Implausible`] when the quoted value exceeds the plausibility
+/// cap (ceiling × `compensation_plausibility_multiplier`) — an upstream unit or
+/// currency error must not saturate the dimension at 100 and inflate the
+/// composite. An implausible range is never a rejection: the permissive-gate
+/// philosophy still governs, and the dimension simply drops out.
+fn compensation_score(config: &Config, extracted: &ExtractedFields) -> CompVerdict {
+    let Some(floor) = config.compensation_floor else {
+        return CompVerdict::Unknown;
+    };
+    let Some(ceiling) = config.compensation_ceiling else {
+        return CompVerdict::Unknown;
+    };
+    let Some(comp) = extracted.comp.as_ref() else {
+        return CompVerdict::Unknown;
+    };
+    // Inverted bounds are an upstream data error; normalize before judging.
+    let Some(value) = comp.clone().normalized().compared_value() else {
+        return CompVerdict::Unknown;
+    };
+    if let Some(cap) = config.plausibility_cap()
+        && value > cap
+    {
+        return CompVerdict::Implausible { value, cap };
+    }
     if ceiling <= floor {
-        return None;
+        return CompVerdict::Unknown;
     }
     let score = (value.saturating_sub(floor)) as f64 / (ceiling - floor) as f64 * 100.0;
-    Some(score.clamp(0.0, 100.0).round() as u64)
+    CompVerdict::Scored(score.clamp(0.0, 100.0).round() as u64)
 }
 
 // ── remote ───────────────────────────────────────────────────────
@@ -329,8 +410,10 @@ fn remote_score(extracted: &ExtractedFields) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
-    use crate::config::ScoringWeights;
+    use crate::{config::ScoringWeights, domain::events::CompRange};
 
     fn config() -> Config {
         Config {
@@ -608,21 +691,21 @@ mod tests {
             period: "year".into(),
             raw: "$180,000".into(),
         });
-        assert_eq!(compensation_score(&config(), &e), Some(0));
+        assert_eq!(compensation_score(&config(), &e), CompVerdict::Scored(0));
         e.comp.as_mut().unwrap().max = Some(300_000);
-        assert_eq!(compensation_score(&config(), &e), Some(100));
+        assert_eq!(compensation_score(&config(), &e), CompVerdict::Scored(100));
         e.comp.as_mut().unwrap().max = Some(240_000);
-        assert_eq!(compensation_score(&config(), &e), Some(50));
+        assert_eq!(compensation_score(&config(), &e), CompVerdict::Scored(50));
     }
 
     #[test]
     fn compensation_unknown_or_unconfigured_drops_out() {
         let mut e = extracted();
         e.comp = None;
-        assert_eq!(compensation_score(&config(), &e), None);
+        assert_eq!(compensation_score(&config(), &e), CompVerdict::Unknown);
         let mut cfg = config();
         cfg.compensation_ceiling = None;
-        assert_eq!(compensation_score(&cfg, &extracted()), None);
+        assert_eq!(compensation_score(&cfg, &extracted()), CompVerdict::Unknown);
     }
 
     #[test]
@@ -637,7 +720,194 @@ mod tests {
             period: "year".into(),
             raw: "$240,000".into(),
         });
-        assert_eq!(compensation_score(&config(), &e), Some(50));
+        assert_eq!(compensation_score(&config(), &e), CompVerdict::Scored(50));
+    }
+
+    // ── implausible compensation (comp-plausibility, GWLJ-f5pdka) ─
+
+    fn comp_range(min: u64, max: u64) -> CompRange {
+        CompRange {
+            min: Some(min),
+            max: Some(max),
+            currency: "USD".into(),
+            period: "year".into(),
+            raw: format!("${min} - ${max}"),
+        }
+    }
+
+    fn with_comp(min: u64, max: u64) -> ExtractedFields {
+        let mut e = extracted();
+        e.comp = Some(comp_range(min, max));
+        e
+    }
+
+    #[test]
+    fn implausible_ranges_drop_the_dimension() {
+        // The five real upstream errors from the 2026-10-28 paid run. The
+        // default config (floor 180k, ceiling 300k) puts the cap at 600_000.
+        for (min, max, value) in [
+            (187_200_000u64, 208_000_000u64, 208_000_000u64), // Advantech PM
+            (218_400_000, 301_600_000, 301_600_000),          // Velociti QC lead
+            (176_800_000, 185_120_000, 185_120_000),          // Mayfair accountant
+            (2_080_000, 2_808_000, 2_808_000),                // "$40k-$54k a week" x52
+            (1_560_000, 2_280_000, 2_280_000),                // WW Talents SWE
+        ] {
+            assert_eq!(
+                compensation_score(&config(), &with_comp(min, max)),
+                CompVerdict::Implausible {
+                    value,
+                    cap: 600_000
+                },
+                "range {min}-{max} should be implausible"
+            );
+        }
+    }
+
+    #[test]
+    fn plausible_high_value_still_scores() {
+        // Above the ceiling but within the cap: saturates at 100, as today.
+        assert_eq!(
+            compensation_score(&config(), &with_comp(300_000, 350_000)),
+            CompVerdict::Scored(100)
+        );
+    }
+
+    #[test]
+    fn at_the_cap_scores_normally() {
+        // The rule is strict "exceeds": a value exactly at the cap scores.
+        assert_eq!(
+            compensation_score(&config(), &with_comp(500_000, 600_000)),
+            CompVerdict::Scored(100)
+        );
+    }
+
+    #[test]
+    fn raised_multiplier_admits_a_higher_range() {
+        let mut cfg = config();
+        cfg.compensation_plausibility_multiplier = Some(3.0);
+        assert_eq!(
+            compensation_score(&cfg, &with_comp(650_000, 700_000)),
+            CompVerdict::Scored(100)
+        );
+        assert_eq!(cfg.plausibility_cap(), Some(900_000));
+    }
+
+    #[test]
+    fn inverted_range_is_normalized_before_judging() {
+        // min above max is an upstream error; the top of the range (the
+        // larger figure) is what gets compared, so this is plausible.
+        let inverted = with_comp(400_000, 250_000);
+        assert_eq!(
+            compensation_score(&config(), &inverted),
+            CompVerdict::Scored(100)
+        );
+        let normalized = inverted.comp.clone().unwrap().normalized();
+        assert_eq!(
+            (normalized.min, normalized.max),
+            (Some(250_000), Some(400_000))
+        );
+        // `raw` is the upstream presentation string and is deliberately left
+        // alone: normalization is about comparison, not about rewriting history.
+        assert_eq!(normalized.raw, "$400000 - $250000");
+    }
+
+    #[test]
+    fn breakdown_names_the_implausible_value_and_cap() {
+        let skills = vec!["Kubernetes".to_string()];
+        let result = score(
+            &config(),
+            &with_comp(187_200_000, 208_000_000),
+            "body",
+            &skills,
+        );
+        assert!(
+            result
+                .breakdown
+                .contains("compensation: implausible (208000000 exceeds cap 600000)"),
+            "unexpected breakdown: {}",
+            result.breakdown
+        );
+        // The dimension is absent, not merely zero.
+        assert!(!result.dimensions.iter().any(|d| d.name == "compensation"));
+    }
+
+    #[test]
+    fn implausible_comp_scores_like_absent_comp() {
+        let skills = vec!["Kubernetes".to_string()];
+        let mut absent = extracted();
+        absent.comp = None;
+        let with_absent = score(&config(), &absent, "body", &skills);
+        let with_implausible = score(
+            &config(),
+            &with_comp(187_200_000, 208_000_000),
+            "body",
+            &skills,
+        );
+        assert_eq!(with_absent.composite, with_implausible.composite);
+        assert_eq!(with_absent.dimensions, with_implausible.dimensions);
+        // Only the explanation differs.
+        assert_ne!(with_absent.breakdown, with_implausible.breakdown);
+    }
+
+    proptest! {
+        /// Anything above the cap is judged implausible, whatever the range's
+        /// width; at or below the cap, nothing is.
+        #[test]
+        fn the_cap_is_the_boundary(
+            cap_excess in 1u64..100_000_000u64,
+            width in 0u64..1_000_000u64,
+        ) {
+            let value = 600_000 + cap_excess;
+            let above = compensation_score(
+                &config(),
+                &with_comp(value.saturating_sub(width), value),
+            );
+            prop_assert_eq!(above, CompVerdict::Implausible { value, cap: 600_000 });
+
+            let within = compensation_score(&config(), &with_comp(value - cap_excess, value - cap_excess));
+            let within_is_implausible = matches!(within, CompVerdict::Implausible { .. });
+            prop_assert!(!within_is_implausible);
+        }
+
+        /// Within [floor, cap] the dimension is monotone non-decreasing
+        /// (reaching 100 at the ceiling and staying there).
+        #[test]
+        fn dimension_is_monotone_up_to_the_cap(
+            a in 180_000u64..600_000u64,
+            delta in 0u64..420_000u64,
+        ) {
+            let b = (a + delta).min(600_000);
+            let CompVerdict::Scored(sa) = compensation_score(&config(), &with_comp(a, a)) else {
+                prop_assert!(false, "expected a score for {a}");
+                unreachable!()
+            };
+            let CompVerdict::Scored(sb) = compensation_score(&config(), &with_comp(b, b)) else {
+                prop_assert!(false, "expected a score for {b}");
+                unreachable!()
+            };
+            prop_assert!(sa <= sb, "{sa} > {sb} for {a} -> {b}");
+        }
+
+        /// Normalization is symmetric: swapping inverted bounds yields the
+        /// same normalized range either way round.
+        #[test]
+        fn normalization_is_symmetric(lo in 0u64..1_000_000u64, hi in 0u64..1_000_000u64) {
+            let a = CompRange {
+                min: Some(lo),
+                max: Some(hi),
+                currency: "USD".into(),
+                period: "year".into(),
+                raw: String::new(),
+            };
+            let b = CompRange {
+                min: Some(hi),
+                max: Some(lo),
+                currency: "USD".into(),
+                period: "year".into(),
+                raw: String::new(),
+            };
+            prop_assert_eq!(a.normalized(), b.normalized());
+        }
     }
 
     // ── remote ───────────────────────────────────────────────────
@@ -748,5 +1018,72 @@ mod tests {
             result.breakdown
         );
         assert!(result.composite <= 100, "composite: {}", result.composite);
+    }
+    // ── observability: the implausibility warn ───────────────────
+
+    /// Capture what the `warn!` writes, without a global subscriber (tests run
+    /// in parallel, so the subscriber is scoped to the closure).
+    fn captured_warnings(body: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer({
+                        let sink = sink.clone();
+                        move || Buffer(sink.clone())
+                    }),
+            );
+        tracing::subscriber::with_default(subscriber, body);
+        String::from_utf8(sink.lock().unwrap().clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn implausible_comp_warns_once_with_identifying_fields() {
+        let captured = captured_warnings(|| {
+            let mut e = with_comp(187_200_000, 208_000_000);
+            e.company = Some("Advantech USA".into());
+            e.title = Some("Product Manager".into());
+            let _ = score(&config(), &e, "body", &["Kubernetes".to_string()]);
+        });
+        assert!(captured.contains("compensation implausible"), "{captured}");
+        // The offending input must be locatable from the line alone.
+        for needle in [
+            "Advantech USA",
+            "Product Manager",
+            "value=208000000",
+            "cap=600000",
+            "multiplier=2",
+            "$187200000",
+        ] {
+            assert!(captured.contains(needle), "missing {needle} in: {captured}");
+        }
+        assert_eq!(captured.matches("compensation implausible").count(), 1);
+    }
+
+    #[test]
+    fn plausible_comp_warns_nothing() {
+        let captured = captured_warnings(|| {
+            let _ = score(&config(), &with_comp(300_000, 350_000), "body", &[]);
+        });
+        assert!(captured.is_empty(), "unexpected log output: {captured}");
     }
 }

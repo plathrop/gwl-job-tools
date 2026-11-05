@@ -87,10 +87,11 @@ pub fn evaluate(config: &Config, extracted: &ExtractedFields, raw_text: &str) ->
     }
 
     if let (Some(floor), Some(comp)) = (config.compensation_floor, &extracted.comp) {
-        // Compare against the top of the quoted range when present, else
-        // the single/bottom figure. (Comp is normalized to USD/year at
-        // extraction.)
-        let quoted = comp.max.or(comp.min);
+        // Compare against the top of the quoted range when present, else the
+        // single/bottom figure (shared with scoring so the two cannot
+        // disagree), after normalizing an inverted range. (Comp is normalized
+        // to USD/year at extraction.)
+        let quoted = comp.clone().normalized().compared_value();
         if let Some(quoted) = quoted
             && quoted < floor
         {
@@ -431,5 +432,36 @@ mod tests {
             serde_json::to_value(Gate::Ideological).unwrap(),
             "ideological"
         );
+    }
+    // ── compensation-range normalization (comp-plausibility) ─────
+
+    #[test]
+    fn inverted_range_is_not_rejected_by_the_floor() {
+        // min 400k / max 250k is an upstream error; the top of the range is
+        // above the floor once normalized, so this must not reject.
+        let mut e = extracted();
+        e.comp = Some(crate::domain::events::CompRange {
+            min: Some(400_000),
+            max: Some(250_000),
+            currency: "USD".into(),
+            period: "year".into(),
+            raw: "$400,000 - $250,000".into(),
+        });
+        assert!(evaluate(&config(), &e, "body").is_empty());
+    }
+
+    #[test]
+    fn implausible_compensation_fails_no_gate() {
+        // The plausibility rule is a scoring rule: an absurd range must reach
+        // scoring (where the dimension drops) and never be rejected.
+        let mut e = extracted();
+        e.comp = Some(crate::domain::events::CompRange {
+            min: Some(187_200_000),
+            max: Some(208_000_000),
+            currency: "USD".into(),
+            period: "year".into(),
+            raw: "$187.2M - $208M".into(),
+        });
+        assert!(evaluate(&config(), &e, "body").is_empty());
     }
 }

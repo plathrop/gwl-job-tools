@@ -94,6 +94,14 @@ impl LogLevel {
 pub struct Config {
     pub compensation_floor: Option<u64>,
     pub compensation_ceiling: Option<u64>,
+    /// Plausibility cap as a multiple of `compensation_ceiling` (OpenSpec
+    /// change `comp-plausibility`, GWLJ-f5pdka). Compensation above
+    /// `ceiling × multiplier` is scored as unknown rather than saturated at
+    /// 100, so an upstream unit/currency error cannot inflate a lead's rank.
+    /// Default [`DEFAULT_COMPENSATION_PLAUSIBILITY_MULTIPLIER`]; accepts an
+    /// integer or a float literal. `None` = not configured.
+    #[serde(deserialize_with = "lenient_opt_f64")]
+    pub compensation_plausibility_multiplier: Option<f64>,
     pub remote_only: bool,
     /// When true, a posting that lists a physical location but says nothing
     /// about work arrangement is treated as non-remote by the remote-only
@@ -271,6 +279,19 @@ impl Config {
                 bail!("scoring weight '{name}' must be finite and non-negative, got {weight}");
             }
         }
+        if let Some(multiplier) = self.compensation_plausibility_multiplier {
+            if !multiplier.is_finite() {
+                bail!("compensation_plausibility_multiplier must be finite, got {multiplier}");
+            }
+            if multiplier < 1.0 {
+                // Below 1.0 the cap lands under the ceiling, so the rule
+                // would drop ranges that interpolate to a real score today —
+                // a footgun disguised as configuration.
+                bail!(
+                    "compensation_plausibility_multiplier must be at least 1.0 (a multiple of compensation_ceiling), got {multiplier}"
+                );
+            }
+        }
         if let (Some(floor), Some(ceiling)) = (self.compensation_floor, self.compensation_ceiling)
             && ceiling <= floor
         {
@@ -278,6 +299,52 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// The default plausibility multiple applied to `compensation_ceiling`.
+///
+/// Any quoted value at or above the ceiling already scores 100, so the cap
+/// carries no ranking information above it; its only job is catching data
+/// errors, and upstream errors observed live are 1–700× too large. Provisional
+/// for public use — revisit against user feedback rather than tuning blind.
+pub const DEFAULT_COMPENSATION_PLAUSIBILITY_MULTIPLIER: f64 = 2.0;
+
+impl Config {
+    /// The effective plausibility multiplier, defaulted.
+    pub fn plausibility_multiplier(&self) -> f64 {
+        self.compensation_plausibility_multiplier
+            .unwrap_or(DEFAULT_COMPENSATION_PLAUSIBILITY_MULTIPLIER)
+    }
+
+    /// The USD/year plausibility cap, when a ceiling is configured. `None`
+    /// means the compensation dimension is already absent, so there is nothing
+    /// to judge plausible.
+    pub fn plausibility_cap(&self) -> Option<u64> {
+        let ceiling = self.compensation_ceiling?;
+        Some((ceiling as f64 * self.plausibility_multiplier()).round() as u64)
+    }
+}
+
+/// Deserialize an optional float that also accepts a TOML integer literal:
+/// `2` and `2.0` both mean 2.0. TOML integers do not coerce to `f64` through
+/// serde, and an operator typing `2` should get a cap, not a type error.
+fn lenient_opt_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Numeric {
+        Float(f64),
+        Integer(i64),
+    }
+
+    Ok(
+        Option::<Numeric>::deserialize(deserializer)?.map(|value| match value {
+            Numeric::Float(f) => f,
+            Numeric::Integer(i) => i as f64,
+        }),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -860,5 +927,84 @@ compensation = 0.4
     #[test]
     fn log_level_default_is_error() {
         assert_eq!(LogLevel::default(), LogLevel::Error);
+    }
+    // ── compensation plausibility multiplier (comp-plausibility) ─
+
+    fn config_from(body: &str) -> Result<Config> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        Config::load_explicit(&path)
+    }
+
+    #[test]
+    fn plausibility_multiplier_defaults_to_two() {
+        let config = Config::default();
+        assert_eq!(config.compensation_plausibility_multiplier, None);
+        assert_eq!(
+            config.plausibility_multiplier(),
+            DEFAULT_COMPENSATION_PLAUSIBILITY_MULTIPLIER
+        );
+    }
+
+    #[test]
+    fn plausibility_multiplier_accepts_integer_and_float_literals() {
+        // TOML integers do not coerce to f64 through serde; `2` must work
+        // exactly like `2.0` rather than becoming a type error.
+        for body in [
+            "compensation_ceiling = 300000\ncompensation_plausibility_multiplier = 2\n",
+            "compensation_ceiling = 300000\ncompensation_plausibility_multiplier = 2.0\n",
+        ] {
+            let config = config_from(body).unwrap();
+            assert_eq!(config.plausibility_multiplier(), 2.0);
+            assert_eq!(config.plausibility_cap(), Some(600_000));
+        }
+    }
+
+    #[test]
+    fn plausibility_cap_follows_the_configured_ceiling() {
+        let mut config = Config {
+            compensation_ceiling: Some(300_000),
+            ..Default::default()
+        };
+        assert_eq!(config.plausibility_cap(), Some(600_000));
+        config.compensation_plausibility_multiplier = Some(3.0);
+        assert_eq!(config.plausibility_cap(), Some(900_000));
+        // No ceiling -> nothing to judge plausible.
+        config.compensation_ceiling = None;
+        assert_eq!(config.plausibility_cap(), None);
+    }
+
+    #[test]
+    fn nonsensical_plausibility_multiplier_fails_at_load() {
+        for (body, needle) in [
+            (
+                "compensation_ceiling = 300000\ncompensation_plausibility_multiplier = 0.5\n",
+                "at least 1.0",
+            ),
+            (
+                "compensation_ceiling = 300000\ncompensation_plausibility_multiplier = nan\n",
+                "must be finite",
+            ),
+            (
+                "compensation_ceiling = 300000\ncompensation_plausibility_multiplier = inf\n",
+                "must be finite",
+            ),
+        ] {
+            let err = config_from(body).unwrap_err().to_string();
+            assert!(
+                err.contains("compensation_plausibility_multiplier") && err.contains(needle),
+                "unexpected error for {body:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_is_accepted_as_the_tightest_cap() {
+        let config = config_from(
+            "compensation_ceiling = 300000\ncompensation_plausibility_multiplier = 1.0\n",
+        )
+        .unwrap();
+        assert_eq!(config.plausibility_cap(), Some(300_000));
     }
 }

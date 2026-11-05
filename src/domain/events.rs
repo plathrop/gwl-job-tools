@@ -115,6 +115,29 @@ pub struct CompRange {
     pub raw: String,
 }
 
+impl CompRange {
+    /// The single value gates and scoring compare: the top of the quoted
+    /// range when present, else the single/bottom figure. Defined once so the
+    /// floor gate and the plausibility check cannot disagree about which
+    /// number represents the posting.
+    pub fn compared_value(&self) -> Option<u64> {
+        self.max.or(self.min)
+    }
+
+    /// Swap inverted bounds (`min > max`, always an upstream data error) so a
+    /// single malformed pair cannot defeat both the floor gate and the
+    /// plausibility check. Every other shape is returned untouched.
+    pub fn normalized(mut self) -> Self {
+        if let (Some(min), Some(max)) = (self.min, self.max)
+            && min > max
+        {
+            self.min = Some(max);
+            self.max = Some(min);
+        }
+        self
+    }
+}
+
 /// Best-effort structured fields extracted from a posting. Any field may be
 /// absent.
 #[skip_serializing_none]
@@ -551,5 +574,44 @@ mod tests {
                 "\"payload\":{\"dedupe_key\":\"tc:abc\"}}"
             )
         );
+    }
+    // ── CompRange normalization (comp-plausibility) ──────────────
+
+    fn comp(min: Option<u64>, max: Option<u64>) -> CompRange {
+        CompRange {
+            min,
+            max,
+            currency: "USD".into(),
+            period: "year".into(),
+            raw: String::new(),
+        }
+    }
+
+    #[test]
+    fn normalized_swaps_inverted_bounds() {
+        let n = comp(Some(400_000), Some(250_000)).normalized();
+        assert_eq!((n.min, n.max), (Some(250_000), Some(400_000)));
+    }
+
+    #[test]
+    fn normalized_leaves_ordered_and_single_bound_ranges_alone() {
+        let ordered = comp(Some(250_000), Some(400_000)).normalized();
+        assert_eq!((ordered.min, ordered.max), (Some(250_000), Some(400_000)));
+
+        let only_min = comp(Some(250_000), None).normalized();
+        assert_eq!((only_min.min, only_min.max), (Some(250_000), None));
+
+        let only_max = comp(None, Some(400_000)).normalized();
+        assert_eq!((only_max.min, only_max.max), (None, Some(400_000)));
+    }
+
+    #[test]
+    fn compared_value_prefers_the_top_of_the_range() {
+        assert_eq!(
+            comp(Some(250_000), Some(400_000)).compared_value(),
+            Some(400_000)
+        );
+        assert_eq!(comp(Some(250_000), None).compared_value(), Some(250_000));
+        assert_eq!(comp(None, None).compared_value(), None);
     }
 }

@@ -92,6 +92,7 @@ defaults. All keys:
 ```toml
 compensation_floor = 180000 # reject below, USD/year
 compensation_ceiling = 400000 # leads at or above this score 100%
+compensation_plausibility_multiplier = 2.0 # quotes above ceiling×this are distrusted
 remote_only = false # reject confident non-remote postings
 reject_location_only = false # treat location-only postings as non-remote
 blacklist = ["initech"] # never match these companies
@@ -166,6 +167,20 @@ so a small balance is a small fetch instead of a rejected one — and
 When either bound stops the run, already-paid records are ingested and the
 stop is reported with its reason. The summary reports credits spent per
 paid source (`credits spent: theirstack 750`).
+
+Compensation quotes are taken with a grain of salt: a posting whose range
+exceeds `compensation_ceiling × compensation_plausibility_multiplier`
+(default `2.0`, i.e. twice the ceiling) is not scored on compensation at
+all — the dimension drops out and the remaining weights renormalize, exactly
+as for a posting that quotes no salary. This exists because feeds publish
+unit and currency errors (a weekly rate annualized twice, a local-currency
+figure labelled USD) and a saturated compensation dimension would rank those
+postings at the top. The score breakdown says which happened
+(`compensation: implausible (208000000 exceeds cap 600000)` versus
+`compensation: unknown`), and `rescore` re-applies the rule to leads ingested
+before you changed it. A `warn` line names each refused quote too, but the
+file sink's default floor is `error`, so that line only appears with a raised
+`--log-level` or `RUST_LOG`; the breakdown is the signal you can always see.
 
 ## How it works
 
