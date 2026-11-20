@@ -11,6 +11,8 @@ schema: spec-driven
 
 # Per-artifact rules (optional)
 # Add custom rules for specific artifacts.
+# These are injected into `openspec instructions <artifact>` output, so every
+# agent authoring that artifact sees them.
 # Example:
 #   rules:
 #     proposal:
@@ -18,6 +20,22 @@ schema: spec-driven
 #       - Always include a "Non-goals" section
 #     tasks:
 #       - Break tasks into chunks of max 2 hours
+rules:
+  specs:
+    - >-
+      A change that changes what a requirement means reconsiders that
+      requirement's name in the same change. A renamed requirement is
+      REMOVED + ADDED under the new name, still within that change — a title
+      that contradicts its own body outlives the change that broke it.
+    - >-
+      Requirement operations are chosen by what changes, not by preference:
+      MODIFIED when the name stays and every existing scenario survives (it
+      replaces the whole block, so copy them all); RENAMED for a name change
+      alone; REMOVED + ADDED, under a *new* name, when the name changes with
+      the content, when a scenario must be dropped, or when the requirement
+      splits. A MODIFIED that omits an existing scenario is a validation
+      error, but a same-name ADDED validates and is refused only at archive —
+      get it right while authoring.
 
 # Per-operation guidance (optional)
 # Add advisory guidance for how apply and archive work should be conducted.
